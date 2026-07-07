@@ -1,24 +1,53 @@
 # services/agents/escalation_agent.py
+"""
+EscalationAgent — final fallback for issues that automated agents cannot resolve.
+
+This agent deliberately does NOT use a LangChain tool-calling loop: escalation
+is a deterministic bookkeeping operation (build a ticket payload for a human),
+not a reasoning task. Keeping it simple avoids burning an LLM call on the
+"give up gracefully" path.
+"""
+
+import logging
+
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
 
+logger = logging.getLogger(__name__)
+
+
 class EscalationAgent(BaseAgent):
     """
-    Specialized AI Agent designated as a fallback for unresolvable issues or critical failures.
-    It prepares a structured summary for human agent handover.
+    Fallback agent — triggered when:
+      - No other agent is registered for the detected intent.
+      - A specialised agent raises EscalationSignal (LLM decided to escalate).
+      - A specialised agent throws an unhandled exception.
     """
+
+    SYSTEM_PROMPT = "You are EscalationAgent, a fallback for unresolved support issues."
+
     def __init__(self, *args, **kwargs):
         super().__init__("EscalationAgent", *args, **kwargs)
 
+    # ------------------------------------------------------------------
+    def _build_tools(self) -> list:
+        # No tools needed — this agent doesn't run an LLM loop.
+        return []
+
+    # ------------------------------------------------------------------
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
-        print(f"\n[{self.name}] Received task: {task.task_id} for intent '{task.intent}'")
-        
-        escalation_reason = task.params.get("reason", "Issue could not be resolved by automated agents.")
-        
-        # In a real system, this agent would also:
-        # - Create a ticket in a CRM/Helpdesk system via E-commerce Microservices API.
-        # - Notify a human agent or team.
-        # - Potentially summarize the conversation history for the human agent.
+        logger.info("[%s] Processing escalation for task %s", self.name, task.task_id)
+
+        escalation_reason = task.params.get(
+            "reason", "Issue could not be resolved by automated agents."
+        )
+        conversation_summary = task.conversation_context[-5:]
+
+        # ── Production integration points (stubbed) ────────────────────
+        # ticket_id = self.ecommerce_api_client.create_helpdesk_ticket(...)
+        # self.ecommerce_api_client.notify_human_agent(ticket_id=ticket_id)
+        ticket_id = f"TKT-{task.task_id[:8].upper()}"
+        logger.info("[%s] Mock helpdesk ticket created: %s", self.name, ticket_id)
 
         return StructuredAgentResult(
             task_id=task.task_id,
@@ -26,11 +55,8 @@ class EscalationAgent(BaseAgent):
             status="escalation",
             result_data={
                 "escalation_reason": escalation_reason,
+                "ticket_id": ticket_id,
                 "original_query": task.original_query,
-                "conversation_summary": task.conversation_context[-3:] # Last 3 turns for context
+                "conversation_summary": conversation_summary,
             },
         )
-
-# This agent would not typically be run directly
-if __name__ == "__main__":
-    print("EscalationAgent handles unresolved queries.")
