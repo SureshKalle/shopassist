@@ -1,6 +1,6 @@
 # services/pii_masker.py
 import uuid
-from typing import List
+from typing import List, Optional
 from common.models import MaskedQuery
 
 class PIIMasker:
