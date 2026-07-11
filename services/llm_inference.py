@@ -1,5 +1,12 @@
 # services/llm_inference.py
+import os
 from typing import List, Dict, Any, Optional, Union
+from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional, Union
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import ValidationError
+
 from common.models import (
     RoutingRequest, AgentInvocation,
     LLMAgentReasonRequest, LLMAgentReasonResponse,
@@ -7,25 +14,95 @@ from common.models import (
     NLGRequest, StructuredAgentResult,
     StructuredOrderSummary, StructuredProductRecommendation
 )
-
+load_dotenv() 
 class MockLLMInferenceService:
     """
-    Simulates the Centralized LLM Inference Service.
-    In a real system, this would be a FastAPI/Flask application wrapping actual LLMs
-    (e.g., hosted via TGI, vLLM, or calling OpenAI/Anthropic APIs).
-    Each 'call_xyz' method represents a specialized LLM endpoint.
+    The Centralized LLM Inference Service.
+    Wraps actual LLM API calls and provides specialized endpoints.
     """
+    def __init__(self):
+        self.ollama_base_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
+        self.openai_client = OpenAI(
+            base_url=f"{self.ollama_base_url}/v1", # OpenAI-compatible endpoint
+            api_key="ollama" 
+        )
+        
+        # Define LLM models to be used for each endpoint
+        self.router_model = os.getenv("OLLAMA_ROUTER_MODEL", "llama3:8b-instruct") 
+        self.agent_reason_model = os.getenv("OLLAMA_AGENT_REASON_MODEL", "llama3:8b-instruct")
+        self.agent_interpret_model = os.getenv("OLLAMA_AGENT_INTERPRET_MODEL", "llama3:8b-instruct")
+        self.generative_model = os.getenv("OLLAMA_GENERATIVE_MODEL", "llama3:8b-instruct")
+        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") 
+
     def call_router(self, request: RoutingRequest) -> AgentInvocation:
-        print(f"  [Mock LLMInf] Calling LLMInf_Router with query: '{request.current_query}'...")
-        # Simulate LLM logic to determine intent and best agent
-        if "order status" in request.current_query.lower() or "where is my stuff" in request.current_query.lower() or "order 12345" in request.current_query.lower():
-            return AgentInvocation(agent_name="OrderTrackingAgent", confidence=0.9, parameters={"query": request.current_query})
-        elif "recommend a product" in request.current_query.lower() or "what should I buy" in request.current_query.lower() or "laptop" in request.current_query.lower():
-            return AgentInvocation(agent_name="ProductRecommendationAgent", confidence=0.85, parameters={"query": request.current_query})
-        elif "return" in request.current_query.lower() or "refund" in request.current_query.lower():
-            return AgentInvocation(agent_name="ReturnsAgent", confidence=0.92, parameters={"query": request.current_query})
-        else:
-            return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.6, parameters={"query": request.current_query})
+        print(f"  [LLMInf] Calling LLMInf_Router ({self.router_model}) with query: '{request.current_query}'...")
+        
+        # Prepare conversation history for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are an expert routing agent for an e-commerce customer service chatbot. "
+                "Your task is to analyze the user's current query and conversation history to determine "
+                "which specialized agent should handle the request. "
+                "You must respond with a JSON object containing three fields: " 
+                "1. `agent_name`: The name of the agent to invoke. Choose from: "
+                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
+                "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "If no specific parameters are extracted, return an empty object {}. "
+                "3. `confidence`: A float between 0.0 and 1.0 representing your confidence in this routing decision. " # <--- ADDED HERE
+                "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent'. "
+                "If the request implies an unresolvable issue or an explicit need for human intervention, choose 'EscalationAgent'. "
+                "Always output a valid JSON object. Do NOT include any other text."
+            )}
+        ]
+        
+        # Add conversation history
+        for msg in request.conversation_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Add current user query
+        messages.append({"role": "user", "content": request.current_query})
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.router_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.0, # Keep temperature low for deterministic routing
+                seed=42 # For reproducibility in testing/capstone
+            )
+            
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] Router LLM raw output: {llm_output_str}")
+            
+            # Validate LLM output against Pydantic model
+            parsed_invocation = AgentInvocation.model_validate_json(llm_output_str)
+            
+            # Simple check for known agents, fallback if LLM invents one
+            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
+                print(f"  [LLMInf] Warning: LLM suggested unknown agent '{parsed_invocation.agent_name}'. Falling back to GeneralPurposeAgent.")
+                return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
+            
+            return parsed_invocation
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for router is not valid JSON or doesn't match AgentInvocation schema: {e}")
+            # Fallback for malformed LLM output
+            return AgentInvocation(
+                agent_name="GeneralPurposeAgent",
+                confidence=0.3, # Lower confidence for fallback
+                parameters={"original_query": request.current_query, "error": "LLM routing output parse error"}
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling Router LLM: {e}")
+            # General fallback for API errors, network issues, etc.
+            return AgentInvocation(
+                agent_name="GeneralPurposeAgent",
+                confidence=0.2, # Very low confidence for general errors
+                parameters={"original_query": request.current_query, "error": f"LLM routing general error: {e}"}
+            )
 
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
         print(f"  [Mock LLMInf] Calling LLMInf_AgentReason for {request.agent_name}...")
@@ -81,11 +158,35 @@ class MockLLMInferenceService:
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
-    llm_service = MockLLMInferenceService()
+    # Set your OpenAI API key as an environment variable or uncomment and set it here
+    # os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_API_KEY" 
+    
+    if not os.getenv("OPENAI_API_KEY"):
+        print("OPENAI_API_KEY environment variable not set. Using mock fallbacks for LLM calls.")
+        # This fallback for demonstration if API key is not set, but won't be "real"
+        class MockOpenAIClient:
+            def chat(self):
+                class MockCompletions:
+                    def create(self, **kwargs):
+                        class MockChoice:
+                            message = type('obj', (object,), {'content': '{"agent_name": "GeneralPurposeAgent", "confidence": 0.5, "parameters": {}}'})()
+                        return type('obj', (object,), {'choices': [MockChoice()]})()
+                return MockCompletions()
+            def embeddings(self):
+                class MockEmbeddings:
+                    def create(self, **kwargs):
+                        class MockData:
+                            embedding = [0.0] * 1536
+                        return type('obj', (object,), {'data': [MockData()]})()
+                return MockEmbedAIClient()
+        MockLLMInferenceService.openai_client = MockOpenAIClient()
+        
+    llm_service = LLMInferenceService()
+    
     # Mock a router call
     router_req = RoutingRequest(session_id="test_123", conversation_history=[], current_query="Check my order")
     agent_invoc = llm_service.call_router(router_req)
-    print(f"Router Result: {agent_invoc}")
+    print(f"\nRouter Result: {agent_invoc}")
     
     # Mock an embedding call
     embedding = llm_service.call_embeddings("Hello World")
