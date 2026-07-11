@@ -28,7 +28,8 @@ class OrderTrackingAgent(BaseAgent):
         )
 
         raw_order_details = {}
-        if reason_response.action == 'call_api' and reason_response.tool_name == 'ECommerceAPI.getOrderDetails':
+        print(reason_response.tool_name, reason_response.action, reason_response.thought)
+        if reason_response.action == 'call_api' and reason_response.tool_name == 'ECommerceAPI':
             # 2. Execute Internal Tool: E-commerce Microservice API call
             raw_order_details = self.ecommerce_api_client.get_order_details(customer_id, order_id)
         else:

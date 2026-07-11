@@ -105,16 +105,75 @@ class MockLLMInferenceService:
             )
 
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        print(f"  [Mock LLMInf] Calling LLMInf_AgentReason for {request.agent_name}...")
-        # Simulate agent reasoning for simple cases
-        if "order details" in request.task_description.lower() and "ECommerceAPI.getOrderDetails" in request.available_tools:
-            # Extract order_id from current_state or task_description
-            order_id = request.current_state.get('order_id', '12345')
-            return LLMAgentReasonResponse(action='call_api', tool_name='ECommerceAPI.getOrderDetails', tool_params={'order_id': order_id}, thought=f"Need order details from API for {order_id}")
-        elif "policy" in request.task_description.lower() and "RAG.queryPolicy" in request.available_tools:
-            return LLMAgentReasonResponse(action='query_rag', tool_name='RAG.queryPolicy', tool_params={'topic': 'return_policy'}, thought="Need to check return policy via RAG")
-        else:
-            return LLMAgentReasonResponse(action='return_result', thought="No further tools needed, returning intermediate result.")
+        
+        print(f"  [LLMInf] Calling LLMInf_AgentReason ({self.agent_reason_model}) for {request.agent_name}...")
+
+        # Prepare the reasoning prompt for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are a reasoning engine for a specialised customer-support AI agent. "
+                "Given a task description, the current state, and a list of available tools, "
+                "decide the SINGLE NEXT action the agent should take. "
+                "You must respond with a JSON object containing exactly these fields: "
+                "1. `action`: one of 'call_api', 'query_rag', 'return_result', 'escalate'. "
+                "2. `tool_name`: the name of the tool to call if action is 'call_api' or 'query_rag' "
+                "(must be one of the tools listed in `available_tools`), otherwise null. "
+                "3. `tool_params`: a JSON object of parameters required for that tool call, otherwise null. "
+                "4. `thought`: a brief chain-of-thought explanation for this decision. "
+                "Use 'return_result' once enough information has been gathered to answer the task. "
+                "Use 'escalate' only if the task cannot be resolved with the available tools. "
+                "Always output a valid JSON object. Do NOT include any other text."
+            )},
+            {"role": "user", "content": (
+                f"Agent: {request.agent_name}\n"
+                f"Task: {request.task_description}\n"
+                f"Current state: {request.current_state}\n"
+                f"Available tools: {request.available_tools}"
+            )}
+        ]
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.agent_reason_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.0, # Keep temperature low for deterministic reasoning
+                seed=42 # For reproducibility in testing/capstone
+            )
+
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] AgentReason LLM raw output: {llm_output_str}")
+
+            # Validate LLM output against Pydantic model
+            parsed_response = LLMAgentReasonResponse.model_validate_json(llm_output_str)
+
+            # Simple check for known actions, fallback if LLM invents one
+            valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
+            if parsed_response.action not in valid_actions:
+                print(f"  [LLMInf] Warning: LLM suggested unknown action '{parsed_response.action}'. Falling back to return_result.")
+                return LLMAgentReasonResponse(
+                    action="return_result",
+                    thought=f"Unknown action '{parsed_response.action}' from LLM; defaulting to return_result."
+                )
+
+            return parsed_response
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for agent reason is not valid JSON or doesn't match LLMAgentReasonResponse schema: {e}")
+            # Fallback for malformed LLM output
+            return LLMAgentReasonResponse(
+                action="return_result",
+                thought=f"LLM agent-reason output parse error: {e}"
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling AgentReason LLM: {e}")
+            # General fallback for API errors, network issues, etc.
+            return LLMAgentReasonResponse(
+                action="return_result",
+                thought=f"LLM agent-reason general error: {e}"
+            )
 
 
     def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
