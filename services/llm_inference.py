@@ -1,444 +1,251 @@
 # services/llm_inference.py
-"""
-Centralised LLM Inference Service — LangChain edition.
+import os
+from typing import List, Dict, Any, Optional, Union
+from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional, Union
+from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
+from pydantic import ValidationError
 
-Every specialised endpoint is now an LCEL chain:
-
-    prompt (ChatPromptTemplate)  →  llm (ChatAnthropic)  →  parser (structured Pydantic output)
-
-Benefits over the raw-API version:
-  - Prompts are versioned, reusable ChatPromptTemplate objects (easy to swap/A-B test).
-  - `.with_structured_output(PydanticModel)` replaces hand-rolled JSON parsing —
-    LangChain handles tool-calling-based structured extraction and validation.
-  - Chains are composable: `prompt | llm | parser` and can be traced/logged via
-    LangSmith simply by setting LANGCHAIN_TRACING_V2=true in .env (no code change).
-  - Swapping the model provider (Anthropic → OpenAI → Bedrock) only touches the
-    `_build_llm()` factory below.
-"""
-
-import logging
-from typing import Optional, cast
-
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel, Field
-
-from common.llm_factory import build_chat_model
-from common.config import (
-    LLM_ROUTER_MAX_TOKENS,
-    LLM_GENERATIVE_MAX_TOKENS,
-    LLM_AGENT_REASON_MAX_TOKENS,
-    LLM_AGENT_INTERPRET_MAX_TOKENS,
-)
 from common.models import (
-    AgentInvocation,
-    LLMAgentInterpretRequest,
-    LLMAgentInterpretResponse,
-    LLMAgentReasonRequest,
-    LLMAgentReasonResponse,
-    NLGRequest,
-    RoutingRequest,
-    StructuredOrderSummary,
-    StructuredProductRecommendation,
+    RoutingRequest, AgentInvocation,
+    LLMAgentReasonRequest, LLMAgentReasonResponse,
+    LLMAgentInterpretRequest, LLMAgentInterpretResponse,
+    NLGRequest, StructuredAgentResult,
+    StructuredOrderSummary, StructuredProductRecommendation
 )
-
-logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Pydantic schemas used purely as LangChain structured-output targets.
-# ---------------------------------------------------------------------------
-class _RouterOutput(BaseModel):
-    agent_name: str = Field(
-        description=(
-            "One of: OrderTrackingAgent, ProductRecommendationAgent, "
-            "ReturnsAgent, GeneralPurposeAgent"
-        )
-    )
-    confidence: float = Field(description="Confidence score between 0.0 and 1.0")
-    order_id: Optional[str] = Field(default=None, description="Order ID if detected in the query")
-    product_query: Optional[str] = Field(default=None, description="Product search terms if relevant")
-    reason: str = Field(description="Brief reasoning for this routing decision")
-
-
-class _AgentReasonOutput(BaseModel):
-    action: str = Field(description="One of: call_api, query_rag, return_result, escalate")
-    tool_name: Optional[str] = Field(default=None, description="Name of the tool to call, if any")
-    tool_params: Optional[dict] = Field(default=None, description="Parameters for the tool call")
-    thought: str = Field(description="Brief chain-of-thought reasoning")
-
-
-class _AgentInterpretOutput(BaseModel):
-    issue_type: Optional[str] = Field(
-        default=None, description="None | PaymentPending | Delayed | Lost | Damaged | Other"
-    )
-    recommendation: Optional[str] = Field(default=None, description="Actionable advice")
-    sentiment: Optional[str] = Field(default=None, description="positive | neutral | negative")
-    answer: Optional[str] = Field(default=None, description="Direct answer, for FAQ/general goals")
-    eligible: Optional[bool] = Field(default=None, description="Eligibility flag, for returns goals")
-    product_id: Optional[str] = Field(default=None)
-    name: Optional[str] = Field(default=None)
-    price: Optional[float] = Field(default=None)
-    description_snippet: Optional[str] = Field(default=None)
-    reason: Optional[str] = Field(default=None)
-    thought: str = Field(description="Brief reasoning")
-
-
-# ---------------------------------------------------------------------------
-# LLM factory — delegates to common/llm_factory.py (provider-agnostic:
-# Groq / Ollama / Anthropic, selected via LLM_PROVIDER in .env)
-# ---------------------------------------------------------------------------
-def _build_llm(max_tokens: int):
-    return build_chat_model(max_tokens=max_tokens, temperature=0.2)
-
-
-class LLMInferenceService:
+load_dotenv() 
+class MockLLMInferenceService:
     """
-    LangChain-powered LLM Inference Service.
-
-    Each `call_*` method uses an LCEL chain:
-        ChatPromptTemplate | ChatAnthropic.with_structured_output(Schema)
-    If no API key is configured, falls back to lightweight mock logic so the
-    rest of the pipeline remains runnable offline.
+    The Centralized LLM Inference Service.
+    Wraps actual LLM API calls and provides specialized endpoints.
     """
-
-    # ── Router ────────────────────────────────────────────────────────────────
-
-    _ROUTER_PROMPT = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are an expert customer-support router for an e-commerce platform. "
-                "Read the customer's latest message and recent conversation history, then "
-                "decide which specialised agent should handle it.\n\n"
-                "Available agents:\n"
-                "  - OrderTrackingAgent        : order status, shipping, delivery updates\n"
-                "  - ProductRecommendationAgent: product suggestions, comparisons, gift ideas\n"
-                "  - ReturnsAgent              : returns, refunds, exchanges, cancellations\n"
-                "  - GeneralPurposeAgent       : FAQs, store policies, anything else",
-            ),
-            ("human", "Conversation so far:\n{history}\n\nLatest customer message: {query}"),
-        ]
-    )
-
     def __init__(self):
-        self._router_llm = _build_llm(LLM_ROUTER_MAX_TOKENS)
-        self._reason_llm = _build_llm(LLM_AGENT_REASON_MAX_TOKENS)
-        self._interpret_llm = _build_llm(LLM_AGENT_INTERPRET_MAX_TOKENS)
-        self._generative_llm = _build_llm(LLM_GENERATIVE_MAX_TOKENS)
-
-        self._router_chain = (
-            self._ROUTER_PROMPT | self._router_llm.with_structured_output(_RouterOutput)
-            if self._router_llm
-            else None
+        self.ollama_base_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
+        self.openai_client = OpenAI(
+            base_url=f"{self.ollama_base_url}/v1", # OpenAI-compatible endpoint
+            api_key="ollama" 
         )
+        
+        # Define LLM models to be used for each endpoint
+        self.router_model = os.getenv("OLLAMA_ROUTER_MODEL", "llama3:8b-instruct") 
+        self.agent_reason_model = os.getenv("OLLAMA_AGENT_REASON_MODEL", "llama3:8b-instruct")
+        self.agent_interpret_model = os.getenv("OLLAMA_AGENT_INTERPRET_MODEL", "llama3:8b-instruct")
+        self.generative_model = os.getenv("OLLAMA_GENERATIVE_MODEL", "llama3:8b-instruct")
+        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") 
 
     def call_router(self, request: RoutingRequest) -> AgentInvocation:
-        """Route the customer query to the best agent via an LCEL chain."""
-        logger.info("[LLMInference] call_router | session=%s", request.session_id)
-
-        if self._router_chain is None:
-            return self._mock_router(request)
-
-        history_text = "\n".join(
-            f"{m['role'].upper()}: {m['content']}"
-            for m in request.conversation_history[-6:]
-        )
-        try:
-            result = cast(_RouterOutput, self._router_chain.invoke(
-                {"history": history_text, "query": request.current_query}
-            ))
-            params = {"reason": result.reason}
-            if result.order_id:
-                params["order_id"] = result.order_id
-            if result.product_query:
-                params["product_query"] = result.product_query
-            params.setdefault("query", request.current_query)
-            return AgentInvocation(
-                agent_name=result.agent_name,
-                confidence=result.confidence,
-                parameters=params,
-            )
-        except Exception as exc:
-            logger.warning("[LLMInference] call_router chain failed (%s) — using mock.", exc)
-            return self._mock_router(request)
-
-    def _mock_router(self, request: RoutingRequest) -> AgentInvocation:
-        q = request.current_query.lower()
-        if any(k in q for k in ("order", "where is", "shipped", "delivery", "tracking")):
-            return AgentInvocation(agent_name="OrderTrackingAgent", confidence=0.9,
-                                   parameters={"query": request.current_query})
-        if any(k in q for k in ("recommend", "suggest", "buy", "laptop", "product", "gift")):
-            return AgentInvocation(agent_name="ProductRecommendationAgent", confidence=0.85,
-                                   parameters={"query": request.current_query})
-        if any(k in q for k in ("return", "refund", "exchange", "cancel")):
-            return AgentInvocation(agent_name="ReturnsAgent", confidence=0.92,
-                                   parameters={"query": request.current_query})
-        return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.6,
-                               parameters={"query": request.current_query})
-
-    # ── Agent Reason (legacy single-step planning; primary path for agents is
-    #     now the LangChain tool-calling agent in base_agent.py) ────────────────
-
-    _REASON_PROMPT = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a reasoning engine for a specialised customer-support AI agent. "
-                "Given a task description, current state, and available tools, decide the "
-                "SINGLE NEXT action.\n\n"
-                "Actions:\n"
-                "  call_api     : call an external API\n"
-                "  query_rag    : query the knowledge base\n"
-                "  return_result: enough info collected, compose the final answer\n"
-                "  escalate     : cannot resolve, escalate to human agent",
-            ),
-            (
-                "human",
-                "Agent: {agent_name}\nTask: {task_description}\n"
-                "Current state: {current_state}\nAvailable tools: {available_tools}",
-            ),
+        print(f"  [LLMInf] Calling LLMInf_Router ({self.router_model}) with query: '{request.current_query}'...")
+        
+        # Prepare conversation history for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are an expert routing agent for an e-commerce customer service chatbot. "
+                "Your task is to analyze the user's current query and conversation history to determine "
+                "which specialized agent should handle the request. "
+                "You must respond with a JSON object containing three fields: " 
+                "1. `agent_name`: The name of the agent to invoke. Choose from: "
+                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
+                "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "If no specific parameters are extracted, return an empty object {}. "
+                "3. `confidence`: A float between 0.0 and 1.0 representing your confidence in this routing decision. " # <--- ADDED HERE
+                "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent'. "
+                "If the request implies an unresolvable issue or an explicit need for human intervention, choose 'EscalationAgent'. "
+                "Always output a valid JSON object. Do NOT include any other text."
+            )}
         ]
-    )
+        
+        # Add conversation history
+        for msg in request.conversation_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Add current user query
+        messages.append({"role": "user", "content": request.current_query})
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.router_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.0, # Keep temperature low for deterministic routing
+                seed=42 # For reproducibility in testing/capstone
+            )
+            
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] Router LLM raw output: {llm_output_str}")
+            
+            # Validate LLM output against Pydantic model
+            parsed_invocation = AgentInvocation.model_validate_json(llm_output_str)
+            
+            # Simple check for known agents, fallback if LLM invents one
+            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
+                print(f"  [LLMInf] Warning: LLM suggested unknown agent '{parsed_invocation.agent_name}'. Falling back to GeneralPurposeAgent.")
+                return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
+            
+            return parsed_invocation
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for router is not valid JSON or doesn't match AgentInvocation schema: {e}")
+            # Fallback for malformed LLM output
+            return AgentInvocation(
+                agent_name="GeneralPurposeAgent",
+                confidence=0.3, # Lower confidence for fallback
+                parameters={"original_query": request.current_query, "error": "LLM routing output parse error"}
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling Router LLM: {e}")
+            # General fallback for API errors, network issues, etc.
+            return AgentInvocation(
+                agent_name="GeneralPurposeAgent",
+                confidence=0.2, # Very low confidence for general errors
+                parameters={"original_query": request.current_query, "error": f"LLM routing general error: {e}"}
+            )
 
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        """
-        Legacy single-step planning call (kept for any code path that doesn't
-        use the LangChain tool-calling agent directly).
-        """
-        logger.info("[LLMInference] call_agent_reason | agent=%s", request.agent_name)
+        print(f"  [LLMInf] Calling LLMInf_AgentReason ({self.agent_reason_model}) for {request.agent_name}...")
 
-        if self._reason_llm is None:
-            return self._mock_reason(request)
+        # Prepare the reasoning prompt for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are a reasoning engine for a specialised customer-support AI agent. "
+                "Given a task description, the current state, and a list of available tools, "
+                "decide the SINGLE NEXT action the agent should take. "
+                "You must respond with a JSON object containing exactly these fields: "
+                "1. `action`: one of 'call_api', 'query_rag', 'return_result', 'escalate'. "
+                "2. `tool_name`: the name of the tool to call if action is 'call_api' or 'query_rag' "
+                "(must be one of the tools listed in `available_tools`), otherwise null. "
+                "3. `tool_params`: a JSON object of parameters required for that tool call, otherwise null. "
+                "4. `thought`: a brief chain-of-thought explanation for this decision. "
+                "Use 'return_result' once enough information has been gathered to answer the task. "
+                "Use 'escalate' only if the task cannot be resolved with the available tools. "
+                "Always output a valid JSON object. Do NOT include any other text."
+            )},
+            {"role": "user", "content": (
+                f"Agent: {request.agent_name}\n"
+                f"Task: {request.task_description}\n"
+                f"Current state: {request.current_state}\n"
+                f"Available tools: {request.available_tools}"
+            )}
+        ]
 
         try:
-            chain = self._REASON_PROMPT | self._reason_llm.with_structured_output(_AgentReasonOutput)
-            result = cast(_AgentReasonOutput, chain.invoke(
-                {
-                    "agent_name": request.agent_name,
-                    "task_description": request.task_description,
-                    "current_state": request.current_state,
-                    "available_tools": request.available_tools,
-                }
-            ))
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.agent_reason_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.0, # Keep temperature low for deterministic reasoning
+                seed=42 # For reproducibility in testing/capstone
+            )
+
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] AgentReason LLM raw output: {llm_output_str}")
+
+            # Validate LLM output against Pydantic model
+            parsed_response = LLMAgentReasonResponse.model_validate_json(llm_output_str)
+
+            # Simple check for known actions, fallback if LLM invents one
+            valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
+            if parsed_response.action not in valid_actions:
+                print(f"  [LLMInf] Warning: LLM suggested unknown action '{parsed_response.action}'. Falling back to return_result.")
+                return LLMAgentReasonResponse(
+                    action="return_result",
+                    thought=f"Unknown action '{parsed_response.action}' from LLM; defaulting to return_result."
+                )
+
+            return parsed_response
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for agent reason is not valid JSON or doesn't match LLMAgentReasonResponse schema: {e}")
+            # Fallback for malformed LLM output
             return LLMAgentReasonResponse(
-                action=result.action,
-                tool_name=result.tool_name,
-                tool_params=result.tool_params,
-                thought=result.thought,
+                action="return_result",
+                thought=f"LLM agent-reason output parse error: {e}"
             )
-        except Exception as exc:
-            logger.warning("[LLMInference] call_agent_reason chain failed (%s) — mock.", exc)
-            return self._mock_reason(request)
-
-    def _mock_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        desc = request.task_description.lower()
-        if "order" in desc and "ECommerceAPI.getOrderDetails" in request.available_tools:
-            order_id = request.current_state.get("order_id", "12345")
+        except Exception as e:
+            print(f"  [LLMInf] Error calling AgentReason LLM: {e}")
+            # General fallback for API errors, network issues, etc.
             return LLMAgentReasonResponse(
-                action="call_api", tool_name="ECommerceAPI.getOrderDetails",
-                tool_params={"order_id": order_id},
-                thought=f"Need order details from API for {order_id}",
+                action="return_result",
+                thought=f"LLM agent-reason general error: {e}"
             )
-        if "policy" in desc and "RAG.queryPolicy" in request.available_tools:
-            return LLMAgentReasonResponse(
-                action="query_rag", tool_name="RAG.queryPolicy",
-                tool_params={"topic": "return_policy"},
-                thought="Need to check return policy via RAG",
-            )
-        return LLMAgentReasonResponse(action="return_result", thought="No further tools needed.")
 
-    # ── Agent Interpret ────────────────────────────────────────────────────────
 
-    _INTERPRET_PROMPT = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a data interpretation engine for a customer-support AI agent. "
-                "You receive raw data and an interpretation goal. Extract structured, "
-                "actionable insight relevant to that goal. Only populate the fields that "
-                "are relevant; leave others null.",
-            ),
-            (
-                "human",
-                "Agent: {agent_name}\nInterpretation goal: {goal}\nRaw data:\n{raw_data}",
-            ),
-        ]
-    )
+    def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
+        print(f"  [Mock LLMInf] Calling LLMInf_AgentInterpret for {request.agent_name} to {request.interpretation_goal}...")
+        # Simulate interpretation of raw data
+        if request.interpretation_goal == 'diagnose order issue' and request.raw_data.get('status') == 'Pending':
+            return LLMAgentInterpretResponse(structured_interpretation={"issue_type": "PaymentPending", "recommendation": "Check payment method"}, thought="Interpreted order status as pending payment issue.")
+        elif request.interpretation_goal == 'diagnose order issue' and request.raw_data.get('status') == 'Shipped':
+             return LLMAgentInterpretResponse(structured_interpretation={"issue_type": "None", "recommendation": "Order is on its way"}, thought="Interpreted order status as shipped with no issues.")
+        return LLMAgentInterpretResponse(structured_interpretation=request.raw_data, thought="Basic interpretation provided.")
 
-    def call_agent_interpret(
-        self, request: LLMAgentInterpretRequest
-    ) -> LLMAgentInterpretResponse:
-        """Interpret raw API/tool data into structured insights via LCEL chain."""
-        logger.info(
-            "[LLMInference] call_agent_interpret | agent=%s | goal=%.50s",
-            request.agent_name, request.interpretation_goal,
-        )
-
-        if self._interpret_llm is None:
-            return self._mock_interpret(request)
-
-        try:
-            chain = self._INTERPRET_PROMPT | self._interpret_llm.with_structured_output(
-                _AgentInterpretOutput
-            )
-            result = cast(_AgentInterpretOutput, chain.invoke(
-                {
-                    "agent_name": request.agent_name,
-                    "goal": request.interpretation_goal,
-                    "raw_data": request.raw_data,
-                }
-            ))
-            data = result.model_dump(exclude_none=True, exclude={"thought"})
-            return LLMAgentInterpretResponse(structured_interpretation=data, thought=result.thought)
-        except Exception as exc:
-            logger.warning("[LLMInference] call_agent_interpret chain failed (%s) — mock.", exc)
-            return self._mock_interpret(request)
-
-    def _mock_interpret(
-        self, request: LLMAgentInterpretRequest
-    ) -> LLMAgentInterpretResponse:
-        status = request.raw_data.get("status", "")
-        if status == "Pending":
-            return LLMAgentInterpretResponse(
-                structured_interpretation={
-                    "issue_type": "PaymentPending",
-                    "recommendation": "Check payment method",
-                    "sentiment": "negative",
-                },
-                thought="Order pending — likely payment issue.",
-            )
-        if status == "Shipped":
-            return LLMAgentInterpretResponse(
-                structured_interpretation={
-                    "issue_type": "None",
-                    "recommendation": "Order is on its way",
-                    "sentiment": "positive",
-                },
-                thought="Order shipped, no issues.",
-            )
-        return LLMAgentInterpretResponse(
-            structured_interpretation=request.raw_data, thought="Basic interpretation."
-        )
-
-    # ── Generative NLG ────────────────────────────────────────────────────────
-
-    _NLG_PROMPT = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "You are a friendly, professional customer-support representative for an "
-                "e-commerce company. Craft a helpful, concise, empathetic response based on "
-                "the structured results from our internal agents.\n\n"
-                "Guidelines:\n"
-                "- Be warm, clear, actionable.\n"
-                "- Never expose internal system/agent/field names.\n"
-                "- If unresolved/escalated, apologise and explain next steps.\n"
-                "- Keep under 150 words.\n"
-                "- End with an open offer to help further.",
-            ),
-            (
-                "human",
-                "Conversation history (recent):\n{history}\n\n"
-                "Customer intent: {intent}\n\nAgent findings:\n{findings}",
-            ),
-        ]
-    )
+    def call_agent_generate(self, request: LLMAgentReasonRequest) -> str: # Simplified for this example
+        print(f"  [Mock LLMInf] Calling LLMInf_AgentGenerate for {request.agent_name}...")
+        return "Generated snippet: This product is highly rated for durability."
 
     def call_generative(self, request: NLGRequest) -> str:
-        """Generate the final natural-language response via an LCEL chain."""
-        logger.info("[LLMInference] call_generative | session=%s", request.session_id)
-
-        findings = self._summarise_agent_results(request)
-        history_text = "\n".join(
-            f"{m['role'].upper()}: {m['content']}"
-            for m in request.conversation_history[-4:]
-        )
-
-        if self._generative_llm is None:
-            return self._mock_generative(request)
-
-        try:
-            chain = self._NLG_PROMPT | self._generative_llm | StrOutputParser()
-            return chain.invoke(
-                {
-                    "history": history_text,
-                    "intent": request.final_user_intent,
-                    "findings": findings,
-                }
-            )
-        except Exception as exc:
-            logger.warning("[LLMInference] call_generative chain failed (%s) — mock.", exc)
-            return self._mock_generative(request)
-
-    @staticmethod
-    def _summarise_agent_results(request: NLGRequest) -> str:
-        lines = []
+        print(f"  [Mock LLMInf] Calling LLMInf_Generative for final NLG...")
+        # Simulate combining results into a natural language response
+        responses = []
         for res in request.agent_results:
             if isinstance(res.result_data, StructuredOrderSummary):
-                s = res.result_data
-                lines.append(
-                    f"Order {s.order_id}: status={s.status}, "
-                    f"delivery={s.estimated_delivery or 'TBD'}, issue={s.issue_analysis or 'None'}"
-                )
+                responses.append(f"Your order {res.result_data.order_id} is currently {res.result_data.status}.")
+                if res.result_data.estimated_delivery:
+                    responses.append(f"It's estimated to arrive by {res.result_data.estimated_delivery}.")
+                if res.result_data.issue_analysis and res.result_data.issue_analysis != "None":
+                    responses.append(f"Issue: {res.result_data.issue_analysis}")
             elif isinstance(res.result_data, StructuredProductRecommendation):
-                r = res.result_data
-                lines.append(f"Recommended product '{r.name}' at ${r.price} — {r.reason}")
+                responses.append(f"I recommend '{res.result_data.name}' (Price: ${res.result_data.price}) for you because {res.result_data.reason}.")
+            elif isinstance(res.result_data, dict) and "answer_snippet" in res.result_data:
+                responses.append(f"Here's some information: {res.result_data['answer_snippet']}")
             else:
-                lines.append(f"[{res.agent_name} | {res.status}] {res.result_data}")
-        return "\n".join(lines)
+                responses.append(f"Agent '{res.agent_name}' provided some information relevant to your query.")
+        
+        greeting = f"Hello {request.session_id.split('_')[0]}! " if request.session_id else "Hello! "
+        return greeting + " ".join(responses) + f" Is there anything else I can assist you with regarding '{request.final_user_intent}'?"
 
-    def _mock_generative(self, request: NLGRequest) -> str:
-        parts = []
-        for res in request.agent_results:
-            if isinstance(res.result_data, StructuredOrderSummary):
-                s = res.result_data
-                parts.append(f"Your order {s.order_id} is currently {s.status}.")
-                if s.estimated_delivery:
-                    parts.append(f"Estimated delivery: {s.estimated_delivery}.")
-                if s.issue_analysis and s.issue_analysis not in ("None", None):
-                    parts.append(f"Note: {s.issue_analysis}.")
-            elif isinstance(res.result_data, StructuredProductRecommendation):
-                r = res.result_data
-                parts.append(f"I recommend '{r.name}' at ${r.price} because {r.reason}.")
-            elif isinstance(res.result_data, dict):
-                snippet = res.result_data.get("answer_snippet") or res.result_data.get(
-                    "escalation_reason", ""
-                )
-                if snippet:
-                    parts.append(snippet)
-        parts.append("Is there anything else I can help you with?")
-        return " ".join(parts)
+    def call_embeddings(self, text: str) -> List[float]:
+        # print(f"  [Mock LLMInf] Generating embedding for text snippet: '{text[:20]}...'")
+        # Simulate embedding generation - simplified, actual embeddings are high-dimensional vectors
+        return [float(ord(c)) / 100 for c in text[:16]] # Use first N chars to make mock embedding somewhat unique
 
-    # ── Embeddings ────────────────────────────────────────────────────────────
-
-    def call_embeddings(self, text: str) -> list[float]:
-        """
-        Legacy direct entry point — kept for backward compatibility.
-        New code should use `services.rag.get_embeddings_model()` directly
-        (it implements LangChain's `Embeddings` interface and is what the
-        `Chroma` vectorstore uses internally).
-        """
-        from services.rag import get_embeddings_model
-
-        return get_embeddings_model().embed_query(text)
-
-
-# ---------------------------------------------------------------------------
-# Backwards-compatible alias
-# ---------------------------------------------------------------------------
-MockLLMInferenceService = LLMInferenceService
-
-
+# Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
-    import uuid
-
-    logging.basicConfig(level=logging.INFO)
-    svc = LLMInferenceService()
-
-    req = RoutingRequest(
-        session_id=str(uuid.uuid4()), conversation_history=[],
-        current_query="Where is my order 12345?",
-    )
-    print(f"Router → {svc.call_router(req)}")
-    print(f"Embedding dim={len(svc.call_embeddings('hello'))}")
+    # Set your OpenAI API key as an environment variable or uncomment and set it here
+    # os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_API_KEY" 
+    
+    if not os.getenv("OPENAI_API_KEY"):
+        print("OPENAI_API_KEY environment variable not set. Using mock fallbacks for LLM calls.")
+        # This fallback for demonstration if API key is not set, but won't be "real"
+        class MockOpenAIClient:
+            def chat(self):
+                class MockCompletions:
+                    def create(self, **kwargs):
+                        class MockChoice:
+                            message = type('obj', (object,), {'content': '{"agent_name": "GeneralPurposeAgent", "confidence": 0.5, "parameters": {}}'})()
+                        return type('obj', (object,), {'choices': [MockChoice()]})()
+                return MockCompletions()
+            def embeddings(self):
+                class MockEmbeddings:
+                    def create(self, **kwargs):
+                        class MockData:
+                            embedding = [0.0] * 1536
+                        return type('obj', (object,), {'data': [MockData()]})()
+                return MockEmbedAIClient()
+        MockLLMInferenceService.openai_client = MockOpenAIClient()
+        
+    llm_service = LLMInferenceService()
+    
+    # Mock a router call
+    router_req = RoutingRequest(session_id="test_123", conversation_history=[], current_query="Check my order")
+    agent_invoc = llm_service.call_router(router_req)
+    print(f"\nRouter Result: {agent_invoc}")
+    
+    # Mock an embedding call
+    embedding = llm_service.call_embeddings("Hello World")
+    print(f"Embedding: {embedding[:5]}...")

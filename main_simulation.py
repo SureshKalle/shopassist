@@ -1,374 +1,116 @@
 # main_simulation.py
-"""
-End-to-end simulation of the AI Agentic Customer Support Platform.
-
-What this script does:
-  1. Initialises all services (PII masker, LLM inference, RAG / ChromaDB,
-     e-commerce API client, data pipeline, specialised agents, orchestrator).
-  2. Runs the data ingestion cycle (conversations, product catalogue, policies).
-  3. Simulates five realistic customer interactions covering every agent path.
-
-Run:
-    python main_simulation.py
-
-Environment:
-    Copy .env.example to .env and fill in ANTHROPIC_API_KEY.
-    Without an API key the system runs in mock-LLM mode (all logic still executes).
-"""
-
-import logging
-import os
 import uuid
 from datetime import datetime
 
-# ── Common models ─────────────────────────────────────────────────────────────
-from common.models import (
-    CustomerQuery,
-    RawCustomerConversation,
-    RawProductRecord,
-)
-
-# ── Clients ───────────────────────────────────────────────────────────────────
+# Import all services and models
+from common.models import CustomerQuery, RawCustomerConversation, RawProductRecord
 from clients.ecommerce_api_client import MockECommerceAPIClient
-
-# ── Services ──────────────────────────────────────────────────────────────────
 from services.pii_masker import PIIMasker
-from services.llm_inference import LLMInferenceService
-from services.rag import RAGService
+from services.llm_inference import MockLLMInferenceService
+from services.rag import MockRAGService
 from services.data_pipeline import DataIngestionPipeline
-from services.orchestrator import AgentOrchestratorService
-from services.evaluation import EvaluationService, latency_timer
-
-# ── Agents ────────────────────────────────────────────────────────────────────
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
-from services.agents.returns_agent import ReturnsAgent
 from services.agents.escalation_agent import EscalationAgent
+from services.orchestrator import AgentOrchestratorService
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging setup
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+# --- Main Execution Flow (Simulates System Startup and Customer Interactions) ---
 
-
-def print_separator(title: str = "") -> None:
-    line = "─" * 80
-    if title:
-        print(f"\n{line}")
-        print(f"  {title}")
-        print(f"{line}")
-    else:
-        print(line)
-
-
-def run_interaction(
-    orchestrator: AgentOrchestratorService,
-    query: CustomerQuery,
-    latencies: list[float] | None = None,
-    statuses: list[str] | None = None,
-) -> None:
-    """Run a single customer interaction, pretty-print the result, and
-    optionally record its latency + resolution status for evaluation."""
-    print(f"\n>>> Customer ({query.user_id}): \"{query.text}\"")
-    print(f"    Session: {query.session_id}")
-
-    with latency_timer() as timer:
-        response = orchestrator.handle_customer_query(query)
-
-    print(f"\n<<< Support Bot: \"{response.response_text}\"")
-    print(f"    Agent invoked : {response.agent_invoked}")
-    print(f"    Confidence    : {response.confidence_score:.2f}")
-    print(f"    Latency       : {timer.elapsed_seconds:.3f}s")
-    print_separator()
-
-    if latencies is not None:
-        latencies.append(timer.elapsed_seconds)
-    if statuses is not None:
-        # Treat confidence 0.0 (our escalation signal) as a non-"success" outcome
-        statuses.append("escalation" if response.confidence_score == 0.0 else "success")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print_separator("AI Agentic Customer Support Platform — System Initialisation")
+    print("--- Initializing Chatbot System Components ---")
 
-    # ── 1. Core services ──────────────────────────────────────────────────────
-    pii_masker = PIIMasker()                                # regex mode by default
-    llm_service = LLMInferenceService()                      # LangChain LCEL chains (or mock fallback)
-    rag_service = RAGService()                               # LangChain Chroma vectorstore
-    ecommerce_client = MockECommerceAPIClient()              # Mock CRM / Order DB
+    # 1. Initialize Core Services
+    pii_masker = PIIMasker()
+    llm_inference_service = MockLLMInferenceService()
+    rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
+    ecommerce_api_client = MockECommerceAPIClient()
 
-    logger.info("Core services initialised.")
+    # 2. Initialize Data Ingestion Pipeline
+    data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service)
 
-    # ── 2. Data ingestion pipeline ────────────────────────────────────────────
-    pipeline = DataIngestionPipeline(pii_masker, llm_service, rag_service)
-
-    print_separator("Data Ingestion Cycle")
-
-    # ── 2a. Customer conversations ────────────────────────────────────────────
-    raw_conversations = [
-        RawCustomerConversation(
-            id="conv_001",
-            text="Hi, my name is John Doe, and I want to know about my order 12345.",
-            metadata={"source": "twitter", "user_id": "jd_123"},
-        ),
-        RawCustomerConversation(
-            id="conv_002",
-            text="Can you help me with a return for product X? My email is john.doe@example.com.",
-            metadata={"source": "web_form", "user_id": "jd_123"},
-        ),
-        RawCustomerConversation(
-            id="conv_003",
-            text="I love my new laptop! Is there a warranty? My phone is 123-456-7890.",
-            metadata={"source": "web_chat", "user_id": "cust_002"},
-        ),
+    # --- SIMULATE DATA PREPARATION & INGESTION ---
+    print("\n--- Running Data Preparation & Ingestion Cycle ---")
+    
+    # Raw Customer Conversations
+    raw_customer_conversations = [
+        RawCustomerConversation(id="conv_001", text="Hi, my name is John Doe, and I want to know about my order 12345.", metadata={"source": "twitter", "user_id": "jd_123"}),
+        RawCustomerConversation(id="conv_002", text="Can you help me with a return for product X? My email is john.doe@example.com.", metadata={"source": "web_form", "user_id": "jd_123"}),
+        RawCustomerConversation(id="conv_003", text="I love my new laptop! Is there a warranty?", metadata={"source": "web_chat", "user_id": "cust_002"}),
     ]
-    cleaned_convs = pipeline.ingest_customer_conversations(raw_conversations)
-    logger.info(
-        "Conversations ingested. Sample masked text: '%s'",
-        cleaned_convs[0].cleaned_text[:60],
-    )
+    cleaned_convs = data_pipeline.ingest_customer_conversations(raw_customer_conversations)
+    print(f"\nSample Cleaned Conversation for LLM Fine-tuning: '{cleaned_convs[0].cleaned_text[:50]}...'")
 
-    # ── 2b. Product catalogue ─────────────────────────────────────────────────
-    raw_products = [
-        RawProductRecord(
-            product_id="PROD_LAP_001",
-            raw_description=(
-                "High-performance gaming laptop with an Intel Core i7 processor, "
-                "16GB DDR5 RAM, and a 1TB NVMe SSD. Stunning 144Hz QHD display "
-                "with RGB keyboard. Ideal for gaming and creative professionals."
-            ),
-            specs={"CPU": "Intel Core i7", "RAM": "16GB DDR5", "Storage": "1TB NVMe SSD",
-                   "Display": "144Hz QHD"},
-            reviews=[
-                "Great product! Fast and reliable.",
-                "Screen is amazing, colours are vivid.",
-                "Runs hot under heavy load, but overall excellent.",
-                "Fast delivery. Jane Smith recommended it to me!",  # PII in review
-            ],
-            price="$1,200.00",
-        ),
-        RawProductRecord(
-            product_id="PROD_HEAD_002",
-            raw_description=(
-                "Premium noise-cancelling headphones for immersive audio. "
-                "Comfortable over-ear design with 20-hour battery life and "
-                "foldable build. Ideal for travel and remote work."
-            ),
-            specs={"Color": "Midnight Black", "Battery": "20 hours", "Connectivity": "Bluetooth 5.3"},
-            reviews=[
-                "Awesome sound quality!",
-                "Very comfortable for long sessions.",
-                "Noise cancellation is top-notch.",
-            ],
-            price="$250.00",
-        ),
-        RawProductRecord(
-            product_id="PROD_WATCH_003",
-            raw_description=(
-                "Smart fitness watch with heart-rate monitor, GPS, sleep tracking, "
-                "and 7-day battery. Water-resistant up to 50m. Compatible with iOS and Android."
-            ),
-            specs={"Battery": "7 days", "Water resistance": "50m", "OS": "iOS & Android"},
-            reviews=["Great for running!", "Battery life is impressive.", "GPS lock is quick."],
-            price="$199.99",
-        ),
+    # Raw E-commerce Product Catalog
+    raw_product_catalog = [
+        RawProductRecord(product_id="PROD_LAP_001", raw_description="High-performance gaming laptop with an i7 processor, 16GB RAM, and a 1TB SSD. Stunning display and RGB keyboard.", specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"}, reviews=["Great product!", "Fast delivery.", "Screen is amazing!"], price="$1200.00"),
+        RawProductRecord(product_id="PROD_HEAD_002", raw_description="Premium noise-cancelling headphones for immersive audio. Comfortable earcups and 20-hour battery life.", specs={"Color": "Black", "Battery": "20h"}, reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."], price="$250.00"),
     ]
-    cleaned_products = pipeline.ingest_product_catalog(raw_products)
-    logger.info(
-        "Products ingested. Catalogue size: %d chunks in RAG.",
-        rag_service.collection_size(),
-    )
+    cleaned_products = data_pipeline.ingest_product_catalog(raw_product_catalog)
+    print(f"\nSample Cleaned Product Description for LLM Fine-tuning: '{cleaned_products[0].clean_description[:50]}...'")
+    print(f"Product RAG vector DB now contains {len(rag_service.vector_db)} documents from initial ingestion.")
 
-    # ── 2c. Policy documents ──────────────────────────────────────────────────
-    policies = [
-        {
-            "id": "pol_returns_001",
-            "title": "Return & Refund Policy",
-            "content": (
-                "Our return policy allows customers to return most items within 30 days "
-                "of purchase, provided they are in original condition and packaging. "
-                "To initiate a return, contact support with your order ID. "
-                "Refunds are processed within 5-7 business days to the original payment method. "
-                "Electronics must be returned within 15 days. Opened software is non-refundable. "
-                "Free return shipping is provided for defective items."
-            ),
-        },
-        {
-            "id": "pol_warranty_001",
-            "title": "Warranty Policy",
-            "content": (
-                "All products come with a minimum 1-year manufacturer warranty. "
-                "Laptops and electronics carry a 2-year warranty covering manufacturing defects. "
-                "Warranty does not cover accidental damage, water damage, or unauthorised repairs. "
-                "To claim warranty, contact support with proof of purchase and a description of the issue. "
-                "Replacement units are dispatched within 3-5 business days upon approval."
-            ),
-        },
-        {
-            "id": "pol_shipping_001",
-            "title": "Shipping Policy",
-            "content": (
-                "Standard shipping takes 5-7 business days. Express shipping (2-3 days) is available "
-                "at checkout for an additional fee. Free standard shipping on orders over $50. "
-                "International shipping is available to 40+ countries. "
-                "Once shipped, you will receive a tracking number via email. "
-                "Estimated delivery dates are shown at checkout."
-            ),
-        },
-    ]
-    pipeline.ingest_policy_documents(policies)
-    logger.info(
-        "Policies ingested. Total RAG collection size: %d chunks.",
-        rag_service.collection_size(),
-    )
+    # Synthetic E-commerce Queries
+    synthetic_queries = data_pipeline.generate_synthetic_queries(["Where is my shipment?", "Suggest a gift.", "How do I return an item?"])
+    print(f"\nSynthetic queries (Sample for LLM training): {synthetic_queries[0]}, {synthetic_queries[1]}")
+    print("--- Data Preparation & Ingestion Cycle Complete ---")
 
-    # ── 2d. Optional: real-world Twitter customer-support data ────────────────
-    # Drop a "Customer Support on Twitter"-style CSV at this path to enrich
-    # the knowledge base with real inbound/outbound conversation pairs.
-    twitter_csv_path = "sample.csv"
-    if os.path.exists(twitter_csv_path):
-        twitter_convs = pipeline.ingest_twitter_support_csv(
-            twitter_csv_path, max_conversations=50
-        )
-        logger.info(
-            "Twitter support data ingested: %d conversation(s). "
-            "Total RAG collection size: %d chunks.",
-            len(twitter_convs), rag_service.collection_size(),
-        )
-    else:
-        logger.info(
-            "No Twitter support CSV found at '%s' — skipping (optional data source).",
-            twitter_csv_path,
-        )
-
-    # ── 2d. Synthetic query generation ────────────────────────────────────────
-    synthetic = pipeline.generate_synthetic_queries([
-        "Where is my shipment?",
-        "How do I return an item?",
-        "Suggest a gift for a gamer.",
-    ])
-    logger.info("Generated %d synthetic training query variants.", len(synthetic))
-
-    # ── 3. Specialised agents ─────────────────────────────────────────────────
-    print_separator("Initialising Agents")
-
-    agent_deps = (llm_service, rag_service, ecommerce_client, pii_masker)
+    # 3. Initialize Specialized Agents
     agents = {
-        "OrderTrackingAgent":        OrderTrackingAgent(*agent_deps),
-        "ProductRecommendationAgent": ProductRecommendationAgent(*agent_deps),
-        "GeneralPurposeAgent":       GeneralPurposeAgent(*agent_deps),
-        "ReturnsAgent":              ReturnsAgent(*agent_deps),
-        "EscalationAgent":           EscalationAgent(*agent_deps),
+        "OrderTrackingAgent": OrderTrackingAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
+        "ProductRecommendationAgent": ProductRecommendationAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
+        "GeneralPurposeAgent": GeneralPurposeAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
+        "EscalationAgent": EscalationAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
+        # You would add "ReturnsAgent" and other agents here
     }
-    logger.info("Registered agents: %s", list(agents.keys()))
+    print("\nInitialized Specialized AI Agents.")
 
-    # ── 4. Orchestrator ───────────────────────────────────────────────────────
-    orchestrator = AgentOrchestratorService(llm_service, pii_masker, agents)
-    logger.info("Orchestrator ready.")
+    # 4. Initialize Agent Orchestrator
+    orchestrator = AgentOrchestratorService(llm_inference_service, pii_masker, agents)
+    print("Initialized Agent Orchestrator Service.")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 5. Simulate customer interactions
-    # ─────────────────────────────────────────────────────────────────────────
-    print_separator("SYSTEM READY — Simulating Customer Interactions")
+    print("\n--- SYSTEM READY: Simulating Customer Interactions ---\n")
 
-    # Track per-turn latency and resolution status for the evaluation report
-    turn_latencies: list[float] = []
-    turn_statuses: list[str] = []
+    # --- SIMULATE CUSTOMER INTERACTIONS ---
 
-    # Interaction 1: Order status check (OrderTrackingAgent)
-    session_1 = f"session_{uuid.uuid4().hex[:8]}"
-    run_interaction(
-        orchestrator,
-        CustomerQuery(
-            session_id=session_1,
-            user_id="cust_001",
-            text="Hi, I'd like to check my order status for order 12345.",
-        ),
-        turn_latencies, turn_statuses,
-    )
+    # Interaction 1: Order Status
+    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="cust_001", text="Hi, I'd like to check my order status for order 12345.")
+    print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
+    response_1 = orchestrator.handle_customer_query(customer_query_1)
+    print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
+    print("-" * 80)
 
-    # Interaction 2: Follow-up in same session — different order (OrderTrackingAgent)
-    run_interaction(
-        orchestrator,
-        CustomerQuery(
-            session_id=session_1,          # Same session — history is maintained
-            user_id="cust_001",
-            text="Actually, my name is Jane Smith. What about order 54321, is that shipped?",
-        ),
-        turn_latencies, turn_statuses,
-    )
+    # Interaction 2: Product Recommendation
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="cust_002", text="Can you recommend a good laptop for gaming?")
+    #print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
+    #response_2 = orchestrator.handle_customer_query(customer_query_2)
+    #print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
+    #print("-" * 80)
 
-    # Interaction 3: Product recommendation (ProductRecommendationAgent)
-    session_2 = f"session_{uuid.uuid4().hex[:8]}"
-    run_interaction(
-        orchestrator,
-        CustomerQuery(
-            session_id=session_2,
-            user_id="cust_002",
-            text="Can you recommend a good laptop for gaming? My budget is around $1200.",
-        ),
-        turn_latencies, turn_statuses,
-    )
+    # Interaction 3: General Query with PII (should be masked)
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_3 = CustomerQuery(session_id=current_session_id, user_id="cust_003", text="What's your return policy? My email is John.Doe@example.com.")
+    #print(f"\n>>> Customer: '{customer_query_3.text}' (Session: {customer_query_3.session_id})")
+    #response_3 = orchestrator.handle_customer_query(customer_query_3)
+    #print(f"\n<<< Chatbot: '{response_3.response_text}' (Agent: {response_3.agent_invoked})")
+    #print("-" * 80)
 
-    # Interaction 4: Policy query with PII (GeneralPurposeAgent)
-    session_3 = f"session_{uuid.uuid4().hex[:8]}"
-    run_interaction(
-        orchestrator,
-        CustomerQuery(
-            session_id=session_3,
-            user_id="cust_003",
-            text="What's your return policy? My email is john.doe@example.com.",
-        ),
-        turn_latencies, turn_statuses,
-    )
+    # Interaction 4: Order Status with PII (should be masked & new order)
+    # Using existing session to show history awareness (though simple in mock)
+    #customer_query_4 = CustomerQuery(session_id=customer_query_1.session_id, user_id="cust_001", text="Actually, my name is Jane Smith. What about order 54321, is that shipped?")
+    #print(f"\n>>> Customer: '{customer_query_4.text}' (Session: {customer_query_4.session_id})")
+    #response_4 = orchestrator.handle_customer_query(customer_query_4)
+    #print(f"\n<<< Chatbot: '{response_4.response_text}' (Agent: {response_4.agent_invoked})")
+    #print("-" * 80)
 
-    # Interaction 5: General / unrecognised query (GeneralPurposeAgent)
-    session_4 = f"session_{uuid.uuid4().hex[:8]}"
-    run_interaction(
-        orchestrator,
-        CustomerQuery(
-            session_id=session_4,
-            user_id="cust_004",
-            text="Tell me about your company's history and founding story.",
-        ),
-        turn_latencies, turn_statuses,
-    )
+    # Interaction 5: Query leading to GeneralPurpose Agent
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_5 = CustomerQuery(session_id=current_session_id, user_id="cust_004", text="Tell me about your company's history.")
+    #print(f"\n>>> Customer: '{customer_query_5.text}' (Session: {customer_query_5.session_id})")
+    #response_5 = orchestrator.handle_customer_query(customer_query_5)
+    #print(f"\n<<< Chatbot: '{response_5.response_text}' (Agent: {response_5.agent_invoked})")
+    #print("-" * 80)
 
-    # ── Show conversation history for session_1 ───────────────────────────────
-    print_separator("Session History Demo (session_1)")
-    history = orchestrator.get_session_history(session_1)
-    for turn in history:
-        label = "Customer" if turn["role"] == "user" else "Bot"
-        print(f"  [{label}]: {turn['content'][:100]}{'…' if len(turn['content']) > 100 else ''}")
-
-    print_separator("Simulation Complete")
-    print(f"\n  RAG collection size : {rag_service.collection_size()} chunks")
-    print(f"  Sessions handled    : 4")
-    print(f"  Synthetic queries   : {len(synthetic)}")
-
-    # ── 6. Evaluation Framework report (Response Speed + Workflow Completion) ─
-    # These two dimensions need no ground-truth labels, so we can compute them
-    # directly from this simulation run. The remaining dimensions (Context
-    # Recall/Precision, Faithfulness, Answer Relevance, BERTScore F1,
-    # Hallucination Rate) need a labelled test set (questions + reference
-    # answers + retrieved contexts) — see services/evaluation.py's
-    # `build_report()` for the full-framework entry point once you have one.
-    print_separator("Evaluation Framework — Live-Measurable Dimensions")
-    evaluator = EvaluationService()
-    speed_result = evaluator.evaluate_response_speed(turn_latencies)
-    completion_result = evaluator.evaluate_workflow_completion(turn_statuses)
-    for result in (speed_result, completion_result):
-        status = "N/A" if result.passed is None else ("PASS" if result.passed else "FAIL")
-        value_str = "N/A" if result.value is None else f"{result.value:.3f}"
-        print(f"  [{status:4}] {result.name:<24} value={value_str:<8} target={result.comparator}{result.target}")
-    print()
-
+    print("\n--- Simulation Complete ---")
