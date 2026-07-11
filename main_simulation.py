@@ -14,11 +14,15 @@ from services.agents.product_recommendation_agent import ProductRecommendationAg
 from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.orchestrator import AgentOrchestratorService
+from db.init_db import build_db
 
 # --- Main Execution Flow (Simulates System Startup and Customer Interactions) ---
 
 if __name__ == "__main__":
     print("--- Initializing Chatbot System Components ---")
+
+    # 0. Initialize/Rebuild the local dev DB (schema + seed data)
+    build_db()
 
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
