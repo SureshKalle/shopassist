@@ -82,35 +82,35 @@ if __name__ == "__main__":
     print("-" * 80)
 
     # Interaction 2: Product Recommendation
-    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="cust_002", text="Can you recommend a good laptop for gaming?")
-    print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
-    response_2 = orchestrator.handle_customer_query(customer_query_2)
-    print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
-    print("-" * 80)
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="cust_002", text="Can you recommend a good laptop for gaming?")
+    #print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
+    #response_2 = orchestrator.handle_customer_query(customer_query_2)
+    #print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
+    #print("-" * 80)
 
     # Interaction 3: General Query with PII (should be masked)
-    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_3 = CustomerQuery(session_id=current_session_id, user_id="cust_003", text="What's your return policy? My email is John.Doe@example.com.")
-    print(f"\n>>> Customer: '{customer_query_3.text}' (Session: {customer_query_3.session_id})")
-    response_3 = orchestrator.handle_customer_query(customer_query_3)
-    print(f"\n<<< Chatbot: '{response_3.response_text}' (Agent: {response_3.agent_invoked})")
-    print("-" * 80)
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_3 = CustomerQuery(session_id=current_session_id, user_id="cust_003", text="What's your return policy? My email is John.Doe@example.com.")
+    #print(f"\n>>> Customer: '{customer_query_3.text}' (Session: {customer_query_3.session_id})")
+    #response_3 = orchestrator.handle_customer_query(customer_query_3)
+    #print(f"\n<<< Chatbot: '{response_3.response_text}' (Agent: {response_3.agent_invoked})")
+    #print("-" * 80)
 
     # Interaction 4: Order Status with PII (should be masked & new order)
     # Using existing session to show history awareness (though simple in mock)
-    customer_query_4 = CustomerQuery(session_id=customer_query_1.session_id, user_id="cust_001", text="Actually, my name is Jane Smith. What about order 54321, is that shipped?")
-    print(f"\n>>> Customer: '{customer_query_4.text}' (Session: {customer_query_4.session_id})")
-    response_4 = orchestrator.handle_customer_query(customer_query_4)
-    print(f"\n<<< Chatbot: '{response_4.response_text}' (Agent: {response_4.agent_invoked})")
-    print("-" * 80)
+    #customer_query_4 = CustomerQuery(session_id=customer_query_1.session_id, user_id="cust_001", text="Actually, my name is Jane Smith. What about order 54321, is that shipped?")
+    #print(f"\n>>> Customer: '{customer_query_4.text}' (Session: {customer_query_4.session_id})")
+    #response_4 = orchestrator.handle_customer_query(customer_query_4)
+    #print(f"\n<<< Chatbot: '{response_4.response_text}' (Agent: {response_4.agent_invoked})")
+    #print("-" * 80)
 
     # Interaction 5: Query leading to GeneralPurpose Agent
-    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_5 = CustomerQuery(session_id=current_session_id, user_id="cust_004", text="Tell me about your company's history.")
-    print(f"\n>>> Customer: '{customer_query_5.text}' (Session: {customer_query_5.session_id})")
-    response_5 = orchestrator.handle_customer_query(customer_query_5)
-    print(f"\n<<< Chatbot: '{response_5.response_text}' (Agent: {response_5.agent_invoked})")
-    print("-" * 80)
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_5 = CustomerQuery(session_id=current_session_id, user_id="cust_004", text="Tell me about your company's history.")
+    #print(f"\n>>> Customer: '{customer_query_5.text}' (Session: {customer_query_5.session_id})")
+    #response_5 = orchestrator.handle_customer_query(customer_query_5)
+    #print(f"\n<<< Chatbot: '{response_5.response_text}' (Agent: {response_5.agent_invoked})")
+    #print("-" * 80)
 
     print("\n--- Simulation Complete ---")
