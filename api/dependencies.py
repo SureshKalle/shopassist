@@ -23,13 +23,11 @@ from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
-from services.agents.returns_agent import ReturnsAgent
 from services.data_pipeline import DataIngestionPipeline
-from services.evaluation import EvaluationService
-from services.llm_inference import LLMInferenceService
+from services.llm_inference import MockLLMInferenceService
 from services.orchestrator import AgentOrchestratorService
 from services.pii_masker import PIIMasker
-from services.rag import RAGService
+from services.rag import MockRAGService
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +38,13 @@ def get_pii_masker() -> PIIMasker:
 
 
 @lru_cache
-def get_llm_service() -> LLMInferenceService:
-    return LLMInferenceService()
+def get_llm_service() -> MockLLMInferenceService:
+    return MockLLMInferenceService()
 
 
 @lru_cache
-def get_rag_service() -> RAGService:
-    return RAGService()
+def get_rag_service() -> MockRAGService:
+    return MockRAGService(get_llm_service())
 
 
 @lru_cache
@@ -58,12 +56,6 @@ def get_ecommerce_client() -> MockECommerceAPIClient:
 def get_data_pipeline() -> DataIngestionPipeline:
     return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service())
 
-
-@lru_cache
-def get_evaluation_service() -> EvaluationService:
-    return EvaluationService()
-
-
 @lru_cache
 def get_agents() -> dict[str, BaseAgent]:
     deps = (get_llm_service(), get_rag_service(), get_ecommerce_client(), get_pii_masker())
@@ -71,7 +63,6 @@ def get_agents() -> dict[str, BaseAgent]:
         "OrderTrackingAgent": OrderTrackingAgent(*deps),
         "ProductRecommendationAgent": ProductRecommendationAgent(*deps),
         "GeneralPurposeAgent": GeneralPurposeAgent(*deps),
-        "ReturnsAgent": ReturnsAgent(*deps),
         "EscalationAgent": EscalationAgent(*deps),
     }
     logger.info("[API] Registered agents: %s", list(agents.keys()))
@@ -95,5 +86,4 @@ def warm_up_services() -> None:
     logger.info("[API] Warming up services...")
     get_orchestrator()  # transitively constructs everything else
     get_data_pipeline()
-    get_evaluation_service()
     logger.info("[API] Service warm-up complete.")
