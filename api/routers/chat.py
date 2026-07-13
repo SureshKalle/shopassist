@@ -13,7 +13,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.dependencies import get_orchestrator
-from api.schemas import ChatRequest, ChatResponse, HistoryResponse, HistoryTurn
+from api.schemas import ChatRequest, ChatResponse
 from common.models import CustomerQuery
 from services.orchestrator import AgentOrchestratorService
 
@@ -55,28 +55,3 @@ def send_message(
         confidence_score=response.confidence_score,
         timestamp=response.timestamp,
     )
-
-
-@router.get("/{session_id}/history", response_model=HistoryResponse)
-def get_history(
-    session_id: str,
-    orchestrator: AgentOrchestratorService = Depends(get_orchestrator),
-) -> HistoryResponse:
-    """Retrieve the full conversation history for a session."""
-    history = orchestrator.get_session_history(session_id)
-    if not history:
-        raise HTTPException(status_code=404, detail=f"No history found for session '{session_id}'.")
-    return HistoryResponse(
-        session_id=session_id,
-        turns=[HistoryTurn(role=t["role"], content=t["content"]) for t in history],
-    )
-
-
-@router.delete("/{session_id}")
-def clear_session(
-    session_id: str,
-    orchestrator: AgentOrchestratorService = Depends(get_orchestrator),
-) -> dict[str, str]:
-    """Clear conversation state for a session (e.g. on customer logout)."""
-    orchestrator.clear_session(session_id)
-    return {"status": "cleared", "session_id": session_id}

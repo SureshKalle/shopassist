@@ -15,9 +15,6 @@ Structure:
       dependencies.py   <- singleton service construction (DI via lru_cache)
       routers/
         chat.py         <- POST/GET/DELETE /api/v1/chat...
-        ingestion.py    <- POST /api/v1/ingest/...
-        evaluation.py   <- POST /api/v1/evaluate
-        health.py       <- GET  /api/v1/health
 
 This file intentionally contains no business logic — every route delegates
 to the same `services/` layer used by `main_simulation.py`, so behaviour is
@@ -31,7 +28,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.dependencies import warm_up_services
-from api.routers import chat, evaluation, health, ingestion
+from api.routers import chat
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,9 +71,6 @@ app.add_middleware(
 )
 
 app.include_router(chat.router)
-app.include_router(ingestion.router)
-app.include_router(evaluation.router)
-app.include_router(health.router)
 
 
 @app.get("/", tags=["root"])
