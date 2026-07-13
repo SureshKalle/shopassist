@@ -207,7 +207,16 @@ class MockLLMInferenceService:
             else:
                 responses.append(f"Agent '{res.agent_name}' provided some information relevant to your query.")
         
-        greeting = f"Hello {request.session_id.split('_')[0]}! " if request.session_id else "Hello! "
+        # Greet by the customer's real name (looked up by customer_id, see
+        # AgentOrchestratorService.handle_customer_query) on the first turn
+        # of a session only — repeating a name on every reply reads as
+        # robotic. session_id is a conversation correlator, not identity;
+        # never derive a "name" from it (that used to say "Hello session_x!").
+        is_first_turn = len(request.conversation_history) <= 1
+        if is_first_turn:
+            greeting = f"Hi {request.customer_name}! " if request.customer_name else "Hello! "
+        else:
+            greeting = ""
         return greeting + " ".join(responses) + f" Is there anything else I can assist you with regarding '{request.final_user_intent}'?"
 
     def call_embeddings(self, text: str) -> List[float]:

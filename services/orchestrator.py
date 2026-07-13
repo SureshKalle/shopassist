@@ -6,6 +6,7 @@ from common.models import (
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import MockLLMInferenceService
+from services.ecommerce_client import ECommerceAPIClient
 from services.agents.base_agent import BaseAgent # For type hinting the agents dictionary
 
 class AgentOrchestratorService:
@@ -15,10 +16,11 @@ class AgentOrchestratorService:
     conversation history, and final customer-facing natural language synthesis.
     """
     def __init__(self, llm_inference_client: MockLLMInferenceService, pii_masker: PIIMasker,
-                 agents: Dict[str, BaseAgent]):
+                 agents: Dict[str, BaseAgent], ecommerce_api_client: ECommerceAPIClient):
         self.llm_inference_client = llm_inference_client
         self.pii_masker = pii_masker
         self.agents = agents # Dictionary of agent_name -> Agent instance
+        self.ecommerce_api_client = ecommerce_api_client
         self.conversation_history_db: Dict[str, List[Dict[str, str]]] = {} # Mock DB: {session_id: List[Dict]}
         self.agent_state_store: Dict[str, Dict[str, Any]] = {} # Mock Store: {session_id: Dict}
         self.orchestrator_routing_cache: Dict[str, AgentInvocation] = {} # Cache1
@@ -34,6 +36,7 @@ class AgentOrchestratorService:
         # 2. Conversation History Retrieval & Context (PII-masked)
         session_id = query.session_id
         user_id = query.user_id
+        is_first_turn = session_id not in self.conversation_history_db
         current_history = self.conversation_history_db.get(session_id, [])
         current_history.append({"role": "user", "content": masked_query.masked_text})
         
@@ -93,11 +96,17 @@ class AgentOrchestratorService:
 
         # 5. Final Natural Language Synthesis (LLMInf_Generative)
         print("\n  Aggregating agent results for final NLG (LLMInf_Generative)...")
+        # Only look up the customer's name on their first turn in this session —
+        # greeting by name on every single reply reads as robotic, and it saves
+        # a DB round-trip on every message. Never derive a "name" from
+        # session_id: that's a conversation correlator, not identity.
+        customer_name = self.ecommerce_api_client.get_customer_name(user_id) if is_first_turn else None
         nlg_request = NLGRequest(
             session_id=session_id,
             conversation_history=current_history,
             agent_results=agent_results,
-            final_user_intent=agent_invocation.agent_name # Simplified
+            final_user_intent=agent_invocation.agent_name, # Simplified
+            customer_name=customer_name,
         )
         final_response_text = self.llm_inference_client.call_generative(nlg_request)
         

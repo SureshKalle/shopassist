@@ -97,6 +97,7 @@ class NLGRequest(BaseModel):
     conversation_history: List[Dict[str, str]] # PII-masked
     agent_results: List[StructuredAgentResult]
     final_user_intent: str # As interpreted by Orchestrator
+    customer_name: Optional[str] = None # Looked up by customer_id; None if unknown/unresolvable
 
 # --- Data Ingestion Models ---
 class RawCustomerConversation(BaseModel):

@@ -4,7 +4,7 @@ from typing import Dict, Any
 from common.models import AgentTask, StructuredAgentResult
 from services.llm_inference import MockLLMInferenceService
 from services.rag import MockRAGService
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from services.ecommerce_client import ECommerceAPIClient
 from services.pii_masker import PIIMasker
 
 class BaseAgent(ABC):
@@ -13,7 +13,7 @@ class BaseAgent(ABC):
     Defines the common interface and shared dependencies.
     """
     def __init__(self, name: str, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService,
-                 ecommerce_api_client: MockECommerceAPIClient, pii_masker: PIIMasker):
+                 ecommerce_api_client: ECommerceAPIClient, pii_masker: PIIMasker):
         self.name = name
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service

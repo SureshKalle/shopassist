@@ -5,7 +5,7 @@ from db.init_db import build_db
 
 # Import all services and models
 from common.models import CustomerQuery, RawCustomerConversation, RawProductRecord
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from services.ecommerce_client import ECommerceAPIClient
 from services.pii_masker import PIIMasker
 from services.llm_inference import MockLLMInferenceService
 from services.rag import MockRAGService
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     pii_masker = PIIMasker()
     llm_inference_service = MockLLMInferenceService()
     rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
-    ecommerce_api_client = MockECommerceAPIClient()
+    ecommerce_api_client = ECommerceAPIClient()
 
     # 2. Initialize Data Ingestion Pipeline
     data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service)
@@ -70,7 +70,7 @@ if __name__ == "__main__":
     print("\nInitialized Specialized AI Agents.")
 
     # 4. Initialize Agent Orchestrator
-    orchestrator = AgentOrchestratorService(llm_inference_service, pii_masker, agents)
+    orchestrator = AgentOrchestratorService(llm_inference_service, pii_masker, agents, ecommerce_api_client)
     print("Initialized Agent Orchestrator Service.")
 
     print("\n--- SYSTEM READY: Simulating Customer Interactions ---\n")

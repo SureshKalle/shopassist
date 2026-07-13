@@ -17,7 +17,7 @@ mechanisms (FastAPI DI vs. plain function calls).
 import logging
 from functools import lru_cache
 
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from services.ecommerce_client import ECommerceAPIClient
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
@@ -48,8 +48,8 @@ def get_rag_service() -> MockRAGService:
 
 
 @lru_cache
-def get_ecommerce_client() -> MockECommerceAPIClient:
-    return MockECommerceAPIClient()
+def get_ecommerce_client() -> ECommerceAPIClient:
+    return ECommerceAPIClient()
 
 
 @lru_cache
@@ -71,7 +71,7 @@ def get_agents() -> dict[str, BaseAgent]:
 
 @lru_cache
 def get_orchestrator() -> AgentOrchestratorService:
-    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents())
+    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents(), get_ecommerce_client())
 
 
 def warm_up_services() -> None:

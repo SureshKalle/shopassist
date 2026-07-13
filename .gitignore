@@ -1,3 +1,14 @@
+# shopassist :: project-specific
+# macOS Finder junk
+.DS_Store
+._*
+
+# Generated local SQLite dev DB (built by db/init_db.py from schema_sqlite.sql
+# + seed_data.sql — schema.sql/schema_sqlite.sql/seed_data.sql are the source
+# of truth, not this binary file).
+db/*.db
+db/*.db-journal
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -149,6 +160,9 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.production.example
 .envrc
 .venv
 env/

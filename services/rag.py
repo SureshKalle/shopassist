@@ -14,6 +14,10 @@ class MockRAGService:
         self.rag_query_cache: Dict[str, List[ChunkedDocument]] = {}
         self.llm_inference_client = llm_inference_client
 
+    def collection_size(self) -> int:
+        """Number of chunks currently ingested — used by the /health endpoint."""
+        return len(self.vector_db)
+
     def query_knowledge_base(self, query_embedding: List[float], query_text: str, top_k: int = 1) -> List[ChunkedDocument]:
         print(f"  [Mock RAG] Querying knowledge base for '{query_text}'...")
         

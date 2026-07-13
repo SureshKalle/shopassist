@@ -11,7 +11,7 @@ layer can evolve its request/response shape independently.
 """
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,4 +34,14 @@ class ChatResponse(BaseModel):
     agent_invoked: Optional[str] = None
     confidence_score: float
     timestamp: datetime
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+class HealthResponse(BaseModel):
+    status: str
+    registered_agents: list[str]
+    rag_collection_size: int
+    database_reachable: bool
 

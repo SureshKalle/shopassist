@@ -2,9 +2,11 @@
 """
 Chat endpoints — the primary customer-facing conversational API.
 
-POST   /api/v1/chat                      → send a message, get a response
-GET    /api/v1/chat/{session_id}/history → retrieve conversation history
-DELETE /api/v1/chat/{session_id}         → clear a session
+POST /api/v1/chat → send a message, get the orchestrated response.
+
+There's no session history/clear endpoint here — AgentOrchestratorService
+doesn't expose one (its history dict is internal), so those routes were
+removed rather than shipped calling a method that doesn't exist.
 """
 
 import logging

@@ -14,7 +14,8 @@ Structure:
       schemas.py        <- HTTP request/response Pydantic models
       dependencies.py   <- singleton service construction (DI via lru_cache)
       routers/
-        chat.py         <- POST/GET/DELETE /api/v1/chat...
+        chat.py         <- POST /api/v1/chat
+        health.py       <- GET  /api/v1/health
 
 This file intentionally contains no business logic — every route delegates
 to the same `services/` layer used by `main_simulation.py`, so behaviour is
@@ -28,7 +29,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.dependencies import warm_up_services
-from api.routers import chat
+from api.routers import chat, health
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +72,7 @@ app.add_middleware(
 )
 
 app.include_router(chat.router)
+app.include_router(health.router)
 
 
 @app.get("/", tags=["root"])

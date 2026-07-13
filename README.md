@@ -1,273 +1,244 @@
----
-title: "AI Agentic Customer Support Platform"
-subtitle: "How It Works"
-output: html_document
----
+# shopassist — AI Agentic Customer Support Platform
 
-# 🤖 AI Agentic Customer Support Platform — How It Works
+FastAPI backend for a multi-agent e-commerce support chatbot: an LLM router
+picks a specialist agent (order tracking, product recommendation, general
+Q&A) per message, agents call out to a real order database and a knowledge
+base, and a final reply gets returned to whatever's calling it — right now
+that's the `shopassist-streamlit` storefront's chat widget, over plain HTTP.
 
-This document walks through **exactly what happens, step by step**, when you run `main_simulation.py`. No jargon — just what gets called, what goes in, what comes out, and why each step exists. If you read nothing else in this project, read this.
+This README describes what's actually implemented, not the target
+architecture. Where something is a placeholder rather than the real thing,
+it says so — see **Known issues / limitations** below before you assume a
+piece of this is more finished than it is.
 
-Think of `main_simulation.py` as a stage director: it wakes up every actor (service/agent), hands them a script (sample customer messages), and lets you watch the whole play unfold in your terminal.
+## What's actually here
 
----
+- **4 agents**, not 5: `OrderTrackingAgent`, `ProductRecommendationAgent`,
+  `GeneralPurposeAgent`, `EscalationAgent`. A `ReturnsAgent` was planned
+  (the router's own prompt still lists it as a valid target — see Known
+  issues) but was never built; return/refund questions fall through to
+  `GeneralPurposeAgent` or escalate.
+- **Routing and per-agent tool-planning are real LLM calls** — via an
+  OpenAI-compatible client pointed at a local Ollama server
+  (`services/llm_inference.py::call_router` / `call_agent_reason`).
+- **Order lookups are real** — `services/ecommerce_client.py` runs actual
+  SQL (SQLAlchemy) against a database: SQLite locally
+  (`db/shopassist.db`), or Postgres if you set `DATABASE_URL`.
+- **The knowledge base is not real RAG yet** — `services/rag.py` is an
+  in-memory dict matched by substring (`if query_text in doc.content`),
+  and `call_embeddings()` returns character codes, not a real embedding.
+  It's there so the agent shapes are right; the retrieval quality isn't.
+- **The final customer-facing reply is not LLM-generated** —
+  `call_generative()` builds it with plain string templates. The two real
+  LLM calls above happen earlier in the pipeline (routing, tool planning);
+  by the time a reply is assembled, it's back to templating.
+- **PII masking is literal string replacement** for a handful of
+  known-fixture values (`"John Doe"`, one hardcoded email, etc.) — not
+  regex, not NER. Treat it as a placeholder for a real masking pass, not
+  an actual privacy guarantee.
 
-## 📑 Table of Contents
+## API
 
-1. [The cast of characters](#1-the-cast-of-characters)
-2. [Startup: stocking the shelves (Data Ingestion)](#2-startup-stocking-the-shelves-data-ingestion)
-3. [Hiring the staff: Agents and the Orchestrator](#3-hiring-the-staff-agents-and-the-orchestrator)
-4. [A single customer interaction, start to finish](#4-a-single-customer-interaction-start-to-finish)
-5. [Workflow diagram](#5-workflow-diagram)
-6. [What the whole simulation actually demonstrates](#6-what-the-whole-simulation-actually-demonstrates)
-7. [Where to look if you want to see the code yourself](#7-where-to-look-if-you-want-to-see-the-code-yourself)
-
----
-
-## 1. The cast of characters
-
-Before any conversation happens, the simulation builds seven "workers," each with one clear job. This happens once, at startup — like opening a store before customers walk in.
-
-| Worker (class) | Its one job | Analogy |
-|---|---|---|
-| `PIIMasker` | Find and hide personal details (names, emails, phone numbers) before anything is sent to an AI model | The front-desk clerk who blacks out sensitive info before photocopying a form |
-| `LLMInferenceService` | Talk to the actual AI model (Groq/Ollama/Anthropic) — routing decisions, generating replies | The translator who phrases everything into a customer-friendly sentence |
-| `RAGService` | Store and search company knowledge (policies, product info, past conversations) | The reference librarian who fetches the right page instantly |
-| `MockECommerceAPIClient` | Look up real order/customer data (stands in for a real CRM/order database) | The warehouse clerk who checks a shipment's status |
-| `DataIngestionPipeline` | Clean, anonymise, and file away raw data so it's searchable later | The archivist who organises paperwork into labelled folders |
-| Five **Agents** (`OrderTrackingAgent`, `ProductRecommendationAgent`, `ReturnsAgent`, `GeneralPurposeAgent`, `EscalationAgent`) | Each handles one *type* of request | Specialist staff — one handles shipping questions, one handles product advice, one handles returns, one's a generalist, one hands off to a human |
-| `AgentOrchestratorService` | The manager who listens to the customer, decides which specialist to call, and delivers the final answer | The call-centre supervisor who routes your call and reads back the resolution |
-
-Every one of these is a real Python class in this codebase. Nothing here is invented for this explanation — you can open the file and read the exact code.
-
----
-
-## 2. Startup: stocking the shelves (Data Ingestion)
-
-Before any customer can be helped, the "store" needs stock — a knowledge base the AI can search. This is `DataIngestionPipeline`'s job, and it runs three times in the simulation, once per data source:
-
-### 2a. Past customer conversations → `pipeline.ingest_customer_conversations(raw_conversations)`
-
-**Input:** Raw, messy conversation text, e.g.:
-> *"Hi, my name is John Doe, and I want to know about my order 12345."*
-
-**What happens inside, step by step:**
-1. **Clean it** — lowercase, strip extra whitespace, remove stray HTML/URLs.
-2. **Mask it** — hand the text to `PIIMasker.mask_text()`, which turns `John Doe` into `[NAME]` and any email/phone into `[EMAIL]`/`[PHONE]`. This is a hard rule in this system: **no personal data is ever allowed to reach the AI model.**
-3. **Chunk it** — if the text is long, `RecursiveCharacterTextSplitter` breaks it into bite-sized pieces (so search results later are focused, not walls of text).
-4. **Store it** — each chunk is embedded (turned into a list of numbers that captures its *meaning*, not just its words) and saved into `RAGService`, which is backed by a ChromaDB vector database.
-
-**Output:** A list of `CleanedCustomerConversation` records, and the chunks are now searchable in the knowledge base.
-
-> 💡 **Why it matters:** Later, when a customer asks "what's your return policy," the system needs *something* to search. This step is what makes that search possible — and doing the PII-masking here (at ingestion time, not later) means sensitive data never even gets a chance to leak downstream.
-
-### 2b. Product catalogue → `pipeline.ingest_product_catalog(raw_products)`
-
-Same idea, but for products: descriptions, specs, and customer reviews. Reviews go through PII-masking too — the sample data even has a review that mentions someone's name (`"...Jane Smith recommended it to me!"`), which gets masked exactly like a conversation would.
-
-> 💡 **Why it matters:** This is what lets `ProductRecommendationAgent` later "know about" the gaming laptop, headphones, and smartwatch in the sample catalogue.
-
-### 2c. Company policies → `pipeline.ingest_policy_documents(policies)`
-
-Plain policy text (returns, warranty, shipping) gets chunked and stored the same way.
-
-> 💡 **Why it matters:** This is what lets `ReturnsAgent` and `GeneralPurposeAgent` answer policy questions accurately instead of guessing.
-
-### (Optional) 2d. Real-world Twitter support data → `pipeline.ingest_twitter_support_csv(csv_path)`
-
-If a CSV like the sample "Customer Support on Twitter" dataset is present, this method pairs up each customer tweet with the company's actual reply (using the CSV's `response_tweet_id` column), turns each pair into a mini-conversation, and ingests it exactly like 2a. This is how the system can be seeded with *real* historical support data instead of only hand-written examples.
-
-**After this whole stocking phase**, `rag_service.collection_size()` reports how many searchable chunks exist — in a typical run, this grows from 0 → 9 (policies) → 58+ (once Twitter data is added).
-
----
-
-## 3. Hiring the staff: Agents and the Orchestrator
-
-```python
-agents = {
-    "OrderTrackingAgent":         OrderTrackingAgent(...),
-    "ProductRecommendationAgent": ProductRecommendationAgent(...),
-    "GeneralPurposeAgent":        GeneralPurposeAgent(...),
-    "ReturnsAgent":               ReturnsAgent(...),
-    "EscalationAgent":            EscalationAgent(...),
-}
-orchestrator = AgentOrchestratorService(llm_service, pii_masker, agents)
-```
-
-Each agent is handed the same four tools (`llm_service`, `rag_service`, `ecommerce_client`, `pii_masker`) but uses them differently depending on its specialty — like five staff members sharing the same filing cabinet and phone line but each trained for a different kind of call.
-
-The `AgentOrchestratorService` is the one object that the rest of the system actually talks to. Nobody calls an agent directly — they always go through the orchestrator, the same way a customer never picks their own specialist; the supervisor routes the call.
-
----
-
-## 4. A single customer interaction, start to finish
-
-This is the heart of the system. Every customer message goes through the exact same seven-step pipeline, no matter what they ask. Let's trace **one real example** captured from an actual simulation run.
-
-**Customer says:** *"Hi, I'd like to check my order status for order 12345."*
-**Called as:** `orchestrator.handle_customer_query(query)`
-
-### Step 1 — Mask personal information
-`PIIMasker.mask_text(query.text)` scans the message. In this example there's no name/email to hide, so the text passes through unchanged. (Compare this to interaction 2 later, where "my name is Jane Smith" becomes `"my name is [NAME]"` before the AI ever sees it.)
-
-### Step 2 — Remember the conversation so far
-The message is added to that session's chat history (`InMemoryChatMessageHistory`). If this is a follow-up question, earlier turns are included here too — this is how the system "remembers" what was said two messages ago.
-
-### Step 3 — Decide who should handle it (Routing)
-The masked text + recent history is sent to `LLMInferenceService.call_router()`. This is a genuine AI decision: the model reads the message and picks one of four specialists — `OrderTrackingAgent`, `ProductRecommendationAgent`, `ReturnsAgent`, or `GeneralPurposeAgent` — along with a confidence score.
-
-> For "check my order status for order 12345" → the router picks **`OrderTrackingAgent`**, confidence **0.90**.
-
-*(A quick check happens first: if this exact question was asked very recently, the system reuses the last routing decision instead of asking the AI again — a small optimisation called `Cache1`.)*
-
-### Step 4 — Hand the task to the specialist
-The orchestrator builds an `AgentTask` (a small package containing the question, the customer ID, and conversation history) and calls that agent's `process_task(task)` method.
-
-**Inside `OrderTrackingAgent.process_task()`:**
-1. It figures out the order number is `12345` (pulled from the routing step or found directly in the text via a pattern match).
-2. It asks the AI to plan its next move — this is a small reasoning loop where the AI decides: *"I need to call the order-lookup tool."*
-3. It actually calls `MockECommerceAPIClient.get_order_details(customer_id, order_id)` — this is the one place in the whole system that touches something resembling a real database.
-   **Output:** `{"order_id": "12345", "status": "Shipped", "items": [...], "estimated_delivery": "2024-08-10"}`
-4. It interprets that raw data — is anything wrong with this order? (Here: no, it shipped fine.)
-5. It packages everything into a `StructuredOrderSummary` — a clean, predictable shape that any downstream code can rely on, regardless of what the AI happened to say.
-
-> ⚠️ **If something goes wrong here** — the agent can't find the order, the AI itself gets stuck, or any unhandled error occurs — the orchestrator automatically falls back to `EscalationAgent`, which prepares a summary for a human to take over. No customer message is ever silently dropped.
-
-### Step 5 — Turn the structured result into a human sentence
-The `StructuredOrderSummary` from Step 4 gets sent to `LLMInferenceService.call_generative()`, along with the conversation history. This is the only step whose entire job is *wording* — turning `status: Shipped, estimated_delivery: 2024-08-10` into an actual warm sentence a customer would want to read.
-
-> **Output:** *"Your order 12345 is currently Shipped. Estimated delivery: 2024-08-10. Note: Order is on its way. Is there anything else I can help you with?"*
-
-### Step 6 — Remember the answer too
-The bot's reply is added to the same conversation history as the customer's message — so if they ask a follow-up next, the system has the full back-and-forth.
-
-### Step 7 — Hand back a clean response
-The orchestrator returns a `ChatbotResponse` object: the reply text, which agent handled it, and a confidence score. This is what actually gets displayed to the customer (or, in the FastAPI/Streamlit layers, sent back over the API).
+Two endpoints:
 
 ```
-<<< Support Bot: "Your order 12345 is currently Shipped. Estimated delivery: 2024-08-10.
-                   Note: Order is on its way. Is there anything else I can help you with?"
-    Agent invoked : OrderTrackingAgent
-    Confidence    : 0.90
-    Latency       : 0.001s
+POST /api/v1/chat
+GET  /api/v1/health
 ```
 
-That's it. Every single customer message in this system — order questions, product asks, returns, general questions — goes through these exact same seven steps. Only Step 4 (which specialist, which tools) changes.
+### `POST /api/v1/chat`
 
----
-
-## 5. Workflow diagram
-
-```mermaid
-flowchart TD
-    A["Customer message arrives<br/><i>'Check my order 12345'</i>"] --> B["Step 1: PIIMasker.mask_text()<br/>Hide names/emails/phones"]
-    B --> C["Step 2: Add to conversation history<br/>(InMemoryChatMessageHistory)"]
-    C --> D["Step 3: LLMInferenceService.call_router()<br/>AI decides: which specialist?"]
-
-    D -->|order question| E1["OrderTrackingAgent"]
-    D -->|product question| E2["ProductRecommendationAgent"]
-    D -->|return/refund| E3["ReturnsAgent"]
-    D -->|general/FAQ| E4["GeneralPurposeAgent"]
-
-    E1 --> F1["Calls MockECommerceAPIClient<br/>.get_order_details()"]
-    E2 --> F2["Searches RAGService<br/>(product knowledge base)"]
-    E3 --> F3["Searches RAGService<br/>(policy knowledge base)"]
-    E4 --> F4["Searches RAGService<br/>(general knowledge base)"]
-
-    F1 --> G["Structured result built<br/>e.g. StructuredOrderSummary"]
-    F2 --> G
-    F3 --> G
-    F4 --> G
-
-    E1 -.error/can't resolve.-> H["EscalationAgent<br/>prepares handover for a human"]
-    E2 -.error/can't resolve.-> H
-    E3 -.error/can't resolve.-> H
-    E4 -.error/can't resolve.-> H
-    H --> G
-
-    G --> I["Step 5: LLMInferenceService.call_generative()<br/>Turn structured data into a friendly reply"]
-    I --> J["Step 6: Add bot reply to conversation history"]
-    J --> K["Step 7: Return ChatbotResponse<br/>to the customer"]
-
-    style A fill:#e1f0ff
-    style K fill:#d4f4dd
-    style H fill:#ffe4e1
+```json
+{ "session_id": null, "user_id": "1", "text": "Where is order 12345?", "source_channel": "web_chat" }
 ```
 
-If your viewer doesn't render Mermaid diagrams, here's the same flow as plain text:
+`session_id` is optional — omit it to start a new conversation; the
+response echoes back the one you should reuse for the next turn.
 
-```
-Customer message
-      |
-      v
-[1] PIIMasker -- hide personal info
-      |
-      v
-[2] Add to conversation history
-      |
-      v
-[3] AI Router -- pick a specialist
-      |
-      +-- OrderTrackingAgent ---------> looks up order via ECommerce API
-      +-- ProductRecommendationAgent -> searches product knowledge base
-      +-- ReturnsAgent ---------------> searches policy knowledge base
-      +-- GeneralPurposeAgent --------> searches general knowledge base
-              |
-              | (any agent can fail/hand off)
-              v
-      EscalationAgent -- prepares handover for a human
-              |
-              v
-      Structured result (e.g. order status, product pick, policy answer)
-              |
-              v
-[5] AI Generator -- turn structured result into a friendly sentence
-              |
-              v
-[6] Add bot reply to conversation history
-              |
-              v
-[7] Return final answer to the customer
+```json
+{ "session_id": "session_a1b2c3d4e5f6", "response_text": "...",
+  "agent_invoked": "OrderTrackingAgent", "confidence_score": 1.0,
+  "timestamp": "2026-07-13T20:06:50.766424" }
 ```
 
----
+`confidence_score` is currently always `1.0` regardless of what the router
+actually returned — see Known issues.
 
-## 6. What the whole simulation actually demonstrates
+### `GET /api/v1/health`
 
-`main_simulation.py` runs **five interactions in a row**, each chosen to exercise a different path through the diagram above:
+```json
+{ "status": "ok",
+  "registered_agents": ["OrderTrackingAgent", "ProductRecommendationAgent", "GeneralPurposeAgent", "EscalationAgent"],
+  "rag_collection_size": 0,
+  "database_reachable": true }
+```
 
-| # | Customer says | Routed to | What it proves |
-|---|---|---|---|
-| 1 | "Check my order status for order 12345" | `OrderTrackingAgent` | The basic happy path — order lookup, no PII, clean answer |
-| 2 | "Actually, my name is Jane Smith. What about order 54321?" (same session as #1) | `OrderTrackingAgent` | **Two things at once:** PII masking catches the name (`Jane Smith` becomes `[NAME]`), *and* conversation memory works — this message reuses the same session as #1 |
-| 3 | "Recommend a good laptop for gaming, budget $1200" | `ProductRecommendationAgent` | Looks up the customer's purchase history, then searches the product knowledge base for a match |
-| 4 | "What's your return policy? My email is john.doe@example.com" | `ReturnsAgent` | PII masking catches the email; the answer comes from the *ingested policy document*, not a made-up response |
-| 5 | "Tell me about your company's history" | `GeneralPurposeAgent` | A question with no good match in the knowledge base -- shows how the system behaves when it *doesn't* have a great answer (falls back to the closest available RAG snippet rather than refusing outright) |
+Doesn't throw on a downstream outage — a dead database shows up as
+`database_reachable: false` in a 200, not a 500 that takes the health
+check out along with it.
 
-After all five, the simulation prints:
-- The **full conversation history** for session 1 (proving interactions 1 and 2 really did share memory)
-- The final **knowledge base size** (how many chunks were ingested)
-- A live **evaluation snapshot** — average response latency and what percentage of interactions were fully resolved vs. escalated (see `services/evaluation.py` for the full 7-dimension framework this hooks into)
+There used to be `ingestion`, `evaluation`, and chat history/clear
+endpoints too; they called into modules (`services/evaluation.py`,
+`services/agents/returns_agent.py`, a couple of `common/` files) that
+never actually got written, so the app couldn't start. They were removed
+rather than stubbed out — see `git log` around "removed unused codebase"
+if you want the story. `/health` here is new, re-added because a
+deployed service without one is a pain to run behind anything.
 
----
+## Running locally
 
-## 7. Where to look if you want to see the code yourself
+You need Python 3.10+, and Ollama running locally with two models pulled
+(everything degrades to rule-based fallbacks without it, but routing and
+tool-planning stop being AI-driven):
 
-| If you want to understand... | Open this file |
-|---|---|
-| The one method that runs every customer interaction | `services/orchestrator.py` -> `handle_customer_query()` |
-| How personal data gets hidden | `services/pii_masker.py` |
-| How the AI decides which specialist to use | `services/llm_inference.py` -> `call_router()` |
-| How each specialist actually does its job | `services/agents/*.py` (one file per specialist) |
-| How company knowledge gets stored and searched | `services/rag.py` |
-| How raw data becomes searchable knowledge | `services/data_pipeline.py` |
-| How to measure whether the system is performing well | `services/evaluation.py` |
-| The full simulation, start to finish | `main_simulation.py` -- literally the script this whole document explains |
-
-**To run it yourself:**
 ```bash
+ollama pull llama3:8b-instruct
+ollama pull nomic-embed-text
+```
+
+Then:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in your LLM provider's API key (or leave blank for mock mode)
+cp .env.example .env             # defaults match a local Ollama install
+python db/init_db.py             # builds db/shopassist.db from schema + seed data
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Docs at `http://localhost:8000/docs`. Try it:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "1", "text": "Where is order 12345?"}'
+```
+
+Or run the standalone simulation instead of the API — same services, no
+HTTP:
+
+```bash
 python main_simulation.py
 ```
-Without any API key filled in, every agent still runs -- it just uses simple rule-based fallback logic instead of AI reasoning, so you can see the *shape* of the system working even with zero setup.
+
+It only runs one interaction by default; four more are written but
+commented out at the bottom of the file (product recommendation, a
+returns-policy question, a second order lookup with PII in it, and a
+general question with no good match). Uncomment them to see more of the
+routing in action — the returns one will demonstrate the `ReturnsAgent`
+gap described in Known issues rather than a real returns flow.
+
+## Configuration
+
+`.env` (gitignored — `.env.example` is the checked-in template):
+
+```env
+OLLAMA_API_BASE_URL=http://localhost:11434
+OLLAMA_ROUTER_MODEL=llama3:8b-instruct
+OLLAMA_AGENT_REASON_MODEL=llama3:8b-instruct
+OLLAMA_AGENT_INTERPRET_MODEL=llama3:8b-instruct
+OLLAMA_GENERATIVE_MODEL=llama3:8b-instruct
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+```
+
+`DATABASE_URL` isn't in that list because it's optional — unset, it falls
+back to the local SQLite file. Set it to point at Postgres instead (e.g.
+`shopassist-database`'s instance):
+
+```
+DATABASE_URL=postgresql://shopassist:shopassist123@localhost:5432/shopassist
+```
+
+For a server deployment, `.env.production.example` documents the same
+variables with production-shaped placeholders (a real Postgres URL, an
+Ollama endpoint that isn't `localhost`) — copy it to `.env.production` and
+fill in real values through your platform's secret manager, don't commit
+the filled-in version.
+
+## Known issues / limitations
+
+Worth knowing before you build on top of this:
+
+- **The router can recommend an agent that doesn't exist.** The system
+  prompt in `call_router` lists `ReturnsAgent` as a valid target
+  (`services/llm_inference.py`), but it's not registered in
+  `api/dependencies.py::get_agents()` or `main_simulation.py`. When the
+  router picks it, `orchestrator.py` falls back to `EscalationAgent` —
+  so returns questions work, technically, they just always escalate to a
+  human instead of getting handled.
+- **`confidence_score` in the API response is always `1.0`.** The router
+  computes a real confidence value, but `orchestrator.py`'s
+  `handle_customer_query()` never passes it into the `ChatbotResponse` it
+  builds, so the Pydantic default (`1.0`) is what actually ships. The
+  number the router computed is discarded.
+- ~~The chat reply's greeting derives a "name" from `session_id`~~ **fixed.**
+  `call_generative()` now greets with `NLGRequest.customer_name`, looked up
+  by `user_id` via `ECommerceAPIClient.get_customer_name()` in
+  `orchestrator.py`, once per session (first turn only — it doesn't repeat
+  on every reply). Falls back to a plain "Hello!" when `user_id` isn't a
+  real numeric customer ID, rather than fabricating a name.
+- **`user_id` from the chat request and the database's numeric
+  `customer_id` aren't the same namespace.** `get_order_details()` only
+  enforces ownership when `user_id` happens to parse as an int; otherwise
+  it skips the check rather than reject the request. Degrades gracefully,
+  but isn't real authorization.
+- **This service and `shopassist-database` maintain separate schemas.**
+  `db/schema.sql` here (`customers` / `items` / `sessions` / `orders` /
+  `order_items`) isn't the same shape as `shopassist-database`'s
+  (`customers` / `products` / `orders` / `order_items`), despite that repo
+  being meant as the platform's shared source of truth. Pointing
+  `DATABASE_URL` at it today would mean rewriting the queries in
+  `services/ecommerce_client.py` to match its column names.
+- **Only Ollama is actually wired up as an LLM provider.** `openai` is
+  the client library, but `services/llm_inference.py` hardcodes
+  `api_key="ollama"` — there's no path to a hosted provider (OpenAI,
+  Anthropic) without a code change, regardless of what you set in `.env`.
+- **Session/conversation state is in-process memory** on the
+  `AgentOrchestratorService` singleton — gone on restart, and won't work
+  correctly if you ever run more than one instance behind a load balancer.
+
+## Project structure
+
+```
+shopassist/
+├── api/
+│   ├── main.py              app instance, lifespan, router wiring
+│   ├── schemas.py            HTTP request/response models
+│   ├── dependencies.py       singleton service construction (DI via lru_cache)
+│   └── routers/
+│       ├── chat.py           POST /api/v1/chat
+│       └── health.py         GET  /api/v1/health
+├── services/
+│   ├── orchestrator.py       routes each message through PII mask → agent → reply
+│   ├── llm_inference.py      LLM calls (router, tool-planning) + the templated reply
+│   ├── rag.py                in-memory keyword-matched "knowledge base"
+│   ├── pii_masker.py         literal-string PII redaction
+│   ├── ecommerce_client.py   real SQL against the order/customer database
+│   ├── data_pipeline.py      cleans/masks/chunks raw text before it hits rag.py
+│   └── agents/               one file per specialist agent
+├── common/
+│   └── models.py             internal Pydantic domain models shared across services/
+├── db/
+│   ├── schema.sql             Postgres/Supabase schema (source of truth for prod)
+│   ├── schema_sqlite.sql       same schema, adapted for local SQLite
+│   ├── seed_data.sql           demo customers/items/orders
+│   ├── init_db.py              rebuilds db/shopassist.db from the two files above
+│   └── shopassist.db           generated locally, gitignored
+├── main_simulation.py         CLI run of the same services, no HTTP
+├── requirements.txt
+├── .env.example
+└── .env.production.example
+```
+
+## Not done yet
+
+- A `ReturnsAgent` that actually exists (see Known issues)
+- Real RAG: real embeddings, a real vector store, real chunking
+- The reply-generation step actually calling an LLM
+- Regex/NER-based PII masking instead of hardcoded literals
+- Session state in Redis or Postgres instead of process memory
+- Auth on the API (currently wide open; CORS is `allow_origins=["*"]`)
+- Reconciling this repo's DB schema with `shopassist-database`'s
+- A Dockerfile — there isn't one yet, despite `shopassist-database`
+  already having a docker-compose setup this could sit alongside
