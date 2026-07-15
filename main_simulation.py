@@ -22,7 +22,7 @@ if __name__ == "__main__":
     print("--- Initializing Chatbot System Components ---")
 
     # 0. Initialize/Rebuild the local dev DB (schema + seed data)
-    #build_db()
+    build_db()
     
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
@@ -79,7 +79,7 @@ if __name__ == "__main__":
 
     # Interaction 1: Order Status
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="cust_001", text="Hi, I'd like to check my order status for order 54321.")
+    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="cust_001", text="Hi, I'd like to check my order status for order 3.")
     print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
     response_1 = orchestrator.handle_customer_query(customer_query_1)
     print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")

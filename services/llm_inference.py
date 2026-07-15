@@ -12,7 +12,15 @@ from common.models import (
     LLMAgentReasonRequest, LLMAgentReasonResponse,
     LLMAgentInterpretRequest, LLMAgentInterpretResponse,
     NLGRequest, StructuredAgentResult,
-    StructuredOrderSummary, StructuredProductRecommendation
+    StructuredOrderSummary, 
+    StructuredProductRecommendation,
+    OrderIssueAnalysis,
+    AgentGenerationOutput,
+    GeneralPurposeAnswer,  
+    EscalationDetails,      
+    OrderIssueAnalysis,    
+    FinalNLGOutput,        
+    Message                
 )
 load_dotenv() 
 class MockLLMInferenceService:
@@ -58,7 +66,7 @@ class MockLLMInferenceService:
         
         # Add conversation history
         for msg in request.conversation_history:
-            messages.append({"role": msg["role"], "content": msg["content"]})
+            messages.append({"role": msg.role, "content": msg.content})   
         
         # Add current user query
         messages.append({"role": "user", "content": request.current_query})
@@ -177,38 +185,255 @@ class MockLLMInferenceService:
 
 
     def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
-        print(f"  [Mock LLMInf] Calling LLMInf_AgentInterpret for {request.agent_name} to {request.interpretation_goal}...")
-        # Simulate interpretation of raw data
-        if request.interpretation_goal == 'diagnose order issue' and request.raw_data.get('status') == 'Pending':
-            return LLMAgentInterpretResponse(structured_interpretation={"issue_type": "PaymentPending", "recommendation": "Check payment method"}, thought="Interpreted order status as pending payment issue.")
-        elif request.interpretation_goal == 'diagnose order issue' and request.raw_data.get('status') == 'Shipped':
-             return LLMAgentInterpretResponse(structured_interpretation={"issue_type": "None", "recommendation": "Order is on its way"}, thought="Interpreted order status as shipped with no issues.")
-        return LLMAgentInterpretResponse(structured_interpretation=request.raw_data, thought="Basic interpretation provided.")
-
-    def call_agent_generate(self, request: LLMAgentReasonRequest) -> str: # Simplified for this example
-        print(f"  [Mock LLMInf] Calling LLMInf_AgentGenerate for {request.agent_name}...")
-        return "Generated snippet: This product is highly rated for durability."
-
-    def call_generative(self, request: NLGRequest) -> str:
-        print(f"  [Mock LLMInf] Calling LLMInf_Generative for final NLG...")
-        # Simulate combining results into a natural language response
-        responses = []
-        for res in request.agent_results:
-            if isinstance(res.result_data, StructuredOrderSummary):
-                responses.append(f"Your order {res.result_data.order_id} is currently {res.result_data.status}.")
-                if res.result_data.estimated_delivery:
-                    responses.append(f"It's estimated to arrive by {res.result_data.estimated_delivery}.")
-                if res.result_data.issue_analysis and res.result_data.issue_analysis != "None":
-                    responses.append(f"Issue: {res.result_data.issue_analysis}")
-            elif isinstance(res.result_data, StructuredProductRecommendation):
-                responses.append(f"I recommend '{res.result_data.name}' (Price: ${res.result_data.price}) for you because {res.result_data.reason}.")
-            elif isinstance(res.result_data, dict) and "answer_snippet" in res.result_data:
-                responses.append(f"Here's some information: {res.result_data['answer_snippet']}")
-            else:
-                responses.append(f"Agent '{res.agent_name}' provided some information relevant to your query.")
         
-        greeting = f"Hello {request.session_id.split('_')[0]}! " if request.session_id else "Hello! "
-        return greeting + " ".join(responses) + f" Is there anything else I can assist you with regarding '{request.final_user_intent}'?"
+        print(f"  [LLMInf] Calling LLMInf_AgentInterpret ({self.agent_interpret_model}) for {request.agent_name} to {request.interpretation_goal}...")
+
+        # Prepare the interpretation prompt for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are an expert AI assistant tasked with interpreting raw data "
+                "and extracting structured insights based on a specific interpretation goal. "
+                "You must respond with a JSON object representing the structured interpretation. "
+                "For the 'diagnose order issue' goal, the JSON must contain: "
+                "1. `issue_type`: A string describing the issue (e.g., 'PaymentPending', 'ShippingDelay', 'None', 'Unknown'). "
+                "2. `recommendation`: A brief, actionable recommendation or summary related to the issue. "
+                "3. `severity`: An optional string for severity ('low', 'medium', 'high'). "
+                "4. `additional_notes`: Any optional extra context or details. "
+                "If no issue is found, `issue_type` should be 'None' and `recommendation` should reflect no issue. "
+                "Always output a valid JSON object strictly adhering to the schema. Do NOT include any other text."
+            )},
+            {"role": "user", "content": (
+                f"Agent: {request.agent_name}\n"
+                f"Interpretation Goal: {request.interpretation_goal}\n"
+                f"Raw Data: {request.raw_data}"
+            )}
+        ]
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.agent_interpret_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.0, # Keep temperature low for deterministic interpretation
+                seed=42 # For reproducibility
+            )
+            
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] AgentInterpret LLM raw output: {llm_output_str}")
+
+            # Validate LLM output against the specific Pydantic model for interpretation
+            # Assuming 'diagnose order issue' is the primary goal for now, which maps to OrderIssueAnalysis
+            # If other goals were introduced, this might become a Union and require more complex validation.
+            structured_interpretation_data = OrderIssueAnalysis.model_validate_json(llm_output_str)
+            
+            return LLMAgentInterpretResponse(
+                structured_interpretation=structured_interpretation_data,
+                thought=f"Successfully interpreted raw data for goal: {request.interpretation_goal}"
+            )
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for agent interpret is not valid JSON or doesn't match OrderIssueAnalysis schema: {e}")
+            # Fallback for malformed LLM output
+            return LLMAgentInterpretResponse(
+                structured_interpretation=OrderIssueAnalysis(issue_type="Unknown", recommendation=f"Failed to interpret data due to LLM output error: {e}", severity="high"),
+                thought=f"LLM agent-interpret output parse error for goal '{request.interpretation_goal}'"
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling AgentInterpret LLM: {e}")
+            # General fallback for API errors, network issues, etc.
+            return LLMAgentInterpretResponse(
+                structured_interpretation=OrderIssueAnalysis(issue_type="Unknown", recommendation=f"An internal error occurred during interpretation: {e}", severity="high"),
+                thought=f"LLM agent-interpret general error for goal '{request.interpretation_goal}'"
+            )
+    
+    def call_agent_generate(self, request: LLMAgentReasonRequest) -> str: # Simplified for this example
+        
+        print(f"  [LLMInf] Calling LLMInf_AgentGenerate ({self.generative_model}) for {request.agent_name} to generate a snippet...") # Use generative_model here
+
+        # Prepare the generation prompt for the LLM
+        # The prompt uses request.task_description and current_state from LLMAgentReasonRequest
+        # This assumes that the agent has already decided *what* to generate (e.g., "describe X product")
+        # through its reasoning process.
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are a concise natural language generation engine for a specialized AI agent. "
+                "Your task is to generate a short, informative natural language snippet "
+                "based on the provided task description and current state, suitable for a customer. "
+                "You must respond with a JSON object containing two fields: "
+                "1. `generated_text`: The natural language snippet. "
+                "2. `confidence`: A float between 0.0 and 1.0 reflecting your certainty in the accuracy/relevance of the snippet. "
+                "Do NOT include any introductory or concluding remarks beyond the JSON. "
+                "Always output a valid JSON object. Do NOT include any other text."
+            )},
+            {"role": "user", "content": (
+                f"Agent: {request.agent_name}\n"
+                f"Generation Task: {request.task_description}\n" # The task determined by agent_reason
+                f"Current State/Context: {request.current_state}" # Relevant data to base generation on
+            )}
+        ]
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.generative_model, # Using the general generative model for this
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.7, # Higher temperature for more creative/varied generation
+                seed=42 # For reproducibility
+            )
+            
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] AgentGenerate LLM raw output: {llm_output_str}")
+
+            # Validate LLM output against the Pydantic model
+            parsed_generation = AgentGenerationOutput.model_validate_json(llm_output_str)
+            
+            return parsed_generation
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for agent generate is not valid JSON or doesn't match AgentGenerationOutput schema: {e}")
+            # Fallback for malformed LLM output
+            return AgentGenerationOutput(
+                generated_text="I encountered an issue while generating a response. Please try again or rephrase your query.",
+                confidence=0.1, # Very low confidence for fallback
+                context_used=[f"LLM output parse error: {e}"]
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling AgentGenerate LLM: {e}")
+            # General fallback for API errors, network issues, etc.
+            return AgentGenerationOutput(
+                generated_text="I apologize, an unexpected error prevented me from generating a specific response.",
+                confidence=0.0, # Zero confidence for general errors
+                context_used=[f"LLM general error: {e}"]
+            )
+        
+    def call_generative(self, request: NLGRequest) -> str:
+        
+        print(f"  [LLMInf] Calling LLMInf_Generative ({self.generative_model}) for final NLG...")
+
+        # Helper to format structured agent results for the LLM
+        def format_agent_results_for_llm(agent_results: List[StructuredAgentResult]) -> str:
+            formatted_outputs = []
+            for res in agent_results:
+                result_data = res.result_data
+                status_indicator = f"Status: {res.status.capitalize()}"
+
+                if isinstance(result_data, StructuredOrderSummary):
+                    items_str = ', '.join([item.get('name', 'item') for item in result_data.items])
+                    issue_str = f"Issue Analysis: {result_data.issue_analysis}" if result_data.issue_analysis and result_data.issue_analysis != "None" else "No specific issue identified."
+                    formatted_outputs.append(
+                        f"### Order Tracking Result ({status_indicator})\n"
+                        f"- Order ID: {result_data.order_id}\n"
+                        f"- Current Status: {result_data.status}\n"
+                        f"- Items: {items_str}\n"
+                        f"- Estimated Delivery: {result_data.estimated_delivery or 'Not available'}\n"
+                        f"- {issue_str}"
+                    )
+                elif isinstance(result_data, StructuredProductRecommendation):
+                    formatted_outputs.append(
+                        f"### Product Recommendation Result ({status_indicator})\n"
+                        f"- Recommended Product: {result_data.name} (ID: {result_data.product_id})\n"
+                        f"- Price: ${result_data.price:.2f}\n"
+                        f"- Reason for Recommendation: {result_data.reason}\n"
+                        f"- Description Snippet: {result_data.description_snippet}"
+                    )
+                elif isinstance(result_data, GeneralPurposeAnswer): # New handler for GeneralPurposeAgent
+                    formatted_outputs.append(
+                        f"### General Information Result ({status_indicator})\n"
+                        f"- Answer Snippet: {result_data.answer_snippet}\n"
+                        f"- Source Documents: {', '.join(result_data.source_documents_summary) if result_data.source_documents_summary else 'None'}"
+                    )
+                elif isinstance(result_data, EscalationDetails): # New handler for EscalationAgent
+                    formatted_outputs.append(
+                        f"### Escalation Notification ({status_indicator})\n"
+                        f"- Reason: {result_data.escalation_reason}\n"
+                        f"- Original Query: {result_data.original_query}\n"
+                        f"- Conversation Summary Snippet: {result_data.conversation_summary[-1].content if result_data.conversation_summary else 'N/A'}"
+                    )
+                elif isinstance(result_data, AgentGenerationOutput): # If an agent returned a raw generation
+                     formatted_outputs.append(
+                        f"### Agent Generated Snippet ({status_indicator})\n"
+                        f"- Snippet: {result_data.generated_text}\n"
+                        f"- Confidence: {result_data.confidence:.2f}"
+                    )
+                else: # Fallback for Dict[str, Any] or other unexpected types
+                    formatted_outputs.append(
+                        f"### Unstructured Agent Result from {res.agent_name} ({status_indicator})\n"
+                        f"- Raw Data: {result_data}"
+                    )
+            return "\n\n" + "\n".join(formatted_outputs) if formatted_outputs else "No specific agent results were provided."
+
+        # Prepare conversation history for the LLM
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are the main customer service chatbot, designed to provide friendly, "
+                "helpful, and accurate responses to e-commerce customers. "
+                "Your goal is to synthesize information from various specialized agents and "
+                "the ongoing conversation history into a single, coherent, natural language response. "
+                "Prioritize direct answers from agent results. "
+                "Maintain a helpful and polite tone. "
+                "If an escalation is needed, clearly state that a human agent will be involved. "
+                "You must respond with a JSON object containing three fields: "
+                "1. `response_text`: The final natural language response to the customer. "
+                "2. `tone`: The inferred tone of the response (e.g., 'helpful', 'empathetic', 'neutral'). "
+                "3. `is_complete`: A boolean indicating if the customer's current query has been fully addressed (True/False). "
+                "4. `confidence`: A float between 0.0 and 1.0 representing your confidence in the accuracy/completeness of this final response."
+                "Always output a valid JSON object. Do NOT include any other text."
+            )}
+        ]
+
+        # Add conversation history
+        for msg in request.conversation_history:
+            messages.append({"role": msg.role, "content": msg.content}) # Use Message model attributes
+
+        # Add agent results and user intent to the prompt
+        formatted_results = format_agent_results_for_llm(request.agent_results)
+        messages.append({"role": "user", "content": (
+            f"Synthesize a response for the customer. Their primary intent was to '{request.final_user_intent}'.\n\n"
+            f"Here are the structured results from the agents:\n{formatted_results}\n\n"
+            "Please generate the final customer-facing response, maintaining the conversation flow and ensuring all relevant details from the agent results are included. If any agent result indicates an 'escalation', clearly state that a human agent will follow up."
+        )})
+
+        try:
+            # Make the actual API call to the LLM
+            response = self.openai_client.chat.completions.create(
+                model=self.generative_model,
+                messages=messages,
+                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
+                temperature=0.7, # Higher temperature for more creative/natural generation
+                seed=42 # For reproducibility
+            )
+
+            # Extract and parse the JSON response
+            llm_output_str = response.choices[0].message.content
+            print(f"  [LLMInf] Generative LLM raw output: {llm_output_str}")
+
+            # Validate LLM output against Pydantic model
+            parsed_nlg_output = FinalNLGOutput.model_validate_json(llm_output_str)
+
+            return parsed_nlg_output
+
+        except ValidationError as e:
+            print(f"  [LLMInf] Error: LLM output for final NLG is not valid JSON or doesn't match FinalNLGOutput schema: {e}")
+            # Fallback for malformed LLM output
+            return FinalNLGOutput(
+                response_text="I apologize, I encountered an issue while formulating my response. Please try again or rephrase your query.",
+                tone="apologetic",
+                is_complete=False,
+                confidence=0.1
+            )
+        except Exception as e:
+            print(f"  [LLMInf] Error calling Generative LLM for final NLG: {e}")
+            # General fallback for API errors, network issues, etc.
+            return FinalNLGOutput(
+                response_text="I'm sorry, an unexpected error occurred. Please bear with me while I try to reconnect.",
+                tone="apologetic",
+                is_complete=False,
+                confidence=0.0
+            )
 
     def call_embeddings(self, text: str) -> List[float]:
         # print(f"  [Mock LLMInf] Generating embedding for text snippet: '{text[:20]}...'")
