@@ -18,7 +18,7 @@ from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
 from services.data_pipeline import DataIngestionPipeline
-from services.llm_inference import MockLLMInferenceService
+from services.llm_inference import LLMInferenceService
 from services.orchestrator import AgentOrchestratorService
 from services.pii_masker import PIIMasker
 from services.rag import MockRAGService
@@ -76,8 +76,8 @@ def get_pii_masker() -> PIIMasker:
 
 
 @lru_cache
-def get_llm_service() -> MockLLMInferenceService:
-    return MockLLMInferenceService()
+def get_llm_service() -> LLMInferenceService:
+    return LLMInferenceService()
 
 
 @lru_cache

@@ -6,7 +6,7 @@ from common.models import (
     ChunkedDocument
 )
 from services.pii_masker import PIIMasker
-from services.llm_inference import MockLLMInferenceService
+from services.llm_inference import LLMInferenceService
 from services.rag import MockRAGService
 
 class DataIngestionPipeline:
@@ -15,7 +15,7 @@ class DataIngestionPipeline:
     for RAG and LLM fine-tuning. This is typically a batch or streaming system,
     not a real-time microservice.
     """
-    def __init__(self, pii_masker: PIIMasker, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService):
+    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: MockRAGService):
         self.pii_masker = pii_masker
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service
@@ -137,7 +137,7 @@ class DataIngestionPipeline:
 # Example of how this pipeline might be run (e.g., a scheduled Airflow job):
 if __name__ == "__main__":
     pii_masker_inst = PIIMasker()
-    llm_inf_inst = MockLLMInferenceService()
+    llm_inf_inst = LLMInferenceService()
     rag_service_inst = MockRAGService(llm_inf_inst)
     
     pipeline = DataIngestionPipeline(pii_masker_inst, llm_inf_inst, rag_service_inst)

@@ -2,7 +2,7 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 from common.models import AgentTask, StructuredAgentResult
-from services.llm_inference import MockLLMInferenceService
+from services.llm_inference import LLMInferenceService
 from services.rag import MockRAGService
 from clients.ecommerce_api_client import MockECommerceAPIClient
 from services.pii_masker import PIIMasker
@@ -12,7 +12,7 @@ class BaseAgent(ABC):
     Abstract Base Class for all Specialized AI Agents.
     Defines the common interface and shared dependencies.
     """
-    def __init__(self, name: str, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService,
+    def __init__(self, name: str, llm_inference_client: LLMInferenceService, rag_service: MockRAGService,
                  ecommerce_api_client: MockECommerceAPIClient, pii_masker: PIIMasker):
         self.name = name
         self.llm_inference_client = llm_inference_client

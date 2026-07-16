@@ -9,6 +9,10 @@
 # Standalone, this container reaches Ollama (and Postgres, if DATABASE_URL
 # is set) on the host via host.docker.internal. Leave DATABASE_URL unset to
 # use the disposable SQLite dev DB rebuilt on every start (see Dockerfile).
+#
+# Use `docker compose up -d --build`, not plain `up -d`: the image is a
+# one-time snapshot of the source tree, so without --build this silently
+# keeps running whatever was last built, ignoring newer code entirely.
 services:
   api:
     build:

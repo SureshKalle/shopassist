@@ -7,7 +7,7 @@ from db.init_db import build_db
 from common.models import CustomerQuery, RawCustomerConversation, RawProductRecord
 from clients.ecommerce_api_client import MockECommerceAPIClient
 from services.pii_masker import PIIMasker
-from services.llm_inference import MockLLMInferenceService
+from services.llm_inference import LLMInferenceService
 from services.rag import MockRAGService
 from services.data_pipeline import DataIngestionPipeline
 from services.agents.order_tracking_agent import OrderTrackingAgent
@@ -26,7 +26,7 @@ if __name__ == "__main__":
     
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
-    llm_inference_service = MockLLMInferenceService()
+    llm_inference_service = LLMInferenceService()
     rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
     ecommerce_api_client = MockECommerceAPIClient()
 

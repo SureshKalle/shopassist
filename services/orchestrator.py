@@ -7,7 +7,7 @@ from common.models import (
     FinalNLGOutput # <--- NEW: Import FinalNLGOutput model
 )
 from services.pii_masker import PIIMasker
-from services.llm_inference import MockLLMInferenceService # <--- CHANGED: Using actual LLMInferenceService
+from services.llm_inference import LLMInferenceService # <--- CHANGED: Using actual LLMInferenceService
 from services.agents.base_agent import BaseAgent # For type hinting the agents dictionary
 
 class AgentOrchestratorService:

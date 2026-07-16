@@ -43,11 +43,13 @@ uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ### Docker
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 docker compose down
 ```
 
-Builds the image and runs it with a healthcheck-gated start and a graceful stop. Reaches Ollama on the host via `host.docker.internal`; see `docker-compose.yml`'s comments for pointing it at Postgres instead of the bundled SQLite dev DB.
+Runs it with a healthcheck-gated start and a graceful stop. Reaches Ollama on the host via `host.docker.internal`; see `docker-compose.yml`'s comments for pointing it at Postgres instead of the bundled SQLite dev DB.
+
+Always include `--build`: the image is a one-time snapshot of the source tree, not a live mount, so plain `docker compose up -d` silently keeps running whatever was last built and won't pick up newer code, committed or not.
 
 ## Configuration
 
