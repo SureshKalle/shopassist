@@ -267,7 +267,23 @@ After all five, the simulation prints:
 **To run it yourself:**
 ```bash
 pip install -r requirements.txt
-cp .env.example .env        # fill in your LLM provider's API key (or leave blank for mock mode)
+cp .env.example .env        # see .env.example for what each value does
 python main_simulation.py
 ```
 Without any API key filled in, every agent still runs -- it just uses simple rule-based fallback logic instead of AI reasoning, so you can see the *shape* of the system working even with zero setup.
+
+**Or run it as an API instead of the CLI simulation** -- same `services/` layer underneath, see `api/main.py`:
+
+```bash
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+# Swagger UI: http://localhost:8000/docs
+```
+
+**Or via Docker** (builds the image, runs it with a healthcheck-gated graceful start/stop):
+
+```bash
+docker compose up -d
+docker compose down
+```
+
+Talks to Ollama on the host via `host.docker.internal` -- see `docker-compose.yml`'s own comments for the Postgres-instead-of-SQLite override.

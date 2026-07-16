@@ -30,15 +30,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.config import settings
 from api.dependencies import warm_up_services
 from api.middleware import RequestLoggingMiddleware
+from api.request_context import RequestIDLogFilter
 from api.routers import chat, health
 
 # See .env.example / api/config.py for all api-owned settings.
 # LOG_LEVEL=DEBUG also enables full request/response body logging (api/middleware.py).
 logging.basicConfig(
     level=settings.log_level,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s [%(request_id)s] — %(message)s",
     datefmt="%H:%M:%S",
 )
+# Handler-level (not logger-level) so it applies to every record that
+# reaches the handler regardless of which logger emitted it (api.access,
+# api.auth, uvicorn's own loggers, ...).
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(RequestIDLogFilter())
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +52,10 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Warm up all services (LLM, RAG, agents) once at startup, not on first request."""
     logger.info("[API] Starting up AI Agentic Customer Support Platform...")
+    logger.warning(
+        "[API] API key auth: %s",
+        "ENFORCED" if settings.api_key_enforce else "advisory only (set API_KEY_ENFORCE=true to require it)",
+    )
     warm_up_services()
     yield
     logger.info("[API] Shutting down.")

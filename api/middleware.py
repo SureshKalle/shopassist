@@ -4,6 +4,11 @@ HTTP access logging - method, path, client host, status, latency for
 every request (INFO), plus full request/response bodies at DEBUG
 (LOG_LEVEL=DEBUG) for debugging client integration issues.
 
+Also assigns each request a correlation ID (api/request_context.py) -
+reused from an incoming X-Request-ID header if present, echoed back on
+the response - so every log line for one request can be grepped out of an
+interleaved stream by that ID.
+
 Bodies log verbatim, unmasked (PII masking happens later, in the
 orchestrator) - keep DEBUG off outside local dev.
 """
@@ -16,6 +21,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from api.config import settings
+from api.request_context import new_request_id, reset_request_id, set_request_id
 
 logger = logging.getLogger("api.access")
 
@@ -30,6 +36,14 @@ def _decode_and_truncate(body: bytes) -> str:
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        request_id = new_request_id(request.headers.get("X-Request-ID"))
+        token = set_request_id(request_id)
+        try:
+            return await self._dispatch(request, call_next, request_id)
+        finally:
+            reset_request_id(token)
+
+    async def _dispatch(self, request: Request, call_next, request_id: str):
         start = time.perf_counter()
         client_host = request.client.host if request.client else "-"
         debug = logger.isEnabledFor(logging.DEBUG)
@@ -79,4 +93,5 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 request.method, request.url.path, response.status_code, duration_ms,
             )
 
+        response.headers["X-Request-ID"] = request_id
         return response

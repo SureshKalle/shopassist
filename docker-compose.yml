@@ -24,6 +24,12 @@ services:
       APP_TITLE: AI Agentic Customer Support Platform
       LOG_LEVEL: INFO
       CORS_ALLOWED_ORIGINS: http://localhost:8501,http://127.0.0.1:8501
+      # Dummy API-key auth (api/security.py) - blank/false by default so
+      # this compose file works standalone with no other setup.
+      API_KEY: ${API_KEY:-}
+      API_KEY_ENFORCE: ${API_KEY_ENFORCE:-false}
+      CHAT_REQUEST_TIMEOUT_SECONDS: ${CHAT_REQUEST_TIMEOUT_SECONDS:-60}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
       OLLAMA_API_BASE_URL: http://host.docker.internal:11434
       # Must name a model actually pulled into that Ollama instance (see .env.example).
       OLLAMA_ROUTER_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
