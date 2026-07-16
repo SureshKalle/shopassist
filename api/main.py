@@ -27,11 +27,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from api.config import settings
 from api.dependencies import warm_up_services
-from api.routers import chat
+from api.middleware import RequestLoggingMiddleware
+from api.routers import chat, health
 
+# See .env.example / api/config.py for all api-owned settings.
+# LOG_LEVEL=DEBUG also enables full request/response body logging (api/middleware.py).
 logging.basicConfig(
-    level=logging.INFO,
+    level=settings.log_level,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -48,29 +52,35 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AI Agentic Customer Support Platform",
+    title=settings.app_title,
     description=(
         "Multi-agent customer support backend: PII masking → LLM-based "
         "intent routing → specialised agents (order tracking, product "
         "recommendation, returns, general Q&A) with RAG-backed knowledge "
         "retrieval, and an escalation fallback."
     ),
-    version="1.0.0",
+    version=settings.app_version,
     lifespan=lifespan,
 )
 
-# CORS: permissive by default for local development (Streamlit UI running on
-# a different port). Tighten `allow_origins` to your actual frontend domain(s)
-# before deploying to production.
+# Defaults to the Streamlit client's dev origin (:8501); override via
+# CORS_ALLOWED_ORIGINS. Must be explicit origins, not "*" - invalid
+# together with allow_credentials=True per the CORS spec.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Added after CORSMiddleware so it's outermost (Starlette layers middleware
+# in reverse of add-order) and logs the request/response exactly as the
+# client sees them, CORS headers included.
+app.add_middleware(RequestLoggingMiddleware)
+
 app.include_router(chat.router)
+app.include_router(health.router)
 
 
 @app.get("/", tags=["root"])

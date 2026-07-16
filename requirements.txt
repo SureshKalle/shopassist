@@ -1,0 +1,17 @@
+# Runtime dependencies for the FastAPI backend (api/) and the services/
+# clients/common layers it wires together. Install with:
+#   pip install -r requirements.txt
+
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+python-dotenv>=1.0
+
+# LLM calls (OpenAI-compatible client pointed at a local Ollama server by
+# default - see services/llm_inference.py / OLLAMA_API_BASE_URL)
+openai>=1.50
+
+# clients/ecommerce_api_client.py: SQLite locally (stdlib), Postgres in
+# docker-compose (see shopassist-devops) via DATABASE_URL.
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9

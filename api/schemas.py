@@ -35,3 +35,13 @@ class ChatResponse(BaseModel):
     confidence_score: float
     timestamp: datetime
 
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+class HealthResponse(BaseModel):
+    status: str
+    registered_agents: list[str]
+    rag_documents_indexed: int
+    database_reachable: bool
+
