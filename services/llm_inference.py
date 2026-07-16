@@ -14,7 +14,15 @@ from common.models import (
     NLGRequest, StructuredAgentResult,
     StructuredOrderSummary, StructuredProductRecommendation
 )
-load_dotenv() 
+load_dotenv()
+
+# nomic-embed-text's actual output dimension — must match
+# shopassist-database's document_chunks.embedding VECTOR(768) column
+# (see that repo's docs/database-design.md). Also this file's fallback
+# vector size on an embedding-call failure, so a degraded response still
+# has the right shape for pgvector to accept.
+EMBEDDING_DIMENSION = 768
+
 class MockLLMInferenceService:
     """
     The Centralized LLM Inference Service.
@@ -22,9 +30,15 @@ class MockLLMInferenceService:
     """
     def __init__(self):
         self.ollama_base_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
+        # Ollama ignores the API key entirely but the OpenAI client requires
+        # a non-empty string; "ollama" is the placeholder Ollama's own docs
+        # use. Reading it from LLM_API_KEY instead of hardcoding it is what
+        # turns "point this at a real OpenAI-compatible server" (vLLM with
+        # --api-key set, a hosted provider) into a config change instead of
+        # a code change — see shopassist-model's README for that path.
         self.openai_client = OpenAI(
             base_url=f"{self.ollama_base_url}/v1", # OpenAI-compatible endpoint
-            api_key="ollama" 
+            api_key=os.getenv("LLM_API_KEY", "ollama"),
         )
         
         # Define LLM models to be used for each endpoint
@@ -47,7 +61,7 @@ class MockLLMInferenceService:
                 "1. `agent_name`: The name of the agent to invoke. Choose from: "
                 "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
                 "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
-                "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "(e.g., {'order_id': 'ord-1001'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
                 "If no specific parameters are extracted, return an empty object {}. "
                 "3. `confidence`: A float between 0.0 and 1.0 representing your confidence in this routing decision. " # <--- ADDED HERE
                 "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent'. "
@@ -220,9 +234,18 @@ class MockLLMInferenceService:
         return greeting + " ".join(responses) + f" Is there anything else I can assist you with regarding '{request.final_user_intent}'?"
 
     def call_embeddings(self, text: str) -> List[float]:
-        # print(f"  [Mock LLMInf] Generating embedding for text snippet: '{text[:20]}...'")
-        # Simulate embedding generation - simplified, actual embeddings are high-dimensional vectors
-        return [float(ord(c)) / 100 for c in text[:16]] # Use first N chars to make mock embedding somewhat unique
+        # Real call via Ollama's OpenAI-compatible /v1/embeddings endpoint —
+        # same client/base_url as every chat call above, no new dependency.
+        try:
+            response = self.openai_client.embeddings.create(model=self.embedding_model, input=text)
+            return response.data[0].embedding
+        except Exception as e:
+            print(f"  [LLMInf] Error calling embeddings ({self.embedding_model}): {e}")
+            # Fail soft, matching every other real LLM call in this class —
+            # a neutral zero-vector rather than a crash. Wrong-dimension
+            # would fail loudly against pgvector's VECTOR(768) column; a
+            # same-dimension zero-vector just retrieves nothing useful.
+            return [0.0] * EMBEDDING_DIMENSION
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":

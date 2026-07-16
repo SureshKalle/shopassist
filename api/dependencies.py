@@ -15,19 +15,21 @@ mechanisms (FastAPI DI vs. plain function calls).
 """
 
 import logging
+import os
 from functools import lru_cache
 
-from services.ecommerce_client import ECommerceAPIClient
+from services.ecommerce_client import DEFAULT_DB_URL, ECommerceAPIClient
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
+from services.classifier_client import ClassifierClient
 from services.data_pipeline import DataIngestionPipeline
 from services.llm_inference import MockLLMInferenceService
 from services.orchestrator import AgentOrchestratorService
 from services.pii_masker import PIIMasker
-from services.rag import MockRAGService
+from services.rag import BaseRAGService, MockRAGService, PgVectorRAGService
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,16 @@ def get_llm_service() -> MockLLMInferenceService:
 
 
 @lru_cache
-def get_rag_service() -> MockRAGService:
+def get_rag_service() -> BaseRAGService:
+    """PgVectorRAGService when DATABASE_URL is Postgres (real semantic
+    search against shopassist-database's document_chunks table);
+    MockRAGService otherwise (SQLite/unset — mirrors
+    ECommerceAPIClient's own SQLite fallback exactly, so both services
+    agree on which backend is active).
+    """
+    database_url = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
+    if database_url.startswith("postgresql"):
+        return PgVectorRAGService(get_llm_service(), database_url)
     return MockRAGService(get_llm_service())
 
 
@@ -53,8 +64,13 @@ def get_ecommerce_client() -> ECommerceAPIClient:
 
 
 @lru_cache
+def get_classifier_client() -> ClassifierClient:
+    return ClassifierClient()
+
+
+@lru_cache
 def get_data_pipeline() -> DataIngestionPipeline:
-    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service())
+    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service(), get_classifier_client())
 
 @lru_cache
 def get_agents() -> dict[str, BaseAgent]:

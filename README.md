@@ -4,7 +4,7 @@ FastAPI backend for a multi-agent e-commerce support chatbot: an LLM router
 picks a specialist agent (order tracking, product recommendation, general
 Q&A) per message, agents call out to a real order database and a knowledge
 base, and a final reply gets returned to whatever's calling it — right now
-that's the `shopassist-streamlit` storefront's chat widget, over plain HTTP.
+that's the `shopassist-client` storefront's chat widget, over plain HTTP.
 
 This README describes what's actually implemented, not the target
 architecture. Where something is a placeholder rather than the real thing,
@@ -22,12 +22,20 @@ piece of this is more finished than it is.
   OpenAI-compatible client pointed at a local Ollama server
   (`services/llm_inference.py::call_router` / `call_agent_reason`).
 - **Order lookups are real** — `services/ecommerce_client.py` runs actual
-  SQL (SQLAlchemy) against a database: SQLite locally
-  (`db/shopassist.db`), or Postgres if you set `DATABASE_URL`.
-- **The knowledge base is not real RAG yet** — `services/rag.py` is an
-  in-memory dict matched by substring (`if query_text in doc.content`),
-  and `call_embeddings()` returns character codes, not a real embedding.
-  It's there so the agent shapes are right; the retrieval quality isn't.
+  SQL (SQLAlchemy) against a database: SQLite locally (built from
+  [shopassist-database](../shopassist-database)'s `sqlite/` setup), or
+  Postgres if you set `DATABASE_URL` (that same repo's `postgres/` setup —
+  used for the capstone demo). Both share the same schema, so no query
+  changes are needed to switch.
+- **The knowledge base is real RAG when `DATABASE_URL` is Postgres** —
+  `services/rag.py::PgVectorRAGService` does real cosine similarity search
+  against [shopassist-database](../shopassist-database)'s
+  `document_chunks` table (pgvector), and `call_embeddings()` calls
+  Ollama's real `nomic-embed-text` model. Falls back to `MockRAGService`
+  (an in-memory dict matched by substring) when there's no Postgres —
+  SQLite has no vector extension, and `api/dependencies.py::
+  get_rag_service()` picks between the two exactly like
+  `ECommerceAPIClient` already picks between SQLite and Postgres.
 - **The final customer-facing reply is not LLM-generated** —
   `call_generative()` builds it with plain string templates. The two real
   LLM calls above happen earlier in the pipeline (routing, tool planning);
@@ -39,17 +47,22 @@ piece of this is more finished than it is.
 
 ## API
 
-Two endpoints:
+Two endpoints, plus a Prometheus `/metrics` endpoint:
 
 ```
 POST /api/v1/chat
 GET  /api/v1/health
+GET  /metrics
 ```
+
+`/metrics` (via `prometheus-fastapi-instrumentator`) is request
+count/latency by route/status — scraped by shopassist-devops's optional
+observability overlay, not part of the request/response contract below.
 
 ### `POST /api/v1/chat`
 
 ```json
-{ "session_id": null, "user_id": "1", "text": "Where is order 12345?", "source_channel": "web_chat" }
+{ "session_id": null, "user_id": "cust-1001", "text": "Where is order ord-1001?", "source_channel": "web_chat" }
 ```
 
 `session_id` is optional — omit it to start a new conversation; the
@@ -103,7 +116,11 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env             # defaults match a local Ollama install
-python db/init_db.py             # builds db/shopassist.db from schema + seed data
+
+# Build the local SQLite dev DB from the sibling shopassist-database repo
+# (clone it alongside this one if you haven't already):
+python3 ../shopassist-database/sqlite/scripts/create_db.py
+
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -112,7 +129,7 @@ Docs at `http://localhost:8000/docs`. Try it:
 ```bash
 curl -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"user_id": "1", "text": "Where is order 12345?"}'
+  -d '{"user_id": "cust-1001", "text": "Where is order ord-1001?"}'
 ```
 
 Or run the standalone simulation instead of the API — same services, no
@@ -129,6 +146,30 @@ general question with no good match). Uncomment them to see more of the
 routing in action — the returns one will demonstrate the `ReturnsAgent`
 gap described in Known issues rather than a real returns flow.
 
+## Running with Docker
+
+`docker-compose.yml` and `Dockerfile` here build and run just this API
+container — standalone, the same way
+[shopassist-database](../shopassist-database) and
+[shopassist-model](../shopassist-model) are each independently runnable:
+
+```bash
+docker compose up -d --build
+```
+
+It talks to services on the host via `host.docker.internal` — start Ollama
+(`ollama serve`) and, if you want real order lookups, Postgres
+(`cd ../shopassist-database && docker compose up -d`, then set
+`DATABASE_URL` in this repo's `.env` to
+`postgresql://shopassist:shopassist123@host.docker.internal:5432/shopassist`)
+before or after bringing this container up — it retries on its own.
+
+To run the **whole platform** together (Postgres, Ollama, this API, and the
+storefront) with one command, use
+[shopassist-devops](../shopassist-devops) instead — it `include:`s this
+file and wires everything to talk over a shared container network rather
+than `host.docker.internal`.
+
 ## Configuration
 
 `.env` (gitignored — `.env.example` is the checked-in template):
@@ -140,7 +181,13 @@ OLLAMA_AGENT_REASON_MODEL=llama3:8b-instruct
 OLLAMA_AGENT_INTERPRET_MODEL=llama3:8b-instruct
 OLLAMA_GENERATIVE_MODEL=llama3:8b-instruct
 OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+CLASSIFIER_API_BASE_URL=http://localhost:8100
 ```
+
+`CLASSIFIER_API_BASE_URL` points at `shopassist-model`'s encoder-family
+classifier service (sentiment + topic classification for reviews/feedback,
+via `services/classifier_client.py`) — a separate serving path from the
+`OLLAMA_*` decoder models above; see that repo's README for why.
 
 `DATABASE_URL` isn't in that list because it's optional — unset, it falls
 back to the local SQLite file. Set it to point at Postgres instead (e.g.
@@ -149,6 +196,11 @@ back to the local SQLite file. Set it to point at Postgres instead (e.g.
 ```
 DATABASE_URL=postgresql://shopassist:shopassist123@localhost:5432/shopassist
 ```
+
+This one variable now decides two things, not one: `ecommerce_client.py`'s
+backend *and* whether `get_rag_service()` returns real pgvector search or
+the in-memory mock (see "What's actually here" above) — Postgres for one
+implies Postgres for the other, they can't disagree.
 
 For a server deployment, `.env.production.example` documents the same
 variables with production-shaped placeholders (a real Postgres URL, an
@@ -177,19 +229,12 @@ Worth knowing before you build on top of this:
   by `user_id` via `ECommerceAPIClient.get_customer_name()` in
   `orchestrator.py`, once per session (first turn only — it doesn't repeat
   on every reply). Falls back to a plain "Hello!" when `user_id` isn't a
-  real numeric customer ID, rather than fabricating a name.
-- **`user_id` from the chat request and the database's numeric
-  `customer_id` aren't the same namespace.** `get_order_details()` only
-  enforces ownership when `user_id` happens to parse as an int; otherwise
-  it skips the check rather than reject the request. Degrades gracefully,
-  but isn't real authorization.
-- **This service and `shopassist-database` maintain separate schemas.**
-  `db/schema.sql` here (`customers` / `items` / `sessions` / `orders` /
-  `order_items`) isn't the same shape as `shopassist-database`'s
-  (`customers` / `products` / `orders` / `order_items`), despite that repo
-  being meant as the platform's shared source of truth. Pointing
-  `DATABASE_URL` at it today would mean rewriting the queries in
-  `services/ecommerce_client.py` to match its column names.
+  real `cust-...` customer ID, rather than fabricating a name.
+- **`user_id` from the chat request and the database's `customer_id`
+  aren't formally the same namespace.** `get_order_details()` only
+  enforces ownership when `user_id` looks like a real DB customer_id (the
+  `cust-` prefix); otherwise it skips the check rather than reject the
+  request. Degrades gracefully, but isn't real authorization.
 - **Only Ollama is actually wired up as an LLM provider.** `openai` is
   the client library, but `services/llm_inference.py` hardcodes
   `api_key="ollama"` — there's no path to a hosted provider (OpenAI,
@@ -197,6 +242,13 @@ Worth knowing before you build on top of this:
 - **Session/conversation state is in-process memory** on the
   `AgentOrchestratorService` singleton — gone on restart, and won't work
   correctly if you ever run more than one instance behind a load balancer.
+- ~~Review sentiment in the data pipeline was a 3-keyword mock~~ **fixed.**
+  `services/data_pipeline.py::ingest_product_catalog` now calls
+  `services/classifier_client.py`, which talks to `shopassist-model`'s
+  encoder-family classifier service for real sentiment (1-5 star,
+  bucketed to negative/neutral/positive) and topic classification. Fails
+  soft to neutral/"other" if that service is unreachable — see
+  `shopassist-model`'s README for the full architecture.
 
 ## Project structure
 
@@ -212,33 +264,40 @@ shopassist/
 ├── services/
 │   ├── orchestrator.py       routes each message through PII mask → agent → reply
 │   ├── llm_inference.py      LLM calls (router, tool-planning) + the templated reply
-│   ├── rag.py                in-memory keyword-matched "knowledge base"
+│   ├── rag.py                PgVectorRAGService (real) + MockRAGService (SQLite fallback)
 │   ├── pii_masker.py         literal-string PII redaction
 │   ├── ecommerce_client.py   real SQL against the order/customer database
 │   ├── data_pipeline.py      cleans/masks/chunks raw text before it hits rag.py
+│   ├── classifier_client.py  calls shopassist-model's encoder-family classifier service
 │   └── agents/               one file per specialist agent
 ├── common/
 │   └── models.py             internal Pydantic domain models shared across services/
-├── db/
-│   ├── schema.sql             Postgres/Supabase schema (source of truth for prod)
-│   ├── schema_sqlite.sql       same schema, adapted for local SQLite
-│   ├── seed_data.sql           demo customers/items/orders
-│   ├── init_db.py              rebuilds db/shopassist.db from the two files above
-│   └── shopassist.db           generated locally, gitignored
 ├── main_simulation.py         CLI run of the same services, no HTTP
+├── data_simulation.py         connects to both databases and previews every table
+├── Dockerfile                 builds the API image (see "Running with Docker")
+├── docker-compose.yml         standalone `docker compose up` for just this container
 ├── requirements.txt
 ├── .env.example
 └── .env.production.example
 ```
 
+Database schema, seed data, and the SQLite/Postgres build tooling live in
+[shopassist-database](../shopassist-database) (`sqlite/` and `postgres/`
+respectively), not in this repo — see that project's README for how to
+build or reset either one.
+
 ## Not done yet
 
 - A `ReturnsAgent` that actually exists (see Known issues)
-- Real RAG: real embeddings, a real vector store, real chunking
+- Real chunking — `data_pipeline.py` still does "one chunk per
+  conversation/product" rather than recursive/semantic chunking; RAG
+  storage and search themselves are real now (pgvector), the chunking
+  strategy feeding them isn't sophisticated yet
+- An ETL that ingests the *live* `items`/`customers` tables into
+  `document_chunks` automatically — today's ingestion is the existing
+  demo/sample data in `main_simulation.py`, now written through a real
+  pipeline instead of a mocked one
 - The reply-generation step actually calling an LLM
 - Regex/NER-based PII masking instead of hardcoded literals
 - Session state in Redis or Postgres instead of process memory
 - Auth on the API (currently wide open; CORS is `allow_origins=["*"]`)
-- Reconciling this repo's DB schema with `shopassist-database`'s
-- A Dockerfile — there isn't one yet, despite `shopassist-database`
-  already having a docker-compose setup this could sit alongside

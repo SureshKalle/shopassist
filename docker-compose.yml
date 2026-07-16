@@ -1,0 +1,55 @@
+# ShopAssist :: FastAPI backend, standalone.
+#
+# `docker compose up` from inside this repo alone builds and runs just the
+# API container - same idea as shopassist-database's and shopassist-model's
+# own compose files: each project stays self-contained and independently
+# runnable. shopassist-devops's root docker-compose.yml `include:`s this
+# file unmodified and layers the platform-wide network + container-network
+# service URLs on top (see that repo's README) - it's the one that wires
+# this up to the real Ollama and Postgres containers.
+#
+# Standalone (no shopassist-devops), this container talks to services
+# running on the host - Ollama via `ollama serve`, Postgres via
+# `cd ../shopassist-database && docker compose up -d` - reached through
+# `host.docker.internal`, which Docker Desktop resolves out of the box on
+# macOS/Windows and the `extra_hosts` entry below adds on Linux.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: shopassist-api:latest
+    container_name: shopassist-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Deliberately not ${OLLAMA_API_BASE_URL} from this project's own
+      # .env - that file's default (http://localhost:11434) is correct for
+      # running the app directly on the host, but "localhost" means the
+      # container itself once inside Docker, not the host machine.
+      OLLAMA_API_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_ROUTER_MODEL: llama3.2:3b-instruct
+      OLLAMA_AGENT_REASON_MODEL: llama3.2:3b-instruct
+      OLLAMA_AGENT_INTERPRET_MODEL: llama3.2:3b-instruct
+      OLLAMA_GENERATIVE_MODEL: llama3.2:3b-instruct
+      OLLAMA_EMBEDDING_MODEL: nomic-embed-text
+      # Unset by default: no bundled database image here (see Dockerfile).
+      # Point it at a reachable Postgres for order lookups to work, e.g.
+      # postgresql://shopassist:shopassist123@host.docker.internal:5432/shopassist
+      # once `cd ../shopassist-database && docker compose up -d` is running.
+      DATABASE_URL: ${DATABASE_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - shopassist-api-network
+
+networks:
+  shopassist-api-network:
+    name: shopassist-api-network

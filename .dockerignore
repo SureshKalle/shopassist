@@ -1,0 +1,9 @@
+.venv/
+.git/
+.env
+.env.production
+__pycache__/
+*.pyc
+main_simulation.py
+data_simulation.py
+README.md

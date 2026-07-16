@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from api.dependencies import warm_up_services
 from api.routers import chat, health
@@ -60,7 +61,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: permissive by default for local development (Streamlit UI running on
+# CORS: permissive by default for local development (Client UI running on
 # a different port). Tighten `allow_origins` to your actual frontend domain(s)
 # before deploying to production.
 app.add_middleware(
@@ -70,6 +71,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GET /metrics — request count/latency histograms by method/path/status,
+# scraped by shopassist-devops's optional Prometheus overlay (see that
+# repo's observability/ directory). include_in_schema=False keeps it out
+# of the Swagger docs above.
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
 
 app.include_router(chat.router)
 app.include_router(health.router)

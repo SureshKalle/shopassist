@@ -8,6 +8,7 @@ from common.models import (
 from services.pii_masker import PIIMasker
 from services.llm_inference import MockLLMInferenceService
 from services.rag import MockRAGService
+from services.classifier_client import ClassifierClient
 
 class DataIngestionPipeline:
     """
@@ -15,10 +16,11 @@ class DataIngestionPipeline:
     for RAG and LLM fine-tuning. This is typically a batch or streaming system,
     not a real-time microservice.
     """
-    def __init__(self, pii_masker: PIIMasker, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService):
+    def __init__(self, pii_masker: PIIMasker, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService, classifier_client: ClassifierClient):
         self.pii_masker = pii_masker
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service
+        self.classifier_client = classifier_client
 
     def ingest_customer_conversations(self, raw_conversations: List[RawCustomerConversation]) -> List[CleanedCustomerConversation]:
         print("\n--- Data Pipeline: Ingesting Customer Conversations ---")
@@ -83,15 +85,26 @@ class DataIngestionPipeline:
             # Extract structured entities from free-text (e.g., features from description)
             structured_specs = {k.lower().replace(' ', '_'): v for k, v in raw_prod.specs.items()}
             
-            # Process reviews: de-duplicate, standardize, sentiment analysis
+            # Process reviews: de-duplicate, standardize, sentiment + topic analysis
             sentiment_analyzed_reviews = []
             for review_text in set(raw_prod.reviews): # Use set to de-duplicate
-                # Mock sentiment: In reality, use a pre-trained sentiment model
-                sentiment = "positive" if "great" in review_text.lower() or "awesome" in review_text.lower() else "negative" if "bad" in review_text.lower() else "neutral"
-                
+                # Real encoder-model classification via shopassist-model's
+                # classifier service (BERT-style sentiment + zero-shot topic
+                # tagging) — see services/classifier_client.py and
+                # shopassist-model's README for the full architecture.
+                sentiment_result = self.classifier_client.classify_sentiment(review_text)
+                feedback_result = self.classifier_client.classify_feedback(review_text)
+
                 # --- 2. PII Masking for Reviews ---
                 masked_review_data = self.pii_masker.mask_text(review_text)
-                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment, "original_hash": masked_review_data.original_text_hash})
+                sentiment_analyzed_reviews.append({
+                    "text": masked_review_data.masked_text,
+                    "sentiment": sentiment_result["label"],
+                    "sentiment_score": sentiment_result["score"],
+                    "topic": feedback_result["label"],
+                    "topic_score": feedback_result["score"],
+                    "original_hash": masked_review_data.original_text_hash,
+                })
             
             cleaned_products.append(CleanedProductRecord(
                 product_id=raw_prod.product_id,
@@ -139,8 +152,9 @@ if __name__ == "__main__":
     pii_masker_inst = PIIMasker()
     llm_inf_inst = MockLLMInferenceService()
     rag_service_inst = MockRAGService(llm_inf_inst)
-    
-    pipeline = DataIngestionPipeline(pii_masker_inst, llm_inf_inst, rag_service_inst)
+    classifier_client_inst = ClassifierClient()
+
+    pipeline = DataIngestionPipeline(pii_masker_inst, llm_inf_inst, rag_service_inst, classifier_client_inst)
 
     raw_convs = [
         RawCustomerConversation(id="test_conv_001", text="Hello, my name is Jane Smith. I need help with order 54321.", metadata={"user_id": "cust_abc"}),

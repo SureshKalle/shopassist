@@ -1,14 +1,15 @@
 # main_simulation.py
+import os
 import uuid
 from datetime import datetime
-from db.init_db import build_db
 
 # Import all services and models
 from common.models import CustomerQuery, RawCustomerConversation, RawProductRecord
-from services.ecommerce_client import ECommerceAPIClient
+from services.ecommerce_client import DEFAULT_DB_URL, ECommerceAPIClient
 from services.pii_masker import PIIMasker
 from services.llm_inference import MockLLMInferenceService
-from services.rag import MockRAGService
+from services.rag import MockRAGService, PgVectorRAGService
+from services.classifier_client import ClassifierClient
 from services.data_pipeline import DataIngestionPipeline
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
@@ -27,18 +28,26 @@ if __name__ == "__main__":
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
     llm_inference_service = MockLLMInferenceService()
-    rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
+    # PgVectorRAGService when DATABASE_URL is Postgres (real semantic search
+    # against shopassist-database's document_chunks), MockRAGService
+    # otherwise — mirrors api/dependencies.py::get_rag_service() exactly.
+    database_url = os.environ.get("DATABASE_URL", DEFAULT_DB_URL)
+    if database_url.startswith("postgresql"):
+        rag_service = PgVectorRAGService(llm_inference_service, database_url)
+    else:
+        rag_service = MockRAGService(llm_inference_service)
     ecommerce_api_client = ECommerceAPIClient()
+    classifier_client = ClassifierClient() # sentiment + topic classification, see shopassist-model
 
     # 2. Initialize Data Ingestion Pipeline
-    data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service)
+    data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service, classifier_client)
 
     # --- SIMULATE DATA PREPARATION & INGESTION ---
     print("\n--- Running Data Preparation & Ingestion Cycle ---")
     
     # Raw Customer Conversations
     raw_customer_conversations = [
-        RawCustomerConversation(id="conv_001", text="Hi, my name is John Doe, and I want to know about my order 12345.", metadata={"source": "twitter", "user_id": "jd_123"}),
+        RawCustomerConversation(id="conv_001", text="Hi, my name is John Doe, and I want to know about my order ord-2001.", metadata={"source": "twitter", "user_id": "jd_123"}),
         RawCustomerConversation(id="conv_002", text="Can you help me with a return for product X? My email is john.doe@example.com.", metadata={"source": "web_form", "user_id": "jd_123"}),
         RawCustomerConversation(id="conv_003", text="I love my new laptop! Is there a warranty?", metadata={"source": "web_chat", "user_id": "cust_002"}),
     ]
@@ -52,7 +61,7 @@ if __name__ == "__main__":
     ]
     cleaned_products = data_pipeline.ingest_product_catalog(raw_product_catalog)
     print(f"\nSample Cleaned Product Description for LLM Fine-tuning: '{cleaned_products[0].clean_description[:50]}...'")
-    print(f"Product RAG vector DB now contains {len(rag_service.vector_db)} documents from initial ingestion.")
+    print(f"Product RAG vector DB now contains {rag_service.collection_size()} documents from initial ingestion.")
 
     # Synthetic E-commerce Queries
     synthetic_queries = data_pipeline.generate_synthetic_queries(["Where is my shipment?", "Suggest a gift.", "How do I return an item?"])
@@ -79,7 +88,7 @@ if __name__ == "__main__":
 
     # Interaction 1: Order Status
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="cust_001", text="Hi, I'd like to check my order status for order 54321.")
+    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="cust-1001", text="Hi, I'd like to check my order status for order ord-2002.")
     print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
     response_1 = orchestrator.handle_customer_query(customer_query_1)
     print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
@@ -87,7 +96,7 @@ if __name__ == "__main__":
 
     # Interaction 2: Product Recommendation
     #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    #customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="cust_002", text="Can you recommend a good laptop for gaming?")
+    #customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="cust-1002", text="Can you recommend some IISc merchandise for a gift?")
     #print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
     #response_2 = orchestrator.handle_customer_query(customer_query_2)
     #print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
@@ -95,7 +104,7 @@ if __name__ == "__main__":
 
     # Interaction 3: General Query with PII (should be masked)
     #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    #customer_query_3 = CustomerQuery(session_id=current_session_id, user_id="cust_003", text="What's your return policy? My email is John.Doe@example.com.")
+    #customer_query_3 = CustomerQuery(session_id=current_session_id, user_id="cust-1003", text="What's your return policy? My email is John.Doe@example.com.")
     #print(f"\n>>> Customer: '{customer_query_3.text}' (Session: {customer_query_3.session_id})")
     #response_3 = orchestrator.handle_customer_query(customer_query_3)
     #print(f"\n<<< Chatbot: '{response_3.response_text}' (Agent: {response_3.agent_invoked})")
@@ -103,7 +112,7 @@ if __name__ == "__main__":
 
     # Interaction 4: Order Status with PII (should be masked & new order)
     # Using existing session to show history awareness (though simple in mock)
-    #customer_query_4 = CustomerQuery(session_id=customer_query_1.session_id, user_id="cust_001", text="Actually, my name is Jane Smith. What about order 54321, is that shipped?")
+    #customer_query_4 = CustomerQuery(session_id=customer_query_1.session_id, user_id="cust-1001", text="Actually, my name is Jane Smith. What about order ord-2002, is that shipped?")
     #print(f"\n>>> Customer: '{customer_query_4.text}' (Session: {customer_query_4.session_id})")
     #response_4 = orchestrator.handle_customer_query(customer_query_4)
     #print(f"\n<<< Chatbot: '{response_4.response_text}' (Agent: {response_4.agent_invoked})")
@@ -111,7 +120,7 @@ if __name__ == "__main__":
 
     # Interaction 5: Query leading to GeneralPurpose Agent
     #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    #customer_query_5 = CustomerQuery(session_id=current_session_id, user_id="cust_004", text="Tell me about your company's history.")
+    #customer_query_5 = CustomerQuery(session_id=current_session_id, user_id="cust-1004", text="Tell me about your company's history.")
     #print(f"\n>>> Customer: '{customer_query_5.text}' (Session: {customer_query_5.session_id})")
     #response_5 = orchestrator.handle_customer_query(customer_query_5)
     #print(f"\n<<< Chatbot: '{response_5.response_text}' (Agent: {response_5.agent_invoked})")

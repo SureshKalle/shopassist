@@ -3,11 +3,8 @@
 .DS_Store
 ._*
 
-# Generated local SQLite dev DB (built by db/init_db.py from schema_sqlite.sql
-# + seed_data.sql — schema.sql/schema_sqlite.sql/seed_data.sql are the source
-# of truth, not this binary file).
-db/*.db
-db/*.db-journal
+# Database schema, seed data, and the generated SQLite/Postgres databases
+# themselves now live in the sibling shopassist-database repo, not here.
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -227,6 +224,3 @@ tempCodeRunnerFile.py
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
-# Streamlit
-.streamlit/secrets.toml

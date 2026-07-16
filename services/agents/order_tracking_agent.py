@@ -3,7 +3,9 @@ from common.models import AgentTask, StructuredAgentResult, StructuredOrderSumma
 from services.agents.base_agent import BaseAgent
 import re
 
-ORDER_ID_PATTERN = re.compile(r"\b(\d{4,})\b")
+# Order IDs are human-readable business keys (ord-1001, ...), not bare
+# numbers - see shopassist-database's docs/database-design.md.
+ORDER_ID_PATTERN = re.compile(r"\b(ord-\d+)\b", re.IGNORECASE)
 
 class OrderTrackingAgent(BaseAgent):
     """
@@ -15,17 +17,17 @@ class OrderTrackingAgent(BaseAgent):
     @staticmethod
     def _extract_order_id(text: str) -> str | None:
         match = ORDER_ID_PATTERN.search(text or "")
-        return match.group(1) if match else None
-    
+        return match.group(1).lower() if match else None
+
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         print(f"\n[{self.name}] Received task: {task.task_id} for intent '{task.intent}'")
-        
+
         customer_id = task.customer_id # Assume Orchestrator has retrieved/tokenized this
-        #order_id = task.params.get('order_id', '12345') # Mock or extract from query if not in params
+        #order_id = task.params.get('order_id', 'ord-1001') # Mock or extract from query if not in params
         # The router never actually populates 'order_id' into task.params (it only
         # passes {"query": <text>}), so pull it out of the customer's own text instead
-        # of silently defaulting to '12345' for every order.
-        order_id = task.params.get('order_id') or self._extract_order_id(task.original_query) or '12345'
+        # of silently defaulting to 'ord-1001' for every order.
+        order_id = task.params.get('order_id') or self._extract_order_id(task.original_query) or 'ord-1001'
 
         # 1. Use LLMInf_AgentReason for structured workflow planning/tool selection
         # (This determines if we need to call an API, RAG, or return directly)
