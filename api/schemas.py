@@ -24,7 +24,7 @@ class ChatRequest(BaseModel):
         default=None, description="Existing session ID to continue a conversation. Omit to start a new session."
     )
     user_id: str = Field(description="Identifier for the customer sending the message.")
-    text: str = Field(description="The customer's message text.", min_length=1)
+    text: str = Field(description="The customer's message text.", min_length=1, max_length=2000)
     source_channel: str = Field(default="web_chat", description="Origin channel, e.g. web_chat, mobile_app, twitter.")
 
 
@@ -34,4 +34,16 @@ class ChatResponse(BaseModel):
     agent_invoked: Optional[str] = None
     confidence_score: float
     timestamp: datetime
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
+class HealthResponse(BaseModel):
+    status: str
+    registered_agents: list[str]
+    rag_documents_indexed: int
+    database_reachable: bool
+    llm_reachable: bool
+    api_key_enforced: bool
 

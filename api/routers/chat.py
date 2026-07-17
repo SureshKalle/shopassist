@@ -7,22 +7,30 @@ GET    /api/v1/chat/{session_id}/history → retrieve conversation history
 DELETE /api/v1/chat/{session_id}         → clear a session
 """
 
+import asyncio
 import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from api.config import settings
 from api.dependencies import get_orchestrator
+from api.rate_limit import rate_limit
 from api.schemas import ChatRequest, ChatResponse
+from api.security import verify_api_key
 from common.models import CustomerQuery
 from services.orchestrator import AgentOrchestratorService
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/chat", tags=["chat"])
+router = APIRouter(
+    prefix="/api/v1/chat",
+    tags=["chat"],
+    dependencies=[Depends(verify_api_key), Depends(rate_limit)],
+)
 
 
 @router.post("", response_model=ChatResponse)
-def send_message(
+async def send_message(
     request: ChatRequest,
     orchestrator: AgentOrchestratorService = Depends(get_orchestrator),
 ) -> ChatResponse:
@@ -43,7 +51,23 @@ def send_message(
     )
 
     try:
-        response = orchestrator.handle_customer_query(query)
+        # orchestrator.handle_customer_query is blocking (sync LLM/DB calls),
+        # so it runs in a worker thread; wait_for bounds how long *this
+        # request* waits on it. It does not cancel the thread itself - Python
+        # can't force-cancel a running thread - so a timeout here frees up
+        # the client and this request, but the orchestrator call keeps
+        # running in the background until it finishes on its own. Real
+        # cancellation needs async LLM/DB clients throughout services/.
+        response = await asyncio.wait_for(
+            asyncio.to_thread(orchestrator.handle_customer_query, query),
+            timeout=settings.chat_request_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        logger.error(
+            "[API] Orchestrator timed out after %ss (session=%s)",
+            settings.chat_request_timeout_seconds, session_id,
+        )
+        raise HTTPException(status_code=504, detail="Request timed out while processing your message.") from exc
     except Exception as exc:
         logger.error("[API] Unhandled error in orchestrator: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Internal error processing chat message.") from exc

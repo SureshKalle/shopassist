@@ -2,22 +2,16 @@
 """
 Singleton service wiring for the FastAPI layer.
 
-All services/agents are expensive to construct (embedding models, LLM
-clients, vectorstore connections, LangGraph agent compilation) so each is
-built exactly once per process via `@lru_cache`, and FastAPI's `Depends()`
-resolves the same cached instance on every request — no per-request
-re-initialisation, no global mutable state scattered across route handlers.
-
-This mirrors exactly how `main_simulation.py` wires the same services
-together for the CLI simulation; the two entry points (API and simulation
-script) share the same construction logic conceptually, just via different
-mechanisms (FastAPI DI vs. plain function calls).
+Each service/agent is built once per process via `@lru_cache`; FastAPI's
+`Depends()` then resolves the same cached instance on every request. Mirrors
+how main_simulation.py wires up the same services for the CLI simulation.
 """
 
 import logging
 from functools import lru_cache
 
 from clients.ecommerce_api_client import MockECommerceAPIClient
+from common.models import RawCustomerConversation, RawProductRecord
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
@@ -30,6 +24,50 @@ from services.pii_masker import PIIMasker
 from services.rag import MockRAGService
 
 logger = logging.getLogger(__name__)
+
+# Same sample data main_simulation.py ingests before its demo queries, so
+# the RAG store isn't empty on this API's first request. No policy docs
+# seeded - DataIngestionPipeline has no ingest_policy_documents method yet.
+_SAMPLE_CONVERSATIONS = [
+    RawCustomerConversation(
+        id="conv_001",
+        text="Hi, my name is John Doe, and I want to know about my order 12345.",
+        metadata={"source": "twitter", "user_id": "jd_123"},
+    ),
+    RawCustomerConversation(
+        id="conv_002",
+        text="Can you help me with a return for product X? My email is john.doe@example.com.",
+        metadata={"source": "web_form", "user_id": "jd_123"},
+    ),
+    RawCustomerConversation(
+        id="conv_003",
+        text="I love my new laptop! Is there a warranty?",
+        metadata={"source": "web_chat", "user_id": "cust_002"},
+    ),
+]
+
+_SAMPLE_PRODUCTS = [
+    RawProductRecord(
+        product_id="PROD_LAP_001",
+        raw_description=(
+            "High-performance gaming laptop with an i7 processor, 16GB RAM, "
+            "and a 1TB SSD. Stunning display and RGB keyboard."
+        ),
+        specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"},
+        reviews=["Great product!", "Fast delivery.", "Screen is amazing!"],
+        price="$1200.00",
+    ),
+    RawProductRecord(
+        product_id="PROD_HEAD_002",
+        raw_description=(
+            "Premium noise-cancelling headphones for immersive audio. "
+            "Comfortable earcups and 20-hour battery life."
+        ),
+        specs={"Color": "Black", "Battery": "20h"},
+        reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."],
+        price="$250.00",
+    ),
+]
 
 
 @lru_cache
@@ -75,15 +113,12 @@ def get_orchestrator() -> AgentOrchestratorService:
 
 
 def warm_up_services() -> None:
-    """
-    Eagerly construct every singleton at app startup (called from the
-    FastAPI lifespan handler in main.py) rather than lazily on first
-    request — surfaces configuration errors (bad API key, unreachable
-    Ollama server, etc.) at boot time instead of on a customer's first
-    request, and avoids a slow "cold" first request while agent graphs
-    compile and the embedding model loads.
-    """
+    """Eagerly construct every singleton and seed the RAG store at startup
+    (called from main.py's lifespan handler), instead of lazily on first
+    request."""
     logger.info("[API] Warming up services...")
     get_orchestrator()  # transitively constructs everything else
-    get_data_pipeline()
+    pipeline = get_data_pipeline()
+    pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)
+    pipeline.ingest_product_catalog(_SAMPLE_PRODUCTS)
     logger.info("[API] Service warm-up complete.")
