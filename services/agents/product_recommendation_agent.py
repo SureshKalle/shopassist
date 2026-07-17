@@ -1,6 +1,10 @@
 # services/agents/product_recommendation_agent.py
+import logging
+
 from common.models import AgentTask, StructuredAgentResult, StructuredProductRecommendation
 from services.agents.base_agent import BaseAgent
+
+logger = logging.getLogger(__name__)
 
 class ProductRecommendationAgent(BaseAgent):
     """
@@ -10,12 +14,23 @@ class ProductRecommendationAgent(BaseAgent):
         super().__init__("ProductRecommendationAgent", *args, **kwargs)
 
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
-        print(f"\n[{self.name}] Received task: {task.task_id} for intent '{task.intent}'")
-        
-        customer_id = task.customer_id
+        """Recommend one product based on the customer's purchase history + RAG.
+
+        Note the recommendation itself (product_id, name, price below) is
+        currently a hardcoded placeholder, not looked up from
+        `clients/ecommerce_api_client.py`'s items table - only the RAG-matched
+        description snippet and the customer-history framing (favorite
+        category, last purchase) are real. Wiring product_id/price/name to a
+        real `EcommerceClient.get_item()`/`search_items()` call is a natural
+        next step once RAG returns enough to identify a specific item_id.
+        """
+        logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
+
+        user_id = task.user_id
         # 1. Fetch customer history (Internal Tool: E-commerce Microservice API)
-        customer_history = self.ecommerce_api_client.get_customer_history(customer_id)
-        
+        customer_history = self.ecommerce_api_client.get_customer_history(user_id)
+        logger.debug("customer_history=%s", customer_history)
+
         # 2. Use RAG to find relevant products based on query and history (Internal Tool: RAG Service)
         rag_query_text = f"{task.original_query} based on customer's favorite category '{customer_history.get('favorite_category')}' and last purchase '{customer_history.get('last_purchase')}'"
         rag_results = self.rag_service.query_knowledge_base(
@@ -40,6 +55,7 @@ class ProductRecommendationAgent(BaseAgent):
                 )
         
         if recommended_product:
+            logger.info("Recommendation found: product_id=%s", recommended_product.product_id)
             return StructuredAgentResult(
                 task_id=task.task_id,
                 agent_name=self.name,
@@ -47,6 +63,7 @@ class ProductRecommendationAgent(BaseAgent):
                 result_data=recommended_product,
             )
         else:
+            logger.warning("No recommendation found for task_id=%s", task.task_id)
             return StructuredAgentResult(
                 task_id=task.task_id,
                 agent_name=self.name,

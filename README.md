@@ -15,8 +15,9 @@ Same steps for both entry points (`services/orchestrator.py`, `AgentOrchestrator
 2. The message is appended to that session's in-memory conversation history (a plain dict keyed by `session_id`, not backed by any external store - lost on process restart).
 3. `LLMInferenceService.call_router()` asks the LLM which agent should handle it (`OrderTrackingAgent`, `ProductRecommendationAgent`, or `GeneralPurposeAgent`), with a confidence score. Recent identical queries reuse the last routing decision instead of asking again.
 4. The chosen agent runs its own logic:
-   - `OrderTrackingAgent` asks the LLM to plan a tool call, then actually queries the order DB (`clients/ecommerce_api_client.py` - SQLite locally, Postgres via `DATABASE_URL`). This is the only agent that touches a real data store.
-   - `ProductRecommendationAgent` / `GeneralPurposeAgent` search `RAGService`, an in-memory dict of ingested text chunks matched by substring/keyword - not a vector DB, and `call_embeddings()` is a deterministic stub, not a real embedding model.
+   - `OrderTrackingAgent` asks the LLM to plan a tool call, then actually queries the order DB via `EcommerceClient` (`clients/ecommerce_api_client.py` - SQLite locally, Postgres via `DATABASE_URL`).
+   - `ProductRecommendationAgent` also goes through `EcommerceClient` (customer purchase history), then searches `RAGService` for a matching product.
+   - `GeneralPurposeAgent` only searches `RAGService`, an in-memory dict of ingested text chunks matched by substring/keyword - not a vector DB, and `call_embeddings()` is a deterministic stub, not a real embedding model.
    - Any unhandled exception from an agent, or a routing failure, falls back to `EscalationAgent`, which packages the reason and last 3 turns for a human handover (it doesn't file a ticket anywhere - that's a stub too).
 5. `LLMInferenceService.call_generative()` turns the agent's structured result into a reply.
 6. The reply is appended to conversation history, and a response object goes back to the caller (`ChatbotResponse` internally, `ChatResponse` over HTTP).
@@ -85,19 +86,33 @@ The current enforcement mode is logged once at startup (`WARNING` level) and rep
 | To understand... | Open |
 |---|---|
 | The FastAPI app, middleware, and router wiring | `api/main.py`, `api/middleware.py` |
+| The HTTP contract for a chatbot client integrating against this gateway | [`api/README.md`](api/README.md) |
 | Auth, rate limiting, request correlation | `api/security.py`, `api/rate_limit.py`, `api/request_context.py` |
 | Singleton service construction (DI) | `api/dependencies.py` |
 | The one method that runs every customer interaction | `services/orchestrator.py` -> `handle_customer_query()` |
 | How PII gets masked | `services/pii_masker.py` |
 | How the LLM router/agent-reasoning/generative calls work | `services/llm_inference.py` |
 | Each specialist's logic | `services/agents/*.py` |
+| Order/customer/item data access (the one place every module goes through) | `clients/ecommerce_api_client.py` -> `EcommerceClient` |
 | The in-memory "RAG" store | `services/rag.py` |
 | How raw sample data becomes searchable chunks | `services/data_pipeline.py` |
 | The CLI entry point | `main_simulation.py` |
 
+## Where to start reading
+
+For a first pass at the codebase, in this order:
+
+1. `services/orchestrator.py` -> `handle_customer_query()` - the whole request lifecycle in one method, with the numbered steps below matching [Request flow](#request-flow) above.
+2. `common/models.py` - every request/response shape passed between the pieces above; skim top to bottom to see one message's data shape evolve end to end.
+3. `services/llm_inference.py` - the five LLM entry points (`call_router`, `call_agent_reason`, `call_agent_interpret`, `call_generative`, `call_embeddings`), each with a docstring explaining its contract and fallback behaviour.
+4. `services/agents/*.py` - one file per specialist; `order_tracking_agent.py` is the most complete example of the reason -> tool-call -> interpret pattern.
+5. `clients/ecommerce_api_client.py` and `db/README.md` - the data layer, local SQLite dev DB, and the switch to Postgres later.
+
 ## Known gaps
 
-- `ChatResponse.confidence_score` always reads `1.0` - `services/orchestrator.py` doesn't pass the router's actual confidence through to the response object.
 - `GET /api/v1/chat/{session_id}/history` and `DELETE /api/v1/chat/{session_id}` are mentioned in `api/routers/chat.py`'s docstring but not implemented.
-- `OrderTrackingAgent` tells the LLM its tool is called `ECommerceAPI.getOrderDetails`, then checks for exactly `ECommerceAPI` - a correct tool-call decision from the LLM can still fail this check and silently skip the real lookup.
 - Rate limiting and the request-routing cache are in-memory and per-process - fine for one instance, not for multiple replicas.
+- `ProductRecommendationAgent` hardcodes the recommended `product_id`/`name`/`price` (see its docstring) - only the RAG-matched description snippet and the customer-history framing are real. Wiring the recommendation itself to `EcommerceClient.get_item()`/`search_items()` is a natural next step.
+- `MockRAGService.query_knowledge_base()` accepts a `query_embedding` parameter but matches purely by substring/keyword against `query_text` - the embedding is computed by every caller but never actually used. `LLMInferenceService.call_embeddings()` is a deterministic stub (16-dimensional at most), not a real embedding model, so this only matters once a real vector store replaces `MockRAGService`.
+- `LLMInferenceService.call_agent_generate()` is fully implemented but not called by any agent or by the orchestrator today - every agent returns a structured result and lets `call_generative()` do the one customer-facing synthesis step instead.
+- See `db/README.md`'s own Known Gaps for data-layer specifics (order-ID format, the disabled order-ownership check).

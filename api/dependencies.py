@@ -10,7 +10,7 @@ how main_simulation.py wires up the same services for the CLI simulation.
 import logging
 from functools import lru_cache
 
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from clients.ecommerce_api_client import EcommerceClient
 from common.models import RawCustomerConversation, RawProductRecord
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
@@ -42,7 +42,7 @@ _SAMPLE_CONVERSATIONS = [
     RawCustomerConversation(
         id="conv_003",
         text="I love my new laptop! Is there a warranty?",
-        metadata={"source": "web_chat", "user_id": "cust_002"},
+        metadata={"source": "web_chat", "user_id": "alum_002"},
     ),
 ]
 
@@ -86,8 +86,8 @@ def get_rag_service() -> MockRAGService:
 
 
 @lru_cache
-def get_ecommerce_client() -> MockECommerceAPIClient:
-    return MockECommerceAPIClient()
+def get_ecommerce_client() -> EcommerceClient:
+    return EcommerceClient()
 
 
 @lru_cache
