@@ -1,7 +1,7 @@
 # services/rag.py
 from typing import List, Dict, Any, Optional
 from common.models import ChunkedDocument
-from services.llm_inference import MockLLMInferenceService # To get embeddings
+from services.llm_inference import LLMInferenceService # To get embeddings
 
 class MockRAGService:
     """
@@ -9,7 +9,7 @@ class MockRAGService:
     In a real system, this would be a microservice interacting with a vector database
     (e.g., Pinecone, Weaviate, ChromaDB) and potentially a search cache (Redis).
     """
-    def __init__(self, llm_inference_client: MockLLMInferenceService):
+    def __init__(self, llm_inference_client: LLMInferenceService):
         self.vector_db: Dict[str, ChunkedDocument] = {} # {doc_id: ChunkedDocument}
         self.rag_query_cache: Dict[str, List[ChunkedDocument]] = {}
         self.llm_inference_client = llm_inference_client
@@ -52,7 +52,7 @@ class MockRAGService:
 
 # Example of how this service might be used:
 if __name__ == "__main__":
-    llm_inf_client = MockLLMInferenceService()
+    llm_inf_client = LLMInferenceService()
     rag_service = MockRAGService(llm_inf_client)
     
     # Ingest some mock documents

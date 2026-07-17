@@ -23,7 +23,7 @@ from common.models import (
     Message                
 )
 load_dotenv() 
-class MockLLMInferenceService:
+class LLMInferenceService:
     """
     The Centralized LLM Inference Service.
     Wraps actual LLM API calls and provides specialized endpoints.
@@ -463,7 +463,7 @@ if __name__ == "__main__":
                             embedding = [0.0] * 1536
                         return type('obj', (object,), {'data': [MockData()]})()
                 return MockEmbedAIClient()
-        MockLLMInferenceService.openai_client = MockOpenAIClient()
+        LLMInferenceService.openai_client = MockOpenAIClient()
         
     llm_service = LLMInferenceService()
     

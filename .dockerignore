@@ -1,0 +1,8 @@
+.venv/
+.git/
+.env
+__pycache__/
+*.pyc
+db/*.db
+api/API_Module_Guide.pdf
+README.md
