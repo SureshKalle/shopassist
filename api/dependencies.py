@@ -55,7 +55,7 @@ _SAMPLE_PRODUCTS = [
         ),
         specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"},
         reviews=["Great product!", "Fast delivery.", "Screen is amazing!"],
-        price="$1200.00",
+        price="₹1200.00",
     ),
     RawProductRecord(
         product_id="PROD_HEAD_002",
@@ -65,7 +65,7 @@ _SAMPLE_PRODUCTS = [
         ),
         specs={"Color": "Black", "Battery": "20h"},
         reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."],
-        price="$250.00",
+        price="₹250.00",
     ),
 ]
 
