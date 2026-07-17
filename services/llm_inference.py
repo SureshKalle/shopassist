@@ -1,8 +1,26 @@
 # services/llm_inference.py
+"""
+The one place every LLM call in shopassist goes through. Wraps an OpenAI-
+compatible client pointed at a local Ollama server (see OLLAMA_API_BASE_URL /
+OLLAMA_*_MODEL in .env.example) behind five purpose-specific methods, one per
+step of the pipeline in services/orchestrator.py and services/agents/*.py:
+
+- call_router           - which specialist agent should handle this message?
+- call_agent_reason     - should this agent call a tool (DB/RAG), or return now?
+- call_agent_interpret  - given raw tool output, what's the structured diagnosis?
+- call_generative       - turn an agent's structured result into a customer reply.
+- call_embeddings       - turn text into a vector (used by services/rag.py).
+
+Each method sends a system prompt describing the exact JSON schema the LLM must
+return, then validates the response against the matching Pydantic model in
+common/models.py. If the model is unavailable, times out, or returns invalid
+JSON, every method degrades to a safe fallback value instead of raising -
+callers never need to handle an LLM-specific exception themselves.
+"""
+import logging
 import os
-from typing import List, Dict, Any, Optional, Union
+from typing import List
 from dotenv import load_dotenv
-from typing import List, Dict, Any, Optional, Union
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
@@ -14,15 +32,17 @@ from common.models import (
     NLGRequest, StructuredAgentResult,
     StructuredOrderSummary, 
     StructuredProductRecommendation,
-    OrderIssueAnalysis,
     AgentGenerationOutput,
     GeneralPurposeAnswer,  
     EscalationDetails,      
     OrderIssueAnalysis,    
-    FinalNLGOutput,        
-    Message                
+    FinalNLGOutput                
 )
-load_dotenv() 
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
 class LLMInferenceService:
     """
     The Centralized LLM Inference Service.
@@ -43,7 +63,15 @@ class LLMInferenceService:
         self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") 
 
     def call_router(self, request: RoutingRequest) -> AgentInvocation:
-        print(f"  [LLMInf] Calling LLMInf_Router ({self.router_model}) with query: '{request.current_query}'...")
+        """Decide which specialist agent should handle this query.
+
+        Sends the (PII-masked) conversation history plus the current query and
+        asks the LLM to pick one of the five known agent names with a confidence
+        score. Falls back to GeneralPurposeAgent - at a lower confidence each
+        time - if the LLM names an unknown agent, returns invalid JSON, or the
+        call itself fails (network error, model not pulled, etc.).
+        """
+        logger.info("call_router: model=%s query=%r", self.router_model, request.current_query)
         
         # Prepare conversation history for the LLM
         messages: List[ChatCompletionMessageParam] = [
@@ -83,20 +111,21 @@ class LLMInferenceService:
             
             # Extract and parse the JSON response
             llm_output_str = response.choices[0].message.content
-            print(f"  [LLMInf] Router LLM raw output: {llm_output_str}")
-            
+            logger.debug("call_router: raw output=%s", llm_output_str)
+
             # Validate LLM output against Pydantic model
             parsed_invocation = AgentInvocation.model_validate_json(llm_output_str)
-            
+
             # Simple check for known agents, fallback if LLM invents one
             if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
-                print(f"  [LLMInf] Warning: LLM suggested unknown agent '{parsed_invocation.agent_name}'. Falling back to GeneralPurposeAgent.")
+                logger.warning("call_router: LLM suggested unknown agent '%s' - falling back to GeneralPurposeAgent", parsed_invocation.agent_name)
                 return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
-            
+
+            logger.info("call_router: agent=%s confidence=%s", parsed_invocation.agent_name, parsed_invocation.confidence)
             return parsed_invocation
 
         except ValidationError as e:
-            print(f"  [LLMInf] Error: LLM output for router is not valid JSON or doesn't match AgentInvocation schema: {e}")
+            logger.warning("call_router: LLM output invalid (%s) - falling back to GeneralPurposeAgent", e)
             # Fallback for malformed LLM output
             return AgentInvocation(
                 agent_name="GeneralPurposeAgent",
@@ -104,7 +133,7 @@ class LLMInferenceService:
                 parameters={"original_query": request.current_query, "error": "LLM routing output parse error"}
             )
         except Exception as e:
-            print(f"  [LLMInf] Error calling Router LLM: {e}")
+            logger.error("call_router: error calling router LLM: %s", e, exc_info=True)
             # General fallback for API errors, network issues, etc.
             return AgentInvocation(
                 agent_name="GeneralPurposeAgent",
@@ -113,8 +142,19 @@ class LLMInferenceService:
             )
 
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        
-        print(f"  [LLMInf] Calling LLMInf_AgentReason ({self.agent_reason_model}) for {request.agent_name}...")
+        """Ask the LLM to plan the agent's single next step.
+
+        Given a task description, the agent's current state, and the tools it's
+        allowed to use (`request.available_tools`), the LLM returns one of
+        'call_api' / 'query_rag' / 'return_result' / 'escalate', plus which tool
+        to call and with what parameters if applicable. Callers must compare
+        `response.tool_name` against the exact string they advertised in
+        `available_tools` - see services/agents/order_tracking_agent.py for the
+        convention (`'ECommerceAPI.getOrderDetails'`, not just `'ECommerceAPI'`).
+        Falls back to `action='return_result'` on any unknown action, invalid
+        JSON, or call failure.
+        """
+        logger.info("call_agent_reason: model=%s agent=%s", self.agent_reason_model, request.agent_name)
 
         # Prepare the reasoning prompt for the LLM
         messages: List[ChatCompletionMessageParam] = [
@@ -152,7 +192,7 @@ class LLMInferenceService:
 
             # Extract and parse the JSON response
             llm_output_str = response.choices[0].message.content
-            print(f"  [LLMInf] AgentReason LLM raw output: {llm_output_str}")
+            logger.debug("call_agent_reason: raw output=%s", llm_output_str)
 
             # Validate LLM output against Pydantic model
             parsed_response = LLMAgentReasonResponse.model_validate_json(llm_output_str)
@@ -160,23 +200,27 @@ class LLMInferenceService:
             # Simple check for known actions, fallback if LLM invents one
             valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
             if parsed_response.action not in valid_actions:
-                print(f"  [LLMInf] Warning: LLM suggested unknown action '{parsed_response.action}'. Falling back to return_result.")
+                logger.warning("call_agent_reason: LLM suggested unknown action '%s' - falling back to return_result", parsed_response.action)
                 return LLMAgentReasonResponse(
                     action="return_result",
                     thought=f"Unknown action '{parsed_response.action}' from LLM; defaulting to return_result."
                 )
 
+            logger.info(
+                "call_agent_reason: agent=%s action=%s tool_name=%s",
+                request.agent_name, parsed_response.action, parsed_response.tool_name,
+            )
             return parsed_response
 
         except ValidationError as e:
-            print(f"  [LLMInf] Error: LLM output for agent reason is not valid JSON or doesn't match LLMAgentReasonResponse schema: {e}")
+            logger.warning("call_agent_reason: LLM output invalid (%s) - defaulting to return_result", e)
             # Fallback for malformed LLM output
             return LLMAgentReasonResponse(
                 action="return_result",
                 thought=f"LLM agent-reason output parse error: {e}"
             )
         except Exception as e:
-            print(f"  [LLMInf] Error calling AgentReason LLM: {e}")
+            logger.error("call_agent_reason: error calling agent-reason LLM: %s", e, exc_info=True)
             # General fallback for API errors, network issues, etc.
             return LLMAgentReasonResponse(
                 action="return_result",
@@ -185,8 +229,19 @@ class LLMInferenceService:
 
 
     def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
-        
-        print(f"  [LLMInf] Calling LLMInf_AgentInterpret ({self.agent_interpret_model}) for {request.agent_name} to {request.interpretation_goal}...")
+        """Turn a tool's raw output into a structured diagnosis.
+
+        Only one `interpretation_goal` is implemented today - 'diagnose order
+        issue', which always validates against `OrderIssueAnalysis`. A second
+        goal (e.g. for ProductRecommendationAgent) would need this method to
+        pick a different response model based on `request.interpretation_goal`,
+        which it doesn't do yet. Falls back to `issue_type='Unknown'` with
+        `severity='high'` on invalid JSON or a call failure.
+        """
+        logger.info(
+            "call_agent_interpret: model=%s agent=%s goal=%s",
+            self.agent_interpret_model, request.agent_name, request.interpretation_goal,
+        )
 
         # Prepare the interpretation prompt for the LLM
         messages: List[ChatCompletionMessageParam] = [
@@ -221,41 +276,52 @@ class LLMInferenceService:
             
             # Extract and parse the JSON response
             llm_output_str = response.choices[0].message.content
-            print(f"  [LLMInf] AgentInterpret LLM raw output: {llm_output_str}")
+            logger.debug("call_agent_interpret: raw output=%s", llm_output_str)
 
             # Validate LLM output against the specific Pydantic model for interpretation
             # Assuming 'diagnose order issue' is the primary goal for now, which maps to OrderIssueAnalysis
             # If other goals were introduced, this might become a Union and require more complex validation.
             structured_interpretation_data = OrderIssueAnalysis.model_validate_json(llm_output_str)
-            
+
+            logger.info(
+                "call_agent_interpret: agent=%s issue_type=%s",
+                request.agent_name, structured_interpretation_data.issue_type,
+            )
             return LLMAgentInterpretResponse(
                 structured_interpretation=structured_interpretation_data,
                 thought=f"Successfully interpreted raw data for goal: {request.interpretation_goal}"
             )
 
         except ValidationError as e:
-            print(f"  [LLMInf] Error: LLM output for agent interpret is not valid JSON or doesn't match OrderIssueAnalysis schema: {e}")
+            logger.warning("call_agent_interpret: LLM output invalid (%s)", e)
             # Fallback for malformed LLM output
             return LLMAgentInterpretResponse(
                 structured_interpretation=OrderIssueAnalysis(issue_type="Unknown", recommendation=f"Failed to interpret data due to LLM output error: {e}", severity="high"),
                 thought=f"LLM agent-interpret output parse error for goal '{request.interpretation_goal}'"
             )
         except Exception as e:
-            print(f"  [LLMInf] Error calling AgentInterpret LLM: {e}")
+            logger.error("call_agent_interpret: error calling agent-interpret LLM: %s", e, exc_info=True)
             # General fallback for API errors, network issues, etc.
             return LLMAgentInterpretResponse(
                 structured_interpretation=OrderIssueAnalysis(issue_type="Unknown", recommendation=f"An internal error occurred during interpretation: {e}", severity="high"),
                 thought=f"LLM agent-interpret general error for goal '{request.interpretation_goal}'"
             )
     
-    def call_agent_generate(self, request: LLMAgentReasonRequest) -> str: # Simplified for this example
-        
-        print(f"  [LLMInf] Calling LLMInf_AgentGenerate ({self.generative_model}) for {request.agent_name} to generate a snippet...") # Use generative_model here
+    def call_agent_generate(self, request: LLMAgentReasonRequest) -> AgentGenerationOutput:
+        """Generate a short natural-language snippet for a single agent-level task.
 
-        # Prepare the generation prompt for the LLM
-        # The prompt uses request.task_description and current_state from LLMAgentReasonRequest
-        # This assumes that the agent has already decided *what* to generate (e.g., "describe X product")
-        # through its reasoning process.
+        Not currently called by any agent or by the orchestrator - every agent
+        today returns a structured result and lets `call_generative()` do the
+        one customer-facing synthesis step instead. Kept for an agent that
+        needs its own standalone snippet (e.g. a one-off product blurb)
+        without going through the full orchestrator NLG step.
+        """
+        logger.info("call_agent_generate: model=%s agent=%s", self.generative_model, request.agent_name)
+
+        # Prepare the generation prompt for the LLM. Uses task_description and
+        # current_state from LLMAgentReasonRequest, assuming the agent has
+        # already decided *what* to generate (e.g. "describe X product") via
+        # its own call_agent_reason() step.
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": (
                 "You are a concise natural language generation engine for a specialized AI agent. "
@@ -286,15 +352,16 @@ class LLMInferenceService:
             
             # Extract and parse the JSON response
             llm_output_str = response.choices[0].message.content
-            print(f"  [LLMInf] AgentGenerate LLM raw output: {llm_output_str}")
+            logger.debug("call_agent_generate: raw output=%s", llm_output_str)
 
             # Validate LLM output against the Pydantic model
             parsed_generation = AgentGenerationOutput.model_validate_json(llm_output_str)
-            
+
+            logger.info("call_agent_generate: agent=%s confidence=%s", request.agent_name, parsed_generation.confidence)
             return parsed_generation
 
         except ValidationError as e:
-            print(f"  [LLMInf] Error: LLM output for agent generate is not valid JSON or doesn't match AgentGenerationOutput schema: {e}")
+            logger.warning("call_agent_generate: LLM output invalid (%s)", e)
             # Fallback for malformed LLM output
             return AgentGenerationOutput(
                 generated_text="I encountered an issue while generating a response. Please try again or rephrase your query.",
@@ -302,7 +369,7 @@ class LLMInferenceService:
                 context_used=[f"LLM output parse error: {e}"]
             )
         except Exception as e:
-            print(f"  [LLMInf] Error calling AgentGenerate LLM: {e}")
+            logger.error("call_agent_generate: error calling agent-generate LLM: %s", e, exc_info=True)
             # General fallback for API errors, network issues, etc.
             return AgentGenerationOutput(
                 generated_text="I apologize, an unexpected error prevented me from generating a specific response.",
@@ -310,9 +377,17 @@ class LLMInferenceService:
                 context_used=[f"LLM general error: {e}"]
             )
         
-    def call_generative(self, request: NLGRequest) -> str:
-        
-        print(f"  [LLMInf] Calling LLMInf_Generative ({self.generative_model}) for final NLG...")
+    def call_generative(self, request: NLGRequest) -> FinalNLGOutput:
+        """Synthesize the final customer-facing reply from the agent's result(s).
+
+        The last step of every request (see services/orchestrator.py step 5):
+        formats whichever StructuredAgentResult the routed agent produced into
+        plain text via `format_agent_results_for_llm()` below, then asks the LLM
+        to write one coherent, on-tone response referencing it. Falls back to a
+        generic apology string (`is_complete=False`) on invalid JSON or a call
+        failure, so the customer always gets some reply.
+        """
+        logger.info("call_generative: model=%s intent=%s", self.generative_model, request.final_user_intent)
 
         # Helper to format structured agent results for the LLM
         def format_agent_results_for_llm(agent_results: List[StructuredAgentResult]) -> str:
@@ -409,15 +484,16 @@ class LLMInferenceService:
 
             # Extract and parse the JSON response
             llm_output_str = response.choices[0].message.content
-            print(f"  [LLMInf] Generative LLM raw output: {llm_output_str}")
+            logger.debug("call_generative: raw output=%s", llm_output_str)
 
             # Validate LLM output against Pydantic model
             parsed_nlg_output = FinalNLGOutput.model_validate_json(llm_output_str)
 
+            logger.info("call_generative: confidence=%s is_complete=%s", parsed_nlg_output.confidence, parsed_nlg_output.is_complete)
             return parsed_nlg_output
 
         except ValidationError as e:
-            print(f"  [LLMInf] Error: LLM output for final NLG is not valid JSON or doesn't match FinalNLGOutput schema: {e}")
+            logger.warning("call_generative: LLM output invalid (%s)", e)
             # Fallback for malformed LLM output
             return FinalNLGOutput(
                 response_text="I apologize, I encountered an issue while formulating my response. Please try again or rephrase your query.",
@@ -426,7 +502,7 @@ class LLMInferenceService:
                 confidence=0.1
             )
         except Exception as e:
-            print(f"  [LLMInf] Error calling Generative LLM for final NLG: {e}")
+            logger.error("call_generative: error calling generative LLM: %s", e, exc_info=True)
             # General fallback for API errors, network issues, etc.
             return FinalNLGOutput(
                 response_text="I'm sorry, an unexpected error occurred. Please bear with me while I try to reconnect.",
@@ -436,9 +512,16 @@ class LLMInferenceService:
             )
 
     def call_embeddings(self, text: str) -> List[float]:
-        # print(f"  [Mock LLMInf] Generating embedding for text snippet: '{text[:20]}...'")
-        # Simulate embedding generation - simplified, actual embeddings are high-dimensional vectors
-        return [float(ord(c)) / 100 for c in text[:16]] # Use first N chars to make mock embedding somewhat unique
+        """Return a vector for `text`, used by services/rag.py for similarity search.
+
+        This is a deterministic stub, not a real embedding model call: it maps
+        the first 16 characters to floats via `ord()`. Good enough for the
+        in-memory RAG demo (services/rag.py's MockRAGService does substring/
+        keyword matching, not real vector similarity), not representative of
+        real embedding quality or dimensionality (real models return
+        hundreds-to-thousands of dimensions; this returns at most 16).
+        """
+        return [float(ord(c)) / 100 for c in text[:16]]
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
@@ -462,7 +545,7 @@ if __name__ == "__main__":
                         class MockData:
                             embedding = [0.0] * 1536
                         return type('obj', (object,), {'data': [MockData()]})()
-                return MockEmbedAIClient()
+                return MockEmbeddings()
         LLMInferenceService.openai_client = MockOpenAIClient()
         
     llm_service = LLMInferenceService()

@@ -1,4 +1,15 @@
 # common/models.py
+"""
+Every Pydantic model shared across shopassist - request/response shapes for
+each LLM call (`services/llm_inference.py`), the agents' own input/output
+contracts, and the customer-facing query/response pair. Grouped by where each
+model sits in the pipeline (see the section headers below); read top to bottom
+to follow one customer message end to end.
+
+Nothing here talks to the LLM, the DB, or HTTP directly - these are pure data
+shapes, validated by Pydantic on construction. `services/orchestrator.py` is
+the best starting point for seeing most of these models used in sequence.
+"""
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
@@ -14,11 +25,11 @@ class Message(BaseModel):
 # These must be defined before AgentInputParams Union and before AgentInvocation/AgentTask
 class OrderTrackingAgentInputParams(BaseModel):
     order_id: str
-    customer_id: str # Pseudonymized ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     # Add other parameters specific to order tracking, e.g., 'date_range', 'item_name'
 
 class ProductRecommendationAgentInputParams(BaseModel):
-    customer_id: str # Pseudonymized ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     product_category_preference: Optional[str] = None
     specific_product_keywords: Optional[str] = None
     # Add context like 'current_page', 'previous_viewed_product_ids'
@@ -117,7 +128,9 @@ class FinalNLGOutput(BaseModel):
 # CustomerQuery: Initial input from the customer
 class CustomerQuery(BaseModel):
     session_id: str
-    user_id: str
+    user_id: str # The one identifier, end to end: sent by shopassist-client at login,
+    # used for order/customer DB lookups (customers.user_id, db/README.md), and threaded
+    # into AgentTask.user_id unchanged.
     timestamp: datetime = Field(default_factory=datetime.now)
     text: str
     source_channel: str = "web_chat" # e.g., web_chat, twitter, mobile_app
@@ -156,7 +169,7 @@ class AgentInvocation(BaseModel):
 class AgentTask(BaseModel):
     session_id: str
     task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    customer_id: str # IMPORTANT: This should be a PSEUDONYMIZED customer ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     original_query: str # Masked
     intent: str
     params: AgentInputParams # Uses AgentInputParams Union
