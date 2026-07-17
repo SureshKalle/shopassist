@@ -1,6 +1,9 @@
 # services/agents/order_tracking_agent.py
 from common.models import AgentTask, StructuredAgentResult, StructuredOrderSummary, LLMAgentReasonRequest, LLMAgentInterpretRequest
 from services.agents.base_agent import BaseAgent
+import re
+
+ORDER_ID_PATTERN = re.compile(r"\b(\d{4,})\b")
 
 class OrderTrackingAgent(BaseAgent):
     """
@@ -9,11 +12,20 @@ class OrderTrackingAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__("OrderTrackingAgent", *args, **kwargs)
 
+    @staticmethod
+    def _extract_order_id(text: str) -> str | None:
+        match = ORDER_ID_PATTERN.search(text or "")
+        return match.group(1) if match else None
+    
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         print(f"\n[{self.name}] Received task: {task.task_id} for intent '{task.intent}'")
         
         customer_id = task.customer_id # Assume Orchestrator has retrieved/tokenized this
-        order_id = task.params.get('order_id', '12345') # Mock or extract from query if not in params
+        #order_id = task.params.get('order_id', '12345') # Mock or extract from query if not in params
+        # The router never actually populates 'order_id' into task.params (it only
+        # passes {"query": <text>}), so pull it out of the customer's own text instead
+        # of silently defaulting to '12345' for every order.
+        order_id = task.params.get('order_id') or self._extract_order_id(task.original_query) or '12345'
 
         # 1. Use LLMInf_AgentReason for structured workflow planning/tool selection
         # (This determines if we need to call an API, RAG, or return directly)
@@ -28,9 +40,11 @@ class OrderTrackingAgent(BaseAgent):
         )
 
         raw_order_details = {}
-        if reason_response.action == 'call_api' and reason_response.tool_name == 'ECommerceAPI.getOrderDetails':
+        print(reason_response.tool_name, reason_response.action, reason_response.thought)
+        if reason_response.action == 'call_api' and reason_response.tool_name == 'ECommerceAPI':
             # 2. Execute Internal Tool: E-commerce Microservice API call
             raw_order_details = self.ecommerce_api_client.get_order_details(customer_id, order_id)
+            print(f"  [{self.name}] Retrieved raw order details: {raw_order_details}")
         else:
             print(f"  [{self.name}] LLMInf_AgentReason decided not to call API: {reason_response.thought}")
         
