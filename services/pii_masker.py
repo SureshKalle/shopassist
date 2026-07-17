@@ -1,7 +1,18 @@
 # services/pii_masker.py
+"""
+Masks PII before any customer text reaches an LLM - the very first step of
+every request (services/orchestrator.py step 1, services/data_pipeline.py's
+ingestion). Currently a literal string-replace against a handful of hardcoded
+sample values (see mask_text() below), not a real PII detector; swapping in
+NER/regex/a DLP API is a drop-in replacement as long as mask_text() keeps
+returning a MaskedQuery.
+"""
+import logging
 import uuid
-from typing import List, Optional
+from typing import Optional
 from common.models import MaskedQuery
+
+logger = logging.getLogger(__name__)
 
 class PIIMasker:
     """
@@ -9,8 +20,11 @@ class PIIMasker:
     microservice or a highly optimized shared library.
     """
     def mask_text(self, text: str, session_id: Optional[str] = None, user_id: Optional[str] = None) -> MaskedQuery:
-        print(f"  [PII Masker] Masking PII in text: '{text}'...")
-        
+        # DEBUG only, and even then this is the raw, UNMASKED text - never log
+        # this at INFO or above. Fine for local dev, not for anywhere logs are
+        # less controlled than the LLM boundary itself.
+        logger.debug("Masking PII in text: %r", text)
+
         # --- Advanced PII Detection (Conceptual) ---
         # In a production system, this would involve:
         # 1. Named Entity Recognition (NER) models specifically fine-tuned for PII.
@@ -25,6 +39,9 @@ class PIIMasker:
                           .replace("123-456-7890", "[PHONE]") \
                           .replace("123 Main St", "[ADDRESS]") \
                           .replace("Jane Smith", "[NAME]") # Add more mock patterns
+
+        was_masked = masked_text != text
+        logger.info("PII masking complete: session_id=%s masked=%s", session_id, was_masked)
 
         # Original text hash helps for audit without exposing PII to LLMs.
         # We generate mock session/user IDs if not provided, for pipeline usage.

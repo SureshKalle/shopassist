@@ -12,12 +12,11 @@ import urllib.error
 import urllib.request
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
 
 from api.config import settings
 from api.dependencies import get_agents, get_ecommerce_client, get_rag_service
 from api.schemas import HealthResponse
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from clients.ecommerce_api_client import EcommerceClient
 from services.rag import MockRAGService
 
 logger = logging.getLogger(__name__)
@@ -40,26 +39,18 @@ def _ollama_reachable(timeout: float = 3.0) -> bool:
 def health_check(
     agents: dict = Depends(get_agents),
     rag_service: MockRAGService = Depends(get_rag_service),
-    ecommerce_client: MockECommerceAPIClient = Depends(get_ecommerce_client),
+    ecommerce_client: EcommerceClient = Depends(get_ecommerce_client),
 ) -> HealthResponse:
     """
     Never raises on a downstream outage — that should show up as
     database_reachable=False / llm_reachable=False, not a 500 that takes
     the health check down along with whatever it was trying to report on.
     """
-    try:
-        with ecommerce_client.engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        database_reachable = True
-    except Exception as exc:
-        logger.warning("[health] Database not reachable: %s", exc)
-        database_reachable = False
-
     return HealthResponse(
         status="ok",
         registered_agents=list(agents.keys()),
         rag_documents_indexed=len(rag_service.vector_db),
-        database_reachable=database_reachable,
+        database_reachable=ecommerce_client.is_reachable(),
         llm_reachable=_ollama_reachable(),
         api_key_enforced=settings.api_key_enforce,
     )

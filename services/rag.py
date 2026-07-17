@@ -1,7 +1,18 @@
 # services/rag.py
-from typing import List, Dict, Any, Optional
+"""
+In-memory stand-in for a real RAG/vector-store service. Documents are ingested
+via ingest_document() (services/data_pipeline.py and api/dependencies.py's
+warm_up_services() both do this at startup) and matched via
+query_knowledge_base(), which is substring/keyword matching against
+doc.content - not a real vector similarity search - so results are only as
+good as the exact words a document and query happen to share.
+"""
+import logging
+from typing import List, Dict
 from common.models import ChunkedDocument
 from services.llm_inference import LLMInferenceService # To get embeddings
+
+logger = logging.getLogger(__name__)
 
 class MockRAGService:
     """
@@ -15,11 +26,20 @@ class MockRAGService:
         self.llm_inference_client = llm_inference_client
 
     def query_knowledge_base(self, query_embedding: List[float], query_text: str, top_k: int = 1) -> List[ChunkedDocument]:
-        print(f"  [Mock RAG] Querying knowledge base for '{query_text}'...")
-        
+        """Return up to `top_k` documents matching `query_text`.
+
+        `query_embedding` is accepted (and every caller computes one via
+        `LLMInferenceService.call_embeddings()`) but not actually used below -
+        matching is plain substring/keyword comparison against `query_text`
+        against `doc.content`. A real vector store would rank by embedding
+        similarity instead; this keeps the parameter so callers don't need to
+        change once that swap happens.
+        """
+        logger.info("query_knowledge_base: query=%r top_k=%d", query_text, top_k)
+
         # Check cache first
         if query_text in self.rag_query_cache:
-            print("  [Mock RAG] Cache hit!")
+            logger.debug("query_knowledge_base: cache hit for %r", query_text)
             return self.rag_query_cache[query_text][:top_k]
 
         # Simulate retrieval from vector DB (simple keyword match for mock)
@@ -39,7 +59,8 @@ class MockRAGService:
 
         # Cache results for future queries
         self.rag_query_cache[query_text] = results
-        
+
+        logger.info("query_knowledge_base: %d result(s) for %r", len(results[:top_k]), query_text)
         return results[:top_k]
 
     def ingest_document(self, doc: ChunkedDocument):
@@ -47,7 +68,7 @@ class MockRAGService:
         Ingests a chunked document into the RAG vector database.
         In a real system, this would write to a persistent vector store.
         """
-        print(f"  [Mock RAG] Ingesting document '{doc.doc_id}' into vector DB...")
+        logger.debug("Ingesting document '%s' (source_type=%s) into vector DB", doc.doc_id, doc.source_type)
         self.vector_db[doc.doc_id] = doc
 
 # Example of how this service might be used:

@@ -1,6 +1,10 @@
 # services/agents/escalation_agent.py
+import logging
+
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
+
+logger = logging.getLogger(__name__)
 
 class EscalationAgent(BaseAgent):
     """
@@ -11,9 +15,8 @@ class EscalationAgent(BaseAgent):
         super().__init__("EscalationAgent", *args, **kwargs)
 
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
-        print(f"\n[{self.name}] Received task: {task.task_id} for intent '{task.intent}'")
-        
         escalation_reason = task.params.get("reason", "Issue could not be resolved by automated agents.")
+        logger.warning("Escalating: task_id=%s reason=%s", task.task_id, escalation_reason)
         
         # In a real system, this agent would also:
         # - Create a ticket in a CRM/Helpdesk system via E-commerce Microservices API.
