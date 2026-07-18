@@ -1,10 +1,14 @@
 # services/agents/product_recommendation_agent.py
 import logging
+from typing import Any, Callable
 
-from common.models import AgentTask, StructuredAgentResult, StructuredProductRecommendation
+from common.models import AgentTask, StructuredAgentResult, StructuredProductRecommendation, LLMAgentReasonRequest
 from services.agents.base_agent import BaseAgent
 
 logger = logging.getLogger(__name__)
+
+SEARCH_ITEMS_TOOL = "ECommerceAPI.searchItems"
+GET_POPULAR_CATEGORY_TOOL = "ECommerceAPI.getPopularCategory"
 
 class ProductRecommendationAgent(BaseAgent):
     """
@@ -14,15 +18,15 @@ class ProductRecommendationAgent(BaseAgent):
         super().__init__("ProductRecommendationAgent", *args, **kwargs)
 
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
-        """Recommend one product based on the customer's purchase history + RAG.
+        """Recommend a product, either via a direct catalog tool call or,
+        failing that, the RAG-based fallback below.
 
-        Note the recommendation itself (product_id, name, price below) is
-        currently a hardcoded placeholder, not looked up from
+        Note the RAG-path recommendation itself (product_id, name, price) is
+        still a hardcoded placeholder, not looked up from
         `clients/ecommerce_api_client.py`'s items table - only the RAG-matched
         description snippet and the customer-history framing (favorite
-        category, last purchase) are real. Wiring product_id/price/name to a
-        real `EcommerceClient.get_item()`/`search_items()` call is a natural
-        next step once RAG returns enough to identify a specific item_id.
+        category, last purchase) are real. The searchItems tool path below
+        doesn't have this problem - it returns a real item_id/name/price.
         """
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 
@@ -31,6 +35,93 @@ class ProductRecommendationAgent(BaseAgent):
         customer_history = self.ecommerce_api_client.get_customer_history(user_id)
         logger.debug("customer_history=%s", customer_history)
 
+        # Tool registry, same convention as OrderTrackingAgent's - available_tools
+        # and dispatch both derive from this dict. Unlike that agent's tools,
+        # these take LLM-extracted params (reason_response.tool_params) since
+        # there's no order_id/user_id to resolve upfront - the LLM has to read
+        # what to search for out of the query itself.
+        tools: dict[str, Callable[[dict], Any]] = {
+            # keyword/query/search_term: the LLM doesn't reliably use the exact
+            # param name asked for in the prompt (observed "query" as often as
+            # "keyword") - accept the common synonyms rather than silently
+            # dropping the term on a naming mismatch.
+            SEARCH_ITEMS_TOOL: lambda params: self.ecommerce_api_client.search_items(
+                category=params.get("category"),
+                keyword=params.get("keyword") or params.get("query") or params.get("search_term"),
+                limit=params.get("limit", 5),
+            ),
+            GET_POPULAR_CATEGORY_TOOL: lambda params: self.ecommerce_api_client.get_popular_category(
+                limit=params.get("limit", 1)
+            ),
+        }
+
+        reason_response = self.llm_inference_client.call_agent_reason(
+            LLMAgentReasonRequest(
+                session_id=task.session_id,
+                agent_name=self.name,
+                task_description=(
+                    f"Handle this product-related request for customer {user_id} "
+                    f"(favorite category: {customer_history.get('favorite_category')}, "
+                    f"last purchase: {customer_history.get('last_purchase')}): \"{task.original_query}\""
+                ),
+                current_state={"user_id": user_id, **customer_history},
+                available_tools=list(tools),
+            )
+        )
+        logger.info(
+            "Reasoning result: action=%s tool_name=%s thought=%s",
+            reason_response.action, reason_response.tool_name, reason_response.thought,
+        )
+
+        if reason_response.action == "call_api" and reason_response.tool_name in tools:
+            tool_result = tools[reason_response.tool_name](reason_response.tool_params or {})
+            logger.info("EcommerceClient returned: %s", tool_result)
+
+            if reason_response.tool_name == SEARCH_ITEMS_TOOL:
+                if tool_result:
+                    item = tool_result[0]
+                    return StructuredAgentResult(
+                        task_id=task.task_id,
+                        agent_name=self.name,
+                        status="success",
+                        result_data=StructuredProductRecommendation(
+                            product_id=item["item_id"],
+                            name=item["name"],
+                            description_snippet=(item.get("description") or "")[:150],
+                            price=item["price"],
+                            reason=f"Matched your search in our {item.get('category') or 'catalog'}.",
+                        ),
+                    )
+                return StructuredAgentResult(
+                    task_id=task.task_id,
+                    agent_name=self.name,
+                    status="failure",
+                    result_data={"message": "No items matched that search. Try a different keyword or category."},
+                )
+
+            if reason_response.tool_name == GET_POPULAR_CATEGORY_TOOL:
+                if tool_result:
+                    top = tool_result[0]
+                    return StructuredAgentResult(
+                        task_id=task.task_id,
+                        agent_name=self.name,
+                        status="success",
+                        result_data={
+                            "category": top["category"],
+                            "units_sold": top["units_sold"],
+                            "message": f"Our most popular category right now is {top['category']}.",
+                        },
+                    )
+                return StructuredAgentResult(
+                    task_id=task.task_id,
+                    agent_name=self.name,
+                    status="failure",
+                    result_data={"message": "Not enough order history yet to determine a popular category."},
+                )
+
+        # Fallback: original RAG-based flow (unchanged) for queries the LLM
+        # didn't map to either tool above (e.g. an open-ended "recommend me
+        # something" with no specific search term or category-popularity ask).
         # 2. Use RAG to find relevant products based on query and history (Internal Tool: RAG Service)
         rag_query_text = f"{task.original_query} based on customer's favorite category '{customer_history.get('favorite_category')}' and last purchase '{customer_history.get('last_purchase')}'"
         rag_results = self.rag_service.query_knowledge_base(

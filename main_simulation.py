@@ -70,8 +70,8 @@ if __name__ == "__main__":
 
     # Raw E-commerce Product Catalog
     raw_product_catalog = [
-        RawProductRecord(product_id="PROD_LAP_001", raw_description="High-performance gaming laptop with an i7 processor, 16GB RAM, and a 1TB SSD. Stunning display and RGB keyboard.", specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"}, reviews=["Great product!", "Fast delivery.", "Screen is amazing!"], price="$1200.00"),
-        RawProductRecord(product_id="PROD_HEAD_002", raw_description="Premium noise-cancelling headphones for immersive audio. Comfortable earcups and 20-hour battery life.", specs={"Color": "Black", "Battery": "20h"}, reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."], price="$250.00"),
+        RawProductRecord(product_id="PROD_LAP_001", raw_description="High-performance gaming laptop with an i7 processor, 16GB RAM, and a 1TB SSD. Stunning display and RGB keyboard.", specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"}, reviews=["Great product!", "Fast delivery.", "Screen is amazing!"], price="₹1200.00"),
+        RawProductRecord(product_id="PROD_HEAD_002", raw_description="Premium noise-cancelling headphones for immersive audio. Comfortable earcups and 20-hour battery life.", specs={"Color": "Black", "Battery": "20h"}, reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."], price="₹250.00"),
     ]
     cleaned_products = data_pipeline.ingest_product_catalog(raw_product_catalog)
     print(f"\nSample Cleaned Product Description for LLM Fine-tuning: '{cleaned_products[0].clean_description[:50]}...'")
@@ -114,7 +114,7 @@ if __name__ == "__main__":
 
     # Interaction 1: Order Status
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order 3.")
+    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order ord-1001.")
     print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
     response_1 = orchestrator.handle_customer_query(customer_query_1)
     print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")

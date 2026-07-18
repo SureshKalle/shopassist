@@ -86,7 +86,7 @@ class DataIngestionPipeline:
             # Normalize variations: e.g., "CPU: i7" vs "Processor: Intel Core i7" -> "cpu": "intel_core_i7"
             # Reconcile inconsistent price formats: already done via float conversion
             try:
-                normalized_price = float(raw_prod.price.replace('$', '').replace(',', ''))
+                normalized_price = float(raw_prod.price.replace('₹', '').replace('$', '').replace(',', ''))
             except ValueError:
                 normalized_price = 0.0 # Assign default or flag as error
 

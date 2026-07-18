@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_URL = f"sqlite:///{(BASE_DIR / 'db' / 'shopassist.db').as_posix()}"
 
+# orders.status CHECK constraint (db/schema_sqlite.sql) also allows
+# 'delivered', 'cancelled', 'returned' - those are terminal, not cancellable.
+_CANCELLABLE_STATUSES = {"pending", "confirmed", "shipped"}
+
 
 class EcommerceClient:
     """Data-access layer for the orders/customers/items DB - the one place
@@ -84,6 +88,56 @@ class EcommerceClient:
             # schema_sqlite.sql has no ETA column yet; NLG/StructuredOrderSummary
             # already treat this as optional, so report unknown rather than
             # fabricate a date.
+            "estimated_delivery": None,
+        }
+
+    def cancel_order(self, user_id: str, order_id: str) -> dict[str, Any]:
+        """Cancel an order in place. Returns the same shape as
+        get_order_details() (order_id/user_id/status/items/estimated_delivery)
+        so callers can feed either tool's result through the same
+        diagnose/summarize pipeline without branching on which one ran - see
+        services/agents/order_tracking_agent.py's tool registry.
+        """
+        logger.info("cancel_order: user_id=%s order_id=%s", user_id, order_id)
+
+        with self.engine.begin() as conn:
+            order_row = conn.execute(
+                text("SELECT order_id, user_id, status, total_amount FROM orders WHERE order_id = :order_id"),
+                {"order_id": order_id},
+            ).mappings().first()
+
+            if not order_row:
+                logger.warning("cancel_order: order_id=%s not found in orders table", order_id)
+                return {"error": "Order not found", "order_id": order_id}
+
+            current_status = order_row["status"].lower()
+            if current_status not in _CANCELLABLE_STATUSES:
+                logger.info("cancel_order: order_id=%s status=%s is not cancellable", order_id, current_status)
+                return {"error": f"Order is already {current_status} and can no longer be cancelled", "order_id": order_id}
+
+            conn.execute(
+                text("UPDATE orders SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE order_id = :order_id"),
+                {"order_id": order_id},
+            )
+
+            item_rows = conn.execute(
+                text(
+                    """
+                    SELECT i.name, oi.quantity
+                    FROM order_items oi
+                    JOIN items i ON i.item_id = oi.item_id
+                    WHERE oi.order_id = :order_id
+                    """
+                ),
+                {"order_id": order_id},
+            ).mappings().all()
+
+        logger.info("cancel_order: order_id=%s cancelled (was %s)", order_id, current_status)
+        return {
+            "order_id": order_row["order_id"],
+            "user_id": order_row["user_id"],
+            "status": "Cancelled",
+            "items": [{"name": row["name"], "qty": row["quantity"]} for row in item_rows],
             "estimated_delivery": None,
         }
 
@@ -205,6 +259,32 @@ class EcommerceClient:
                 {"user_id": user_id, "limit": limit},
             ).mappings().all()
         logger.debug("list_orders_for_customer: %d order(s) for user_id=%s", len(rows), user_id)
+        return [dict(row) for row in rows]
+
+    def get_popular_category(self, limit: int = 1) -> list[dict[str, Any]]:
+        """Categories ranked by total units sold, most popular first.
+
+        Excludes cancelled/returned orders so a cancellation doesn't still
+        count toward a category's popularity.
+        """
+        logger.info("get_popular_category: limit=%d", limit)
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT i.category, SUM(oi.quantity) AS units_sold
+                    FROM order_items oi
+                    JOIN items i ON i.item_id = oi.item_id
+                    JOIN orders o ON o.order_id = oi.order_id
+                    WHERE o.status NOT IN ('cancelled', 'returned') AND i.category IS NOT NULL
+                    GROUP BY i.category
+                    ORDER BY units_sold DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"limit": limit},
+            ).mappings().all()
+        logger.debug("get_popular_category: %d categor(y/ies)", len(rows))
         return [dict(row) for row in rows]
 
 
