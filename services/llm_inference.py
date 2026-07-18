@@ -411,7 +411,7 @@ class LLMInferenceService:
                     formatted_outputs.append(
                         f"### Product Recommendation Result ({status_indicator})\n"
                         f"- Recommended Product: {result_data.name} (ID: {result_data.product_id})\n"
-                        f"- Price: ${result_data.price:.2f}\n"
+                        f"- Price: ₹{result_data.price:.2f}\n"
                         f"- Reason for Recommendation: {result_data.reason}\n"
                         f"- Description Snippet: {result_data.description_snippet}"
                     )
