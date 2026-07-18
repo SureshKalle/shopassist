@@ -20,6 +20,7 @@ from common.models import CustomerQuery, RawCustomerConversation, RawProductReco
 from clients.ecommerce_api_client import EcommerceClient
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
+from services.classifier_client import ClassifierClient
 from services.rag import MockRAGService
 from services.data_pipeline import DataIngestionPipeline
 from services.agents.order_tracking_agent import OrderTrackingAgent
@@ -52,9 +53,10 @@ if __name__ == "__main__":
     llm_inference_service = LLMInferenceService()
     rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
     ecommerce_api_client = EcommerceClient()
+    classifier_client = ClassifierClient() # sentiment; fails soft if not started separately (shopassist-model)
 
     # 2. Initialize Data Ingestion Pipeline
-    data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service)
+    data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service, classifier_client)
 
     # --- SIMULATE DATA PREPARATION & INGESTION ---
     print("\n--- Running Data Preparation & Ingestion Cycle ---")
@@ -93,7 +95,7 @@ if __name__ == "__main__":
     print("\nInitialized Specialized AI Agents.")
 
     # 4. Initialize Agent Orchestrator
-    orchestrator = AgentOrchestratorService(llm_inference_service, pii_masker, agents)
+    orchestrator = AgentOrchestratorService(llm_inference_service, pii_masker, agents, classifier_client)
     print("Initialized Agent Orchestrator Service.")
 
     print("\n--- SYSTEM READY: Simulating Customer Interactions ---\n")
