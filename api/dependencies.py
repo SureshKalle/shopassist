@@ -2,36 +2,73 @@
 """
 Singleton service wiring for the FastAPI layer.
 
-All services/agents are expensive to construct (embedding models, LLM
-clients, vectorstore connections, LangGraph agent compilation) so each is
-built exactly once per process via `@lru_cache`, and FastAPI's `Depends()`
-resolves the same cached instance on every request — no per-request
-re-initialisation, no global mutable state scattered across route handlers.
-
-This mirrors exactly how `main_simulation.py` wires the same services
-together for the CLI simulation; the two entry points (API and simulation
-script) share the same construction logic conceptually, just via different
-mechanisms (FastAPI DI vs. plain function calls).
+Each service/agent is built once per process via `@lru_cache`; FastAPI's
+`Depends()` then resolves the same cached instance on every request. Mirrors
+how main_simulation.py wires up the same services for the CLI simulation.
 """
 
 import logging
 from functools import lru_cache
 
-from clients.ecommerce_api_client import MockECommerceAPIClient
+from clients.ecommerce_api_client import EcommerceClient
+from common.models import RawCustomerConversation, RawProductRecord
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
-from services.agents.returns_agent import ReturnsAgent
+from services.classifier_client import ClassifierClient
 from services.data_pipeline import DataIngestionPipeline
-from services.evaluation import EvaluationService
 from services.llm_inference import LLMInferenceService
 from services.orchestrator import AgentOrchestratorService
 from services.pii_masker import PIIMasker
-from services.rag import RAGService
+from services.rag import MockRAGService
 
 logger = logging.getLogger(__name__)
+
+# Same sample data main_simulation.py ingests before its demo queries, so
+# the RAG store isn't empty on this API's first request. No policy docs
+# seeded - DataIngestionPipeline has no ingest_policy_documents method yet.
+_SAMPLE_CONVERSATIONS = [
+    RawCustomerConversation(
+        id="conv_001",
+        text="Hi, my name is John Doe, and I want to know about my order 12345.",
+        metadata={"source": "twitter", "user_id": "jd_123"},
+    ),
+    RawCustomerConversation(
+        id="conv_002",
+        text="Can you help me with a return for product X? My email is john.doe@example.com.",
+        metadata={"source": "web_form", "user_id": "jd_123"},
+    ),
+    RawCustomerConversation(
+        id="conv_003",
+        text="I love my new laptop! Is there a warranty?",
+        metadata={"source": "web_chat", "user_id": "alum_002"},
+    ),
+]
+
+_SAMPLE_PRODUCTS = [
+    RawProductRecord(
+        product_id="PROD_LAP_001",
+        raw_description=(
+            "High-performance gaming laptop with an i7 processor, 16GB RAM, "
+            "and a 1TB SSD. Stunning display and RGB keyboard."
+        ),
+        specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"},
+        reviews=["Great product!", "Fast delivery.", "Screen is amazing!"],
+        price="₹1200.00",
+    ),
+    RawProductRecord(
+        product_id="PROD_HEAD_002",
+        raw_description=(
+            "Premium noise-cancelling headphones for immersive audio. "
+            "Comfortable earcups and 20-hour battery life."
+        ),
+        specs={"Color": "Black", "Battery": "20h"},
+        reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."],
+        price="₹250.00",
+    ),
+]
 
 
 @lru_cache
@@ -45,24 +82,23 @@ def get_llm_service() -> LLMInferenceService:
 
 
 @lru_cache
-def get_rag_service() -> RAGService:
-    return RAGService()
+def get_rag_service() -> MockRAGService:
+    return MockRAGService(get_llm_service())
 
 
 @lru_cache
-def get_ecommerce_client() -> MockECommerceAPIClient:
-    return MockECommerceAPIClient()
+def get_ecommerce_client() -> EcommerceClient:
+    return EcommerceClient()
+
+
+@lru_cache
+def get_classifier_client() -> ClassifierClient:
+    return ClassifierClient()
 
 
 @lru_cache
 def get_data_pipeline() -> DataIngestionPipeline:
-    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service())
-
-
-@lru_cache
-def get_evaluation_service() -> EvaluationService:
-    return EvaluationService()
-
+    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service(), get_classifier_client())
 
 @lru_cache
 def get_agents() -> dict[str, BaseAgent]:
@@ -71,7 +107,6 @@ def get_agents() -> dict[str, BaseAgent]:
         "OrderTrackingAgent": OrderTrackingAgent(*deps),
         "ProductRecommendationAgent": ProductRecommendationAgent(*deps),
         "GeneralPurposeAgent": GeneralPurposeAgent(*deps),
-        "ReturnsAgent": ReturnsAgent(*deps),
         "EscalationAgent": EscalationAgent(*deps),
     }
     logger.info("[API] Registered agents: %s", list(agents.keys()))
@@ -80,20 +115,16 @@ def get_agents() -> dict[str, BaseAgent]:
 
 @lru_cache
 def get_orchestrator() -> AgentOrchestratorService:
-    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents())
+    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents(), get_classifier_client())
 
 
 def warm_up_services() -> None:
-    """
-    Eagerly construct every singleton at app startup (called from the
-    FastAPI lifespan handler in main.py) rather than lazily on first
-    request — surfaces configuration errors (bad API key, unreachable
-    Ollama server, etc.) at boot time instead of on a customer's first
-    request, and avoids a slow "cold" first request while agent graphs
-    compile and the embedding model loads.
-    """
+    """Eagerly construct every singleton and seed the RAG store at startup
+    (called from main.py's lifespan handler), instead of lazily on first
+    request."""
     logger.info("[API] Warming up services...")
     get_orchestrator()  # transitively constructs everything else
-    get_data_pipeline()
-    get_evaluation_service()
+    pipeline = get_data_pipeline()
+    pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)
+    pipeline.ingest_product_catalog(_SAMPLE_PRODUCTS)
     logger.info("[API] Service warm-up complete.")

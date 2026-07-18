@@ -1,4 +1,15 @@
 # common/models.py
+"""
+Every Pydantic model shared across shopassist - request/response shapes for
+each LLM call (`services/llm_inference.py`), the agents' own input/output
+contracts, and the customer-facing query/response pair. Grouped by where each
+model sits in the pipeline (see the section headers below); read top to bottom
+to follow one customer message end to end.
+
+Nothing here talks to the LLM, the DB, or HTTP directly - these are pure data
+shapes, validated by Pydantic on construction. `services/orchestrator.py` is
+the best starting point for seeing most of these models used in sequence.
+"""
 import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
@@ -14,11 +25,11 @@ class Message(BaseModel):
 # These must be defined before AgentInputParams Union and before AgentInvocation/AgentTask
 class OrderTrackingAgentInputParams(BaseModel):
     order_id: str
-    customer_id: str # Pseudonymized ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     # Add other parameters specific to order tracking, e.g., 'date_range', 'item_name'
 
 class ProductRecommendationAgentInputParams(BaseModel):
-    customer_id: str # Pseudonymized ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     product_category_preference: Optional[str] = None
     specific_product_keywords: Optional[str] = None
     # Add context like 'current_page', 'previous_viewed_product_ids'
@@ -117,7 +128,9 @@ class FinalNLGOutput(BaseModel):
 # CustomerQuery: Initial input from the customer
 class CustomerQuery(BaseModel):
     session_id: str
-    user_id: str
+    user_id: str # The one identifier, end to end: sent by shopassist-client at login,
+    # used for order/customer DB lookups (customers.user_id, db/README.md), and threaded
+    # into AgentTask.user_id unchanged.
     timestamp: datetime = Field(default_factory=datetime.now)
     text: str
     source_channel: str = "web_chat" # e.g., web_chat, twitter, mobile_app
@@ -129,6 +142,17 @@ class MaskedQuery(BaseModel):
     timestamp: datetime = Field(default_factory=datetime.now)
     masked_text: str
     original_text_hash: str # To reference original for audit, but not store PII
+
+# SentimentResult: shopassist's local mirror of shopassist-model's classifier
+# service response (classifier/schemas.py SentimentResponse) - see
+# services/classifier_client.py. Not yet consulted by routing/NLG - today
+# it's only logged/recorded (services/orchestrator.py's sentiment hook,
+# services/data_pipeline.py's review-sentiment call site).
+class SentimentResult(BaseModel):
+    label: str # "negative" | "neutral" | "positive" | "unknown"
+    stars: int # 1-5, from the underlying star-rating model; 0 if unknown
+    score: float # confidence in raw_label, 0-1
+    raw_label: str # the model's own output before bucketing, e.g. "4 stars"
 
 # ChatbotResponse: Final output from the Orchestrator to the customer-facing interface
 class ChatbotResponse(BaseModel):
@@ -156,7 +180,7 @@ class AgentInvocation(BaseModel):
 class AgentTask(BaseModel):
     session_id: str
     task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    customer_id: str # IMPORTANT: This should be a PSEUDONYMIZED customer ID
+    user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     original_query: str # Masked
     intent: str
     params: AgentInputParams # Uses AgentInputParams Union
@@ -195,6 +219,11 @@ class NLGRequest(BaseModel):
     conversation_history: List[Message] # Uses Message model
     agent_results: List[StructuredAgentResult] # Uses StructuredAgentResult
     final_user_intent: str # As interpreted by Orchestrator
+    # Optional and defaulted to None so existing callers/tests that build an
+    # NLGRequest without it keep working unchanged. label="unknown" (or None)
+    # means call_generative skips the sentiment-calibration prompt entirely -
+    # see that method's comment.
+    customer_sentiment: Optional[SentimentResult] = None
 
 
 # --- DATA INGESTION MODELS ---

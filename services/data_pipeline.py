@@ -1,4 +1,12 @@
 # services/data_pipeline.py
+"""
+Offline/batch ingestion pipeline that seeds services/rag.py's in-memory store
+and would, in a real deployment, also feed LLM fine-tuning data. Not part of
+the live request path - api/dependencies.py's warm_up_services() and
+main_simulation.py both call this once at startup with a small hardcoded
+sample dataset, not on every request.
+"""
+import logging
 from typing import List
 from common.models import (
     RawCustomerConversation, CleanedCustomerConversation,
@@ -6,8 +14,11 @@ from common.models import (
     ChunkedDocument
 )
 from services.pii_masker import PIIMasker
-from services.llm_inference import MockLLMInferenceService
+from services.llm_inference import LLMInferenceService
+from services.classifier_client import ClassifierClient
 from services.rag import MockRAGService
+
+logger = logging.getLogger(__name__)
 
 class DataIngestionPipeline:
     """
@@ -15,16 +26,18 @@ class DataIngestionPipeline:
     for RAG and LLM fine-tuning. This is typically a batch or streaming system,
     not a real-time microservice.
     """
-    def __init__(self, pii_masker: PIIMasker, llm_inference_client: MockLLMInferenceService, rag_service: MockRAGService):
+    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: MockRAGService,
+                 classifier_client: ClassifierClient = None):
         self.pii_masker = pii_masker
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service
+        self.classifier_client = classifier_client or ClassifierClient()
 
     def ingest_customer_conversations(self, raw_conversations: List[RawCustomerConversation]) -> List[CleanedCustomerConversation]:
-        print("\n--- Data Pipeline: Ingesting Customer Conversations ---")
+        logger.info("Ingesting %d customer conversation(s)", len(raw_conversations))
         cleaned_conversations = []
         for raw_conv in raw_conversations:
-            print(f"  Processing raw conversation ID: {raw_conv.id}")
+            logger.debug("Processing raw conversation ID: %s", raw_conv.id)
             
             # --- 1. Cleaning & Organization (e.g., lowercasing, removing noise) ---
             cleaned_text = raw_conv.text.lower().strip()
@@ -60,14 +73,14 @@ class DataIngestionPipeline:
                         metadata={"conv_id": raw_conv.id, "chunk_idx": i}
                     )
                     self.rag_service.ingest_document(chunk)
-        print("--- Customer Conversation Ingestion Complete ---")
+        logger.info("Customer conversation ingestion complete: %d record(s)", len(cleaned_conversations))
         return cleaned_conversations
 
     def ingest_product_catalog(self, raw_products: List[RawProductRecord]) -> List[CleanedProductRecord]:
-        print("\n--- Data Pipeline: Ingesting Product Catalog ---")
+        logger.info("Ingesting %d product record(s)", len(raw_products))
         cleaned_products = []
         for raw_prod in raw_products:
-            print(f"  Processing raw product ID: {raw_prod.product_id}")
+            logger.debug("Processing raw product ID: %s", raw_prod.product_id)
             
             # --- 1. Cleaning & Organization ---
             clean_description = raw_prod.raw_description.strip()
@@ -76,7 +89,7 @@ class DataIngestionPipeline:
             # Normalize variations: e.g., "CPU: i7" vs "Processor: Intel Core i7" -> "cpu": "intel_core_i7"
             # Reconcile inconsistent price formats: already done via float conversion
             try:
-                normalized_price = float(raw_prod.price.replace('$', '').replace(',', ''))
+                normalized_price = float(raw_prod.price.replace('₹', '').replace('$', '').replace(',', ''))
             except ValueError:
                 normalized_price = 0.0 # Assign default or flag as error
 
@@ -86,12 +99,14 @@ class DataIngestionPipeline:
             # Process reviews: de-duplicate, standardize, sentiment analysis
             sentiment_analyzed_reviews = []
             for review_text in set(raw_prod.reviews): # Use set to de-duplicate
-                # Mock sentiment: In reality, use a pre-trained sentiment model
-                sentiment = "positive" if "great" in review_text.lower() or "awesome" in review_text.lower() else "negative" if "bad" in review_text.lower() else "neutral"
-                
+                # Real classifier call (services/classifier_client.py) - fails
+                # soft to label="unknown" if that service isn't running, so
+                # ingestion never breaks on it being unavailable.
+                sentiment = self.classifier_client.classify_sentiment(review_text)
+
                 # --- 2. PII Masking for Reviews ---
                 masked_review_data = self.pii_masker.mask_text(review_text)
-                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment, "original_hash": masked_review_data.original_text_hash})
+                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment.label, "sentiment_score": sentiment.score, "original_hash": masked_review_data.original_text_hash})
             
             cleaned_products.append(CleanedProductRecord(
                 product_id=raw_prod.product_id,
@@ -115,11 +130,11 @@ class DataIngestionPipeline:
                 metadata={"product_id": raw_prod.product_id}
             )
             self.rag_service.ingest_document(chunk)
-        print("--- Product Catalog Ingestion Complete ---")
+        logger.info("Product catalog ingestion complete: %d record(s)", len(cleaned_products))
         return cleaned_products
 
     def generate_synthetic_queries(self, base_queries: List[str]) -> List[str]:
-        print("\n--- Data Pipeline: Generating Synthetic Queries ---")
+        logger.info("Generating synthetic queries from %d base quer(y/ies)", len(base_queries))
         synthetic_queries = []
         # In a real system, GPT-5 or similar would generate variations (paraphrasing, adding details, varying tone)
         # This can be done by sending requests to a powerful LLM like LLMInf_Generative or an external API.
@@ -131,19 +146,19 @@ class DataIngestionPipeline:
         # --- Quality Filtering for Synthetic Data ---
         # After generation, filter out low-quality, nonsensical, or redundant synthetic queries.
         # This could involve heuristics, another small LLM for quality scoring, or diversity metrics.
-        print("--- Synthetic Query Generation Complete ---")
+        logger.info("Synthetic query generation complete: %d generated", len(synthetic_queries))
         return synthetic_queries
 
 # Example of how this pipeline might be run (e.g., a scheduled Airflow job):
 if __name__ == "__main__":
     pii_masker_inst = PIIMasker()
-    llm_inf_inst = MockLLMInferenceService()
+    llm_inf_inst = LLMInferenceService()
     rag_service_inst = MockRAGService(llm_inf_inst)
     
     pipeline = DataIngestionPipeline(pii_masker_inst, llm_inf_inst, rag_service_inst)
 
     raw_convs = [
-        RawCustomerConversation(id="test_conv_001", text="Hello, my name is Jane Smith. I need help with order 54321.", metadata={"user_id": "cust_abc"}),
+        RawCustomerConversation(id="test_conv_001", text="Hello, my name is Jane Smith. I need help with order 54321.", metadata={"user_id": "alum_abc"}),
     ]
     cleaned_convs = pipeline.ingest_customer_conversations(raw_convs)
     print(f"\nSample Cleaned Conv: {cleaned_convs[0].cleaned_text}")
