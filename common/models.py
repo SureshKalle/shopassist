@@ -197,7 +197,10 @@ class LLMAgentReasonRequest(BaseModel):
 # LLMAgentReasonResponse: Output from LLMInf_AgentReason
 class LLMAgentReasonResponse(BaseModel):
     action: str # e.g., 'call_api', 'query_rag', 'return_result', 'escalate'
+    # tool_name can now be a category like "ECommerceAPI" or "RAG"
+    # The actual method/operation will be in tool_params.method
     tool_name: Optional[str] = None
+    # tool_params will now *always* include a 'method' field for 'call_api'/'query_rag'
     tool_params: Optional[Dict[str, Any]] = None
     thought: str
 
