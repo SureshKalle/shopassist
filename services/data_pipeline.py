@@ -15,6 +15,7 @@ from common.models import (
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
+from services.classifier_client import ClassifierClient
 from services.rag import MockRAGService
 
 logger = logging.getLogger(__name__)
@@ -25,10 +26,12 @@ class DataIngestionPipeline:
     for RAG and LLM fine-tuning. This is typically a batch or streaming system,
     not a real-time microservice.
     """
-    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: MockRAGService):
+    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: MockRAGService,
+                 classifier_client: ClassifierClient = None):
         self.pii_masker = pii_masker
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service
+        self.classifier_client = classifier_client or ClassifierClient()
 
     def ingest_customer_conversations(self, raw_conversations: List[RawCustomerConversation]) -> List[CleanedCustomerConversation]:
         logger.info("Ingesting %d customer conversation(s)", len(raw_conversations))
@@ -96,12 +99,14 @@ class DataIngestionPipeline:
             # Process reviews: de-duplicate, standardize, sentiment analysis
             sentiment_analyzed_reviews = []
             for review_text in set(raw_prod.reviews): # Use set to de-duplicate
-                # Mock sentiment: In reality, use a pre-trained sentiment model
-                sentiment = "positive" if "great" in review_text.lower() or "awesome" in review_text.lower() else "negative" if "bad" in review_text.lower() else "neutral"
-                
+                # Real classifier call (services/classifier_client.py) - fails
+                # soft to label="unknown" if that service isn't running, so
+                # ingestion never breaks on it being unavailable.
+                sentiment = self.classifier_client.classify_sentiment(review_text)
+
                 # --- 2. PII Masking for Reviews ---
                 masked_review_data = self.pii_masker.mask_text(review_text)
-                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment, "original_hash": masked_review_data.original_text_hash})
+                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment.label, "sentiment_score": sentiment.score, "original_hash": masked_review_data.original_text_hash})
             
             cleaned_products.append(CleanedProductRecord(
                 product_id=raw_prod.product_id,

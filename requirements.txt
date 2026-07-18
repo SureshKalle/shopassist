@@ -15,3 +15,7 @@ openai>=1.50
 # docker-compose (see shopassist-devops) via DATABASE_URL.
 SQLAlchemy>=2.0
 psycopg2-binary>=2.9
+
+# services/classifier_client.py: HTTP client for shopassist-model's
+# classifier service (sentiment/feedback-topic encoder models).
+requests>=2.31

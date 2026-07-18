@@ -17,6 +17,7 @@ from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
+from services.classifier_client import ClassifierClient
 from services.data_pipeline import DataIngestionPipeline
 from services.llm_inference import LLMInferenceService
 from services.orchestrator import AgentOrchestratorService
@@ -91,8 +92,13 @@ def get_ecommerce_client() -> EcommerceClient:
 
 
 @lru_cache
+def get_classifier_client() -> ClassifierClient:
+    return ClassifierClient()
+
+
+@lru_cache
 def get_data_pipeline() -> DataIngestionPipeline:
-    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service())
+    return DataIngestionPipeline(get_pii_masker(), get_llm_service(), get_rag_service(), get_classifier_client())
 
 @lru_cache
 def get_agents() -> dict[str, BaseAgent]:
@@ -109,7 +115,7 @@ def get_agents() -> dict[str, BaseAgent]:
 
 @lru_cache
 def get_orchestrator() -> AgentOrchestratorService:
-    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents())
+    return AgentOrchestratorService(get_llm_service(), get_pii_masker(), get_agents(), get_classifier_client())
 
 
 def warm_up_services() -> None:

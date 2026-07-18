@@ -143,6 +143,17 @@ class MaskedQuery(BaseModel):
     masked_text: str
     original_text_hash: str # To reference original for audit, but not store PII
 
+# SentimentResult: shopassist's local mirror of shopassist-model's classifier
+# service response (classifier/schemas.py SentimentResponse) - see
+# services/classifier_client.py. Not yet consulted by routing/NLG - today
+# it's only logged/recorded (services/orchestrator.py's sentiment hook,
+# services/data_pipeline.py's review-sentiment call site).
+class SentimentResult(BaseModel):
+    label: str # "negative" | "neutral" | "positive" | "unknown"
+    stars: int # 1-5, from the underlying star-rating model; 0 if unknown
+    score: float # confidence in raw_label, 0-1
+    raw_label: str # the model's own output before bucketing, e.g. "4 stars"
+
 # ChatbotResponse: Final output from the Orchestrator to the customer-facing interface
 class ChatbotResponse(BaseModel):
     session_id: str
@@ -208,6 +219,11 @@ class NLGRequest(BaseModel):
     conversation_history: List[Message] # Uses Message model
     agent_results: List[StructuredAgentResult] # Uses StructuredAgentResult
     final_user_intent: str # As interpreted by Orchestrator
+    # Optional and defaulted to None so existing callers/tests that build an
+    # NLGRequest without it keep working unchanged. label="unknown" (or None)
+    # means call_generative skips the sentiment-calibration prompt entirely -
+    # see that method's comment.
+    customer_sentiment: Optional[SentimentResult] = None
 
 
 # --- DATA INGESTION MODELS ---

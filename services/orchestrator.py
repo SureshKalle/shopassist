@@ -18,9 +18,11 @@ from common.models import (
     RoutingRequest, AgentInvocation, AgentTask, StructuredAgentResult, NLGRequest,
     Message,
     FinalNLGOutput,
+    SentimentResult,
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
+from services.classifier_client import ClassifierClient
 from services.agents.base_agent import BaseAgent  # for type hinting the agents dict
 
 logger = logging.getLogger(__name__)
@@ -32,14 +34,23 @@ class AgentOrchestratorService:
     conversation history, and final customer-facing natural language synthesis.
     """
     def __init__(self, llm_inference_client: LLMInferenceService, pii_masker: PIIMasker,
-                 agents: Dict[str, BaseAgent]):
+                 agents: Dict[str, BaseAgent], classifier_client: ClassifierClient = None):
         self.llm_inference_client = llm_inference_client
         self.pii_masker = pii_masker
         self.agents = agents  # agent_name -> agent instance (see api/dependencies.py get_agents())
+        # Defaults to a real client (pointed at the classifier service, off by
+        # default until that's started separately - see ClassifierClient's
+        # fail-soft behaviour) rather than requiring every caller to build one.
+        self.classifier_client = classifier_client or ClassifierClient()
         # Per-session conversation turns, oldest first. Not persisted anywhere.
         self.conversation_history_db: Dict[str, List[Message]] = {}
         # Last agent/result per session - currently write-only, no reader consults it yet.
         self.agent_state_store: Dict[str, Dict[str, Any]] = {}
+        # Sentiment of each session's most recent customer message (step 1.5
+        # below). Read by step 5 to calibrate the final reply's tone (see
+        # NLGRequest.customer_sentiment / LLMInferenceService.call_generative)
+        # - routing/agent selection still ignores it, only NLG consumes it.
+        self.session_sentiment: Dict[str, SentimentResult] = {}
         # Routing decisions keyed by exact masked-text match, so a repeated identical
         # query skips a second LLM router call. Grows unbounded for the process lifetime.
         self.orchestrator_routing_cache: Dict[str, AgentInvocation] = {}
@@ -49,12 +60,15 @@ class AgentOrchestratorService:
 
         Steps (mirrors README.md's "Request flow"):
           1. Mask PII in the incoming text.
+          1.5. Classify sentiment of the message (ClassifierClient) - doesn't
+               affect routing, only step 5's reply tone (see that step).
           2. Load/update this session's conversation history.
           3. Ask the LLM router which agent should handle it (cached by exact
              masked-text match).
           4. Run that agent; any exception falls back to EscalationAgent so a
              failure never surfaces as a raw error to the customer.
-          5. Turn the agent's structured result into a natural-language reply.
+          5. Turn the agent's structured result into a natural-language reply,
+             calibrated to the sentiment from step 1.5 when available.
           6. Persist the updated history and return the response.
         """
         logger.info("Handling customer query: session_id=%s user_id=%s", query.session_id, query.user_id)
@@ -64,6 +78,19 @@ class AgentOrchestratorService:
         # on receipt, since there's no separate edge layer in this project yet.
         masked_query = self.pii_masker.mask_text(query.text, session_id=query.session_id, user_id=query.user_id)
         logger.debug("Masked query: '%s'", masked_query.masked_text)
+
+        # 1.5. Sentiment of the customer's message, via the (separate,
+        # optional) encoder-model classifier service - see
+        # services/classifier_client.py. Fails soft to "unknown" if that
+        # service isn't running, so this never blocks a chat turn. Logged and
+        # stashed on self.session_sentiment for now; not yet consulted by
+        # routing or NLG (see that dict's comment in __init__).
+        sentiment = self.classifier_client.classify_sentiment(masked_query.masked_text)
+        self.session_sentiment[query.session_id] = sentiment
+        logger.info(
+            "Customer sentiment: session_id=%s label=%s stars=%d score=%.2f",
+            query.session_id, sentiment.label, sentiment.stars, sentiment.score,
+        )
 
         # 2. Load this session's history (PII-masked turns only - never raw text),
         # append the current turn, and hand the running list to every downstream
@@ -159,7 +186,8 @@ class AgentOrchestratorService:
             session_id=session_id,
             conversation_history=current_history,
             agent_results=agent_results,
-            final_user_intent=agent_invocation.agent_name  # simplified: the routed agent name stands in for intent
+            final_user_intent=agent_invocation.agent_name,  # simplified: the routed agent name stands in for intent
+            customer_sentiment=self.session_sentiment.get(session_id),  # from step 1.5; None/"unknown" is a no-op in call_generative
         )
 
         final_nlg_output: FinalNLGOutput = self.llm_inference_client.call_generative(nlg_request)

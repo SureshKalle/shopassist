@@ -1,15 +1,22 @@
 # services/llm_inference.py
 """
 The one place every LLM call in shopassist goes through. Wraps an OpenAI-
-compatible client pointed at a local Ollama server (see OLLAMA_API_BASE_URL /
-OLLAMA_*_MODEL in .env.example) behind five purpose-specific methods, one per
-step of the pipeline in services/orchestrator.py and services/agents/*.py:
+compatible client behind five purpose-specific methods, one per step of the
+pipeline in services/orchestrator.py and services/agents/*.py:
 
 - call_router           - which specialist agent should handle this message?
 - call_agent_reason     - should this agent call a tool (DB/RAG), or return now?
 - call_agent_interpret  - given raw tool output, what's the structured diagnosis?
 - call_generative       - turn an agent's structured result into a customer reply.
 - call_embeddings       - turn text into a vector (used by services/rag.py).
+
+Each of the first four independently defaults to the local Ollama server
+(OLLAMA_API_BASE_URL / OLLAMA_<ROLE>_MODEL in .env.example) and can be
+switched to Gemini's OpenAI-compatible endpoint per-role via
+<ROLE>_PROVIDER=gemini + GEMINI_API_KEY - see _resolve_role() below. This is
+what lets a cheap/fast local model handle the frequent routing/reasoning
+steps while an expensive cloud model is reserved for the one step that
+actually reaches the customer (call_generative).
 
 Each method sends a system prompt describing the exact JSON schema the LLM must
 return, then validates the response against the matching Pydantic model in
@@ -19,11 +26,11 @@ callers never need to handle an LLM-specific exception themselves.
 """
 import logging
 import os
-from typing import List
+from typing import List, Optional, Type, TypeVar
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from common.models import (
     RoutingRequest, AgentInvocation,
@@ -42,6 +49,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar("T", bound=BaseModel)
+
 
 class LLMInferenceService:
     """
@@ -50,17 +59,180 @@ class LLMInferenceService:
     """
     def __init__(self):
         self.ollama_base_url = os.getenv("OLLAMA_API_BASE_URL", "http://localhost:11434")
-        self.openai_client = OpenAI(
+        self.local_client = OpenAI(
             base_url=f"{self.ollama_base_url}/v1", # OpenAI-compatible endpoint
-            api_key="ollama" 
+            api_key="ollama"
         )
-        
-        # Define LLM models to be used for each endpoint
-        self.router_model = os.getenv("OLLAMA_ROUTER_MODEL", "llama3:8b-instruct") 
-        self.agent_reason_model = os.getenv("OLLAMA_AGENT_REASON_MODEL", "llama3:8b-instruct")
-        self.agent_interpret_model = os.getenv("OLLAMA_AGENT_INTERPRET_MODEL", "llama3:8b-instruct")
-        self.generative_model = os.getenv("OLLAMA_GENERATIVE_MODEL", "llama3:8b-instruct")
-        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") 
+        # Lazily constructed by _gemini_client() - only touches GEMINI_API_KEY
+        # if some role's *_PROVIDER is actually set to "gemini", so a fully
+        # local deployment never needs cloud credentials to boot.
+        self._gemini_client_singleton: Optional[OpenAI] = None
+
+        # Per-role client/model/structured-output-mode/provider/local-fallback-
+        # model. Each of these four roles independently defaults to "local"
+        # (Ollama, same as before) and can be switched to Gemini via
+        # <ROLE>_PROVIDER=gemini - see _resolve_role(). The 5th element
+        # (local_model) is always resolved regardless of the active
+        # provider, so a cloud-provider role can transparently retry against
+        # Ollama if the cloud call fails (quota, outage, ...) - see
+        # _complete_structured()'s fallback_model param. call_embeddings()
+        # isn't listed here: it's a deterministic stub today (see its
+        # docstring), not a real model call, so there's no client to route yet.
+        self.router_client, self.router_model, self.router_mode, self.router_provider, self.router_local_model = self._resolve_role(
+            "ROUTER", "llama3:8b-instruct", "gemini-2.5-flash"
+        )
+        self.agent_reason_client, self.agent_reason_model, self.agent_reason_mode, self.agent_reason_provider, self.agent_reason_local_model = self._resolve_role(
+            "AGENT_REASON", "llama3:8b-instruct", "gemini-2.5-flash"
+        )
+        self.agent_interpret_client, self.agent_interpret_model, self.agent_interpret_mode, self.agent_interpret_provider, self.agent_interpret_local_model = self._resolve_role(
+            "AGENT_INTERPRET", "llama3:8b-instruct", "gemini-2.5-flash"
+        )
+        # Shared by call_generative() and call_agent_generate() - both
+        # already used the same self.generative_model before this refactor.
+        self.generative_client, self.generative_model, self.generative_mode, self.generative_provider, self.generative_local_model = self._resolve_role(
+            "GENERATIVE", "llama3:8b-instruct", "gemini-2.5-pro"
+        )
+
+        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+
+        # One line, always at INFO regardless of LOG_LEVEL, showing exactly
+        # which provider/model handles each pipeline step for this process -
+        # the fastest way to confirm a hybrid local/cloud config actually
+        # took effect without digging through per-request logs.
+        logger.info(
+            "LLMInferenceService ready | ROUTER=%s:%s AGENT_REASON=%s:%s AGENT_INTERPRET=%s:%s GENERATIVE=%s:%s",
+            self.router_provider, self.router_model,
+            self.agent_reason_provider, self.agent_reason_model,
+            self.agent_interpret_provider, self.agent_interpret_model,
+            self.generative_provider, self.generative_model,
+        )
+
+    def _resolve_role(self, role: str, local_default_model: str, gemini_default_model: str) -> tuple[OpenAI, str, str, str, str]:
+        """Pick the client/model/structured-output-mode/provider/local-model
+        for one pipeline role.
+
+        `<ROLE>_PROVIDER` (env var, default "local") chooses between:
+        - "local": the existing Ollama server, model from OLLAMA_<ROLE>_MODEL.
+        - "gemini": Gemini's OpenAI-compatible endpoint, model from
+          GEMINI_<ROLE>_MODEL. Requires GEMINI_API_KEY.
+
+        The returned mode ("json_object" or "parse") tells
+        _complete_structured() which structured-output mechanism this
+        provider actually speaks - see that method's docstring for why
+        Gemini needs a different one than plain response_format=json_object.
+        The returned provider string is only for logging (see __init__'s
+        startup summary and each call_*'s entry log) - it's redundant with
+        mode today (mode implies provider 1:1), but keeps the log lines
+        reading "provider=gemini" instead of the reader having to remember
+        that "mode=parse" means Gemini. The returned local_model is always
+        computed (OLLAMA_<ROLE>_MODEL or its default) regardless of which
+        provider is actually active, so callers always have a local fallback
+        target on hand - see _complete_structured()'s fallback_model param.
+        """
+        local_model = os.getenv(f"OLLAMA_{role}_MODEL", local_default_model)
+        provider = os.getenv(f"{role}_PROVIDER", "local").strip().lower()
+        if provider == "local":
+            return self.local_client, local_model, "json_object", provider, local_model
+        if provider == "gemini":
+            model = os.getenv(f"GEMINI_{role}_MODEL", gemini_default_model)
+            return self._gemini_client(), model, "parse", provider, local_model
+        raise ValueError(f"Unknown {role}_PROVIDER '{provider}' (expected 'local' or 'gemini')")
+
+    def _gemini_client(self) -> OpenAI:
+        if self._gemini_client_singleton is None:
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "GEMINI_API_KEY is required when any *_PROVIDER env var is set to 'gemini' (see .env.example)."
+                )
+            self._gemini_client_singleton = OpenAI(
+                api_key=api_key,
+                base_url=os.getenv("GEMINI_API_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/"),
+            )
+        return self._gemini_client_singleton
+
+    def _dispatch_structured(
+        self, *, client: OpenAI, model: str, mode: str,
+        messages: List[ChatCompletionMessageParam], schema: Type[T],
+        temperature: float, seed: Optional[int] = None,
+    ) -> T:
+        """One single-attempt structured-output chat completion - no
+        fallback, no logging beyond the raw response. See
+        _complete_structured() (the only caller) for the two `mode`s this
+        supports and why.
+        """
+        if mode == "parse":
+            completion = client.beta.chat.completions.parse(
+                model=model, messages=messages, temperature=temperature, response_format=schema,
+            )
+            parsed = completion.choices[0].message.parsed
+            if parsed is None:
+                raise ValueError(f"{model} returned no parseable structured output")
+            logger.debug("_dispatch_structured: model=%s parsed=%s", model, parsed.model_dump_json())
+            return parsed
+
+        kwargs = {"response_format": {"type": "json_object"}}
+        if seed is not None:
+            kwargs["seed"] = seed
+        response = client.chat.completions.create(
+            model=model, messages=messages, temperature=temperature, **kwargs,
+        )
+        llm_output_str = response.choices[0].message.content
+        logger.debug("_dispatch_structured: model=%s raw output=%s", model, llm_output_str)
+        return schema.model_validate_json(llm_output_str)
+
+    def _complete_structured(
+        self, *, caller: str, provider: str, client: OpenAI, model: str, mode: str,
+        messages: List[ChatCompletionMessageParam], schema: Type[T],
+        temperature: float, seed: Optional[int] = None,
+        fallback_model: Optional[str] = None,
+    ) -> T:
+        """Run one structured-output chat completion, returning a validated
+        `schema` instance regardless of which mechanism the provider speaks.
+
+        - "json_object" (local Ollama, and most OpenAI-compatible hosts):
+          plain chat.completions.create(response_format={"type": "json_object"}),
+          manually validated against `schema` afterwards - the original
+          behaviour of every call_* method before this existed.
+        - "parse" (Gemini's OpenAI-compat endpoint): Gemini doesn't reliably
+          honour response_format={"type": "json_object"} on
+          chat.completions.create - Google's documented structured-output
+          path is client.beta.chat.completions.parse(response_format=<a
+          pydantic model>) instead, which returns an already-validated
+          instance directly (https://ai.google.dev/gemini-api/docs/openai).
+
+        `caller`/`provider` are logging-only (which call_* method, which
+        provider actually handled it) - this is the one place every real LLM
+        network call in the service passes through, so it's the definitive
+        place to log "which model ran this request" at runtime.
+
+        `fallback_model`: when set and `provider` isn't already "local", a
+        failed primary call (cloud outage, quota exhausted, auth error,
+        timeout, ...) is retried once against self.local_client with this
+        model in "json_object" mode before giving up - transparent
+        cloud->local failover, so a temporary cloud-side problem degrades to
+        the free local model instead of straight to each call_* method's
+        generic apology/fallback value. If the fallback attempt also fails,
+        that exception propagates to the caller exactly as before this
+        existed - callers' existing try/except still handles it.
+        """
+        logger.info("%s -> provider=%s model=%s mode=%s", caller, provider, model, mode)
+        try:
+            return self._dispatch_structured(
+                client=client, model=model, mode=mode, messages=messages,
+                schema=schema, temperature=temperature, seed=seed,
+            )
+        except Exception as e:
+            if not fallback_model or provider == "local":
+                raise
+            logger.warning(
+                "%s: %s call failed (%s) - falling back to local model %s",
+                caller, provider, e, fallback_model,
+            )
+            return self._dispatch_structured(
+                client=self.local_client, model=fallback_model, mode="json_object", messages=messages,
+                schema=schema, temperature=temperature, seed=seed,
+            )
 
     def call_router(self, request: RoutingRequest) -> AgentInvocation:
         """Decide which specialist agent should handle this query.
@@ -71,7 +243,7 @@ class LLMInferenceService:
         time - if the LLM names an unknown agent, returns invalid JSON, or the
         call itself fails (network error, model not pulled, etc.).
         """
-        logger.info("call_router: model=%s query=%r", self.router_model, request.current_query)
+        logger.info("call_router: provider=%s model=%s query=%r", self.router_provider, self.router_model, request.current_query)
         
         # Prepare conversation history for the LLM
         messages: List[ChatCompletionMessageParam] = [
@@ -100,21 +272,13 @@ class LLMInferenceService:
         messages.append({"role": "user", "content": request.current_query})
 
         try:
-            # Make the actual API call to the LLM
-            response = self.openai_client.chat.completions.create(
-                model=self.router_model,
-                messages=messages,
-                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
-                temperature=0.0, # Keep temperature low for deterministic routing
-                seed=42 # For reproducibility in testing/capstone
+            parsed_invocation = self._complete_structured(
+                caller="call_router", provider=self.router_provider,
+                client=self.router_client, model=self.router_model, mode=self.router_mode,
+                messages=messages, schema=AgentInvocation,
+                fallback_model=self.router_local_model,
+                temperature=0.0, seed=42, # low temp + fixed seed for deterministic routing
             )
-            
-            # Extract and parse the JSON response
-            llm_output_str = response.choices[0].message.content
-            logger.debug("call_router: raw output=%s", llm_output_str)
-
-            # Validate LLM output against Pydantic model
-            parsed_invocation = AgentInvocation.model_validate_json(llm_output_str)
 
             # Simple check for known agents, fallback if LLM invents one
             if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
@@ -154,7 +318,7 @@ class LLMInferenceService:
         Falls back to `action='return_result'` on any unknown action, invalid
         JSON, or call failure.
         """
-        logger.info("call_agent_reason: model=%s agent=%s", self.agent_reason_model, request.agent_name)
+        logger.info("call_agent_reason: provider=%s model=%s agent=%s", self.agent_reason_provider, self.agent_reason_model, request.agent_name)
 
         # Prepare the reasoning prompt for the LLM
         messages: List[ChatCompletionMessageParam] = [
@@ -181,21 +345,13 @@ class LLMInferenceService:
         ]
 
         try:
-            # Make the actual API call to the LLM
-            response = self.openai_client.chat.completions.create(
-                model=self.agent_reason_model,
-                messages=messages,
-                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
-                temperature=0.0, # Keep temperature low for deterministic reasoning
-                seed=42 # For reproducibility in testing/capstone
+            parsed_response = self._complete_structured(
+                caller="call_agent_reason", provider=self.agent_reason_provider,
+                client=self.agent_reason_client, model=self.agent_reason_model, mode=self.agent_reason_mode,
+                messages=messages, schema=LLMAgentReasonResponse,
+                fallback_model=self.agent_reason_local_model,
+                temperature=0.0, seed=42, # low temp + fixed seed for deterministic reasoning
             )
-
-            # Extract and parse the JSON response
-            llm_output_str = response.choices[0].message.content
-            logger.debug("call_agent_reason: raw output=%s", llm_output_str)
-
-            # Validate LLM output against Pydantic model
-            parsed_response = LLMAgentReasonResponse.model_validate_json(llm_output_str)
 
             # Simple check for known actions, fallback if LLM invents one
             valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
@@ -239,8 +395,8 @@ class LLMInferenceService:
         `severity='high'` on invalid JSON or a call failure.
         """
         logger.info(
-            "call_agent_interpret: model=%s agent=%s goal=%s",
-            self.agent_interpret_model, request.agent_name, request.interpretation_goal,
+            "call_agent_interpret: provider=%s model=%s agent=%s goal=%s",
+            self.agent_interpret_provider, self.agent_interpret_model, request.agent_name, request.interpretation_goal,
         )
 
         # Prepare the interpretation prompt for the LLM
@@ -265,23 +421,15 @@ class LLMInferenceService:
         ]
 
         try:
-            # Make the actual API call to the LLM
-            response = self.openai_client.chat.completions.create(
-                model=self.agent_interpret_model,
-                messages=messages,
-                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
-                temperature=0.0, # Keep temperature low for deterministic interpretation
-                seed=42 # For reproducibility
-            )
-            
-            # Extract and parse the JSON response
-            llm_output_str = response.choices[0].message.content
-            logger.debug("call_agent_interpret: raw output=%s", llm_output_str)
-
-            # Validate LLM output against the specific Pydantic model for interpretation
             # Assuming 'diagnose order issue' is the primary goal for now, which maps to OrderIssueAnalysis
             # If other goals were introduced, this might become a Union and require more complex validation.
-            structured_interpretation_data = OrderIssueAnalysis.model_validate_json(llm_output_str)
+            structured_interpretation_data = self._complete_structured(
+                caller="call_agent_interpret", provider=self.agent_interpret_provider,
+                client=self.agent_interpret_client, model=self.agent_interpret_model, mode=self.agent_interpret_mode,
+                messages=messages, schema=OrderIssueAnalysis,
+                fallback_model=self.agent_interpret_local_model,
+                temperature=0.0, seed=42, # low temp + fixed seed for deterministic interpretation
+            )
 
             logger.info(
                 "call_agent_interpret: agent=%s issue_type=%s",
@@ -316,7 +464,7 @@ class LLMInferenceService:
         needs its own standalone snippet (e.g. a one-off product blurb)
         without going through the full orchestrator NLG step.
         """
-        logger.info("call_agent_generate: model=%s agent=%s", self.generative_model, request.agent_name)
+        logger.info("call_agent_generate: provider=%s model=%s agent=%s", self.generative_provider, self.generative_model, request.agent_name)
 
         # Prepare the generation prompt for the LLM. Uses task_description and
         # current_state from LLMAgentReasonRequest, assuming the agent has
@@ -341,21 +489,13 @@ class LLMInferenceService:
         ]
 
         try:
-            # Make the actual API call to the LLM
-            response = self.openai_client.chat.completions.create(
-                model=self.generative_model, # Using the general generative model for this
-                messages=messages,
-                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
-                temperature=0.7, # Higher temperature for more creative/varied generation
-                seed=42 # For reproducibility
+            parsed_generation = self._complete_structured(
+                caller="call_agent_generate", provider=self.generative_provider,
+                client=self.generative_client, model=self.generative_model, mode=self.generative_mode,
+                messages=messages, schema=AgentGenerationOutput,
+                fallback_model=self.generative_local_model,
+                temperature=0.7, seed=42, # higher temp for creative/varied generation
             )
-            
-            # Extract and parse the JSON response
-            llm_output_str = response.choices[0].message.content
-            logger.debug("call_agent_generate: raw output=%s", llm_output_str)
-
-            # Validate LLM output against the Pydantic model
-            parsed_generation = AgentGenerationOutput.model_validate_json(llm_output_str)
 
             logger.info("call_agent_generate: agent=%s confidence=%s", request.agent_name, parsed_generation.confidence)
             return parsed_generation
@@ -387,7 +527,7 @@ class LLMInferenceService:
         generic apology string (`is_complete=False`) on invalid JSON or a call
         failure, so the customer always gets some reply.
         """
-        logger.info("call_generative: model=%s intent=%s", self.generative_model, request.final_user_intent)
+        logger.info("call_generative: provider=%s model=%s intent=%s", self.generative_provider, self.generative_model, request.final_user_intent)
 
         # Helper to format structured agent results for the LLM
         def format_agent_results_for_llm(agent_results: List[StructuredAgentResult]) -> str:
@@ -441,6 +581,30 @@ class LLMInferenceService:
                     )
             return "\n\n" + "\n".join(formatted_outputs) if formatted_outputs else "No specific agent results were provided."
 
+        # Sentiment-aware tone (services/orchestrator.py's step 1.5 /
+        # services/classifier_client.py), folded into the base system
+        # message's own content rather than appended as a second, trailing
+        # system message. Tried the latter first - it reliably broke local
+        # Ollama's json_object-mode output (a system-role message landing
+        # after the user turns confused it into free-forming an unrelated
+        # JSON shape, even though Gemini's schema-constrained .parse() mode
+        # tolerated it fine) - one leading system message is safe for both.
+        # Only added when a real classification came back - label="unknown"
+        # means the classifier was unreachable, and leaving the base prompt
+        # untouched in that case keeps behaviour identical to before this
+        # existed when the classifier isn't running.
+        sentiment = request.customer_sentiment
+        sentiment_instruction = ""
+        if sentiment and sentiment.label != "unknown":
+            sentiment_instruction = (
+                f" The customer's message sentiment was automatically classified as "
+                f"'{sentiment.label}' (confidence {sentiment.score:.2f}). Calibrate your tone to "
+                "it: for negative sentiment, lead with empathy and acknowledge their frustration "
+                "before addressing the request; for positive sentiment, match their warmth; for "
+                "neutral, respond simply and directly - don't overplay emotion that isn't there. "
+                "This calibration must never change what information you report - only how you say it."
+            )
+
         # Prepare conversation history for the LLM
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": (
@@ -457,6 +621,7 @@ class LLMInferenceService:
                 "3. `is_complete`: A boolean indicating if the customer's current query has been fully addressed (True/False). "
                 "4. `confidence`: A float between 0.0 and 1.0 representing your confidence in the accuracy/completeness of this final response."
                 "Always output a valid JSON object. Do NOT include any other text."
+                + sentiment_instruction
             )}
         ]
 
@@ -473,21 +638,13 @@ class LLMInferenceService:
         )})
 
         try:
-            # Make the actual API call to the LLM
-            response = self.openai_client.chat.completions.create(
-                model=self.generative_model,
-                messages=messages,
-                response_format={"type": "json_object"}, # Instruct LLM to generate JSON
-                temperature=0.7, # Higher temperature for more creative/natural generation
-                seed=42 # For reproducibility
+            parsed_nlg_output = self._complete_structured(
+                caller="call_generative", provider=self.generative_provider,
+                client=self.generative_client, model=self.generative_model, mode=self.generative_mode,
+                messages=messages, schema=FinalNLGOutput,
+                fallback_model=self.generative_local_model,
+                temperature=0.7, seed=42, # higher temp for creative/natural generation
             )
-
-            # Extract and parse the JSON response
-            llm_output_str = response.choices[0].message.content
-            logger.debug("call_generative: raw output=%s", llm_output_str)
-
-            # Validate LLM output against Pydantic model
-            parsed_nlg_output = FinalNLGOutput.model_validate_json(llm_output_str)
 
             logger.info("call_generative: confidence=%s is_complete=%s", parsed_nlg_output.confidence, parsed_nlg_output.is_complete)
             return parsed_nlg_output
@@ -525,29 +682,8 @@ class LLMInferenceService:
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
-    # Set your OpenAI API key as an environment variable or uncomment and set it here
-    # os.environ["OPENAI_API_KEY"] = "YOUR_OPENAI_API_KEY" 
-    
-    if not os.getenv("OPENAI_API_KEY"):
-        print("OPENAI_API_KEY environment variable not set. Using mock fallbacks for LLM calls.")
-        # This fallback for demonstration if API key is not set, but won't be "real"
-        class MockOpenAIClient:
-            def chat(self):
-                class MockCompletions:
-                    def create(self, **kwargs):
-                        class MockChoice:
-                            message = type('obj', (object,), {'content': '{"agent_name": "GeneralPurposeAgent", "confidence": 0.5, "parameters": {}}'})()
-                        return type('obj', (object,), {'choices': [MockChoice()]})()
-                return MockCompletions()
-            def embeddings(self):
-                class MockEmbeddings:
-                    def create(self, **kwargs):
-                        class MockData:
-                            embedding = [0.0] * 1536
-                        return type('obj', (object,), {'data': [MockData()]})()
-                return MockEmbeddings()
-        LLMInferenceService.openai_client = MockOpenAIClient()
-        
+    # Local by default (needs Ollama running); set ROUTER_PROVIDER=gemini
+    # (+ GEMINI_API_KEY) in the environment to exercise the cloud path instead.
     llm_service = LLMInferenceService()
     
     # Mock a router call
