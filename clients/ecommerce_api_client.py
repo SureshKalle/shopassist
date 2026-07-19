@@ -5,7 +5,18 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+try:
+    from sqlalchemy import create_engine, text
+except Exception:  # pragma: no cover - optional dependency for dev/editor
+    # Provide lightweight fallbacks so linters/editors don't flag unresolved
+    # import and to give a clear error if runtime use is attempted.
+    def create_engine(*args, **kwargs):
+        raise ImportError(
+            "sqlalchemy is required to use EcommerceClient: install sqlalchemy"
+        )
+
+    def text(stmt):
+        return stmt
 
 logger = logging.getLogger(__name__)
 
