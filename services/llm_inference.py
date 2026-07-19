@@ -306,21 +306,8 @@ class LLMInferenceService:
             )
 
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        """Ask the LLM to plan the agent's single next step.
-
-        Given a task description, the agent's current state, and the tools it's
-        allowed to use (`request.available_tools`), the LLM returns one of
-        'call_api' / 'query_rag' / 'return_result' / 'escalate', plus which tool
-        to call and with what parameters if applicable. Callers must compare
-        `response.tool_name` against the exact string they advertised in
-        `available_tools` - see services/agents/order_tracking_agent.py for the
-        convention (`'ECommerceAPI.getOrderDetails'`, not just `'ECommerceAPI'`).
-        Falls back to `action='return_result'` on any unknown action, invalid
-        JSON, or call failure.
-        """
         logger.info("call_agent_reason: provider=%s model=%s agent=%s", self.agent_reason_provider, self.agent_reason_model, request.agent_name)
 
-        # Prepare the reasoning prompt for the LLM
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": (
                 "You are a reasoning engine for a specialised customer-support AI agent. "
@@ -328,10 +315,13 @@ class LLMInferenceService:
                 "decide the SINGLE NEXT action the agent should take. "
                 "You must respond with a JSON object containing exactly these fields: "
                 "1. `action`: one of 'call_api', 'query_rag', 'return_result', 'escalate'. "
-                "2. `tool_name`: the name of the tool to call if action is 'call_api' or 'query_rag' "
-                "(must be one of the tools listed in `available_tools`), otherwise null. "
-                "3. `tool_params`: a JSON object of parameters required for that tool call, otherwise null. "
-                "4. `thought`: a brief chain-of-thought explanation for this decision. "
+                "2. `tool_name`: The general name of the tool category (e.g., 'ECommerceAPI', 'RAG'). "
+                "   Return null if `action` is 'return_result' or 'escalate'. "
+                "3. `tool_params`: A JSON object of parameters required for that tool call. "
+                "   If `action` is 'call_api' or 'query_rag', this object MUST include a `method` field "
+                "   specifying the exact function to call within that tool (e.g., {'method': 'getOrderDetails', 'order_id': '123'}). "
+                "   Otherwise, return null. "
+                "4. `thought`: A brief chain-of-thought explanation for this decision. "
                 "Use 'return_result' once enough information has been gathered to answer the task. "
                 "Use 'escalate' only if the task cannot be resolved with the available tools. "
                 "Always output a valid JSON object. Do NOT include any other text."
@@ -340,7 +330,7 @@ class LLMInferenceService:
                 f"Agent: {request.agent_name}\n"
                 f"Task: {request.task_description}\n"
                 f"Current state: {request.current_state}\n"
-                f"Available tools: {request.available_tools}"
+                f"Available tools: {request.available_tools}" # This list is still useful for context
             )}
         ]
 
@@ -350,10 +340,9 @@ class LLMInferenceService:
                 client=self.agent_reason_client, model=self.agent_reason_model, mode=self.agent_reason_mode,
                 messages=messages, schema=LLMAgentReasonResponse,
                 fallback_model=self.agent_reason_local_model,
-                temperature=0.0, seed=42, # low temp + fixed seed for deterministic reasoning
+                temperature=0.0, seed=42,
             )
 
-            # Simple check for known actions, fallback if LLM invents one
             valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
             if parsed_response.action not in valid_actions:
                 logger.warning("call_agent_reason: LLM suggested unknown action '%s' - falling back to return_result", parsed_response.action)
@@ -362,22 +351,46 @@ class LLMInferenceService:
                     thought=f"Unknown action '{parsed_response.action}' from LLM; defaulting to return_result."
                 )
 
+            # --- MODIFIED VALIDATION LOGIC ---
+            if parsed_response.action in ["call_api", "query_rag"]:
+                if not parsed_response.tool_name:
+                    logger.warning("call_agent_reason: LLM suggested action '%s' but no tool_name - falling back to return_result", parsed_response.action)
+                    return LLMAgentReasonResponse(action="return_result", thought="LLM suggested tool action without a tool_name.")
+                
+                if not parsed_response.tool_params or "method" not in parsed_response.tool_params:
+                    logger.warning("call_agent_reason: LLM suggested action '%s' but missing 'method' in tool_params - falling back to return_result", parsed_response.action)
+                    return LLMAgentReasonResponse(action="return_result", thought="LLM suggested tool action without 'method' in tool_params.")
+                
+                # Now, instead of checking if tool_name is in available_tools, we check if the full method name is implicitly valid
+                # For now, we rely on the agent's 'tools' dict to do the final validation.
+                # The LLM is now trained to put "ECommerceAPI" in tool_name and "getOrderDetails" in tool_params['method']
+                full_tool_identifier = f"{parsed_response.tool_name}.{parsed_response.tool_params['method']}"
+                if full_tool_identifier not in request.available_tools:
+                    logger.warning(
+                        "call_agent_reason: LLM suggested tool '%s' with method '%s' not in available tools %s - falling back to return_result",
+                        parsed_response.tool_name, parsed_response.tool_params['method'], request.available_tools
+                    )
+                    return LLMAgentReasonResponse(
+                        action="return_result",
+                        thought=f"LLM suggested unknown/unavailable tool method '{full_tool_identifier}'; defaulting to return_result."
+                    )
+            # --- END MODIFIED VALIDATION LOGIC ---
+
             logger.info(
-                "call_agent_reason: agent=%s action=%s tool_name=%s",
-                request.agent_name, parsed_response.action, parsed_response.tool_name,
+                "call_agent_reason: agent=%s action=%s tool_name=%s method=%s",
+                request.agent_name, parsed_response.action, parsed_response.tool_name, 
+                parsed_response.tool_params.get('method') if parsed_response.tool_params else None,
             )
             return parsed_response
 
         except ValidationError as e:
             logger.warning("call_agent_reason: LLM output invalid (%s) - defaulting to return_result", e)
-            # Fallback for malformed LLM output
             return LLMAgentReasonResponse(
                 action="return_result",
                 thought=f"LLM agent-reason output parse error: {e}"
             )
         except Exception as e:
             logger.error("call_agent_reason: error calling agent-reason LLM: %s", e, exc_info=True)
-            # General fallback for API errors, network issues, etc.
             return LLMAgentReasonResponse(
                 action="return_result",
                 thought=f"LLM agent-reason general error: {e}"

@@ -12,7 +12,7 @@ see db/README.md's Known Gaps.
 """
 import logging
 import re
-from typing import Callable
+from typing import Callable, Optional # Added Optional
 
 from common.models import AgentTask, StructuredAgentResult, StructuredOrderSummary, LLMAgentReasonRequest, LLMAgentInterpretRequest
 from services.agents.base_agent import BaseAgent
@@ -42,57 +42,63 @@ class OrderTrackingAgent(BaseAgent):
         match = ORDER_ID_PATTERN.search(text or "")
         return match.group(1) if match else None
 
+    # (Langfuse decorator would go here, when we add it back)
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 
-        user_id = task.user_id  # the logged-in identifier, sent by shopassist-client (see common/models.py CustomerQuery)
-        # The router never actually populates 'order_id' into task.params (it only
-        # passes {"query": <text>}), so pull it out of the customer's own text instead
-        # of silently defaulting to '12345' for every order.
-        order_id = task.params.get('order_id') or self._extract_order_id(task.original_query)
-        logger.info("Resolved order_id=%s user_id=%s", order_id, user_id)
+        user_id = task.user_id
+        # Resolve order_id at the very beginning to avoid NameError
+        resolved_order_id: Optional[str] = task.params.get('order_id') or self._extract_order_id(task.original_query)
+        logger.info("Resolved order_id=%s user_id=%s", resolved_order_id, user_id)
 
-        # Tool registry: the single source of truth for both what's advertised
-        # to the LLM (available_tools below) and what actually runs (the
-        # dispatch after call_agent_reason) - a tool can't be offered without
-        # being invocable, or invoked without being offered. Add a new tool by
-        # adding one entry here, not by hand-syncing a string in two places.
+        # Tool registry:
         tools: dict[str, Callable[[], dict]] = {
-            GET_ORDER_DETAILS_TOOL: lambda: self.ecommerce_api_client.get_order_details(user_id, order_id),
-            CANCEL_ORDER_TOOL: lambda: self.ecommerce_api_client.cancel_order(user_id, order_id),
-            DELETE_ORDER_TOOL: lambda: self.ecommerce_api_client.delete_order(user_id, order_id),
+            GET_ORDER_DETAILS_TOOL: lambda: self.ecommerce_api_client.get_order_details(user_id, resolved_order_id),
+            CANCEL_ORDER_TOOL: lambda: self.ecommerce_api_client.cancel_order(user_id, resolved_order_id),
+            DELETE_ORDER_TOOL: lambda: self.ecommerce_api_client.delete_order(user_id, resolved_order_id),
         }
+        logger.debug("Available tools for LLM: %s", list(tools.keys()))
 
         # 1. Use LLMInf_AgentReason for structured workflow planning/tool selection
-        # (This determines if we need to call an API, RAG, or return directly)
         reason_response = self.llm_inference_client.call_agent_reason(
             LLMAgentReasonRequest(
                 session_id=task.session_id,
                 agent_name=self.name,
                 task_description=(
-                    f"Handle this order-related request for order {order_id}, "
+                    f"Handle this order-related request for order {resolved_order_id}, "
                     f"customer {user_id}: \"{task.original_query}\""
                 ),
-                current_state={'order_id': order_id, 'user_id': user_id},
-                available_tools=list(tools), # Inform the LLM of available tools
+                current_state={'order_id': resolved_order_id, 'user_id': user_id},
+                available_tools=list(tools.keys()),
             )
         )
 
         raw_order_details = {}
-        invoked_tool = None
+        invoked_tool_identifier = None
         logger.info(
-            "Reasoning result: action=%s tool_name=%s thought=%s",
-            reason_response.action, reason_response.tool_name, reason_response.thought,
+            "Reasoning result: action=%s tool_name=%s method=%s thought=%s",
+            reason_response.action, reason_response.tool_name, 
+            reason_response.tool_params.get('method') if reason_response.tool_params else None,
+            reason_response.thought,
         )
-        if reason_response.action == 'call_api' and reason_response.tool_name in tools:
-            # 2. Execute Internal Tool: E-commerce Microservice API call
-            invoked_tool = reason_response.tool_name
-            raw_order_details = tools[invoked_tool]()
-            logger.info("EcommerceClient returned: %s", raw_order_details)
+
+        if reason_response.action == 'call_api' and reason_response.tool_name and reason_response.tool_params and 'method' in reason_response.tool_params:
+            invoked_tool_identifier = f"{reason_response.tool_name}.{reason_response.tool_params['method']}"
+            
+            if invoked_tool_identifier in tools:
+                raw_order_details = tools[invoked_tool_identifier]()
+                logger.info("EcommerceClient returned: %s", raw_order_details)
+            else:
+                logger.warning(
+                    "Order lookup skipped - LLM suggested tool '%s' not in agent's registry. Reason: %s",
+                    invoked_tool_identifier, reason_response.thought,
+                )
         else:
             logger.warning(
-                "Order lookup skipped (action=%s, tool_name=%s) - reason: %s",
-                reason_response.action, reason_response.tool_name, reason_response.thought,
+                "Order lookup skipped (action=%s, tool_name=%s, method in params=%s) - reason: %s",
+                reason_response.action, reason_response.tool_name, 
+                'method' in reason_response.tool_params if reason_response.tool_params else False,
+                reason_response.thought,
             )
 
         if not raw_order_details or "error" in raw_order_details:
@@ -100,10 +106,10 @@ class OrderTrackingAgent(BaseAgent):
             # found, wrong status to delete) return a specific reason worth
             # surfacing; getOrderDetails keeps the existing generic message
             # rather than exposing raw DB wording.
-            if invoked_tool in _ACTION_TOOLS_WITH_OWN_ERROR_MESSAGE and raw_order_details.get("error"):
+            if invoked_tool_identifier in _ACTION_TOOLS_WITH_OWN_ERROR_MESSAGE and raw_order_details.get("error"):
                 message = raw_order_details["error"]
             else:
-                message = f"Could not find details for order {order_id}. Please check the ID or try again."
+                message = f"Could not find details for order {resolved_order_id}. Please check the ID or try again."
             return StructuredAgentResult(
                 task_id=task.task_id,
                 agent_name=self.name,
@@ -113,9 +119,9 @@ class OrderTrackingAgent(BaseAgent):
 
         # 3. Diagnose the order (e.g. shipping delay, payment pending) from the
         # raw DB row via the LLM's interpret step.
-        if invoked_tool == CANCEL_ORDER_TOOL:
+        if invoked_tool_identifier == CANCEL_ORDER_TOOL:
             interpretation_goal = "confirm the cancellation and note anything the customer should know"
-        elif invoked_tool == DELETE_ORDER_TOOL:
+        elif invoked_tool_identifier == DELETE_ORDER_TOOL:
             interpretation_goal = "confirm the deletion and note anything the customer should know"
         else:
             interpretation_goal = "diagnose order issue"
@@ -130,9 +136,6 @@ class OrderTrackingAgent(BaseAgent):
         )
 
         # 4. Compile all findings into a final structured result.
-        # structured_interpretation is always an OrderIssueAnalysis model (see
-        # common/models.py LLMAgentInterpretResponse / services/llm_inference.py
-        # call_agent_interpret), never a plain dict - access issue_type directly.
         order_summary = StructuredOrderSummary(
             order_id=raw_order_details.get('order_id'),
             status=raw_order_details.get('status'),
@@ -147,8 +150,3 @@ class OrderTrackingAgent(BaseAgent):
             status="success",
             result_data=order_summary,
         )
-
-# This agent would not typically be run directly but instantiated by the Orchestrator
-if __name__ == "__main__":
-    print("OrderTrackingAgent is a specialized agent.")
-    # To test, you would need to mock all its dependencies.
