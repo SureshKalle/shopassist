@@ -114,12 +114,20 @@ if __name__ == "__main__":
     # api/routers/chat.py needs no such hardcode - it already takes user_id
     # straight from the request, since shopassist-client sends one at login.
 
-    # Interaction 1: Order Status
+    ## Interaction 1: Order Status
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order ord-1001.")
+    #print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
+    #response_1 = orchestrator.handle_customer_query(customer_query_1)
+    #print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
+    #print("-" * 80)
+
+    # Interaction 2: Order Deletion
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order ord-1001.")
-    print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
-    response_1 = orchestrator.handle_customer_query(customer_query_1)
-    print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
+    customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="alum-1003", text="Hi, I dont need this order ord-1003.")
+    print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
+    response_2 = orchestrator.handle_customer_query(customer_query_2)
+    print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
     print("-" * 80)
 
     # Interaction 2: Product Recommendation

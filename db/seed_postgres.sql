@@ -1,22 +1,12 @@
--- ShopAssist :: SQLite seed data (IISc alumni shop merchandise, INR pricing)
--- Lightweight sample dataset for local development. Safe to re-run after
--- db/init_db.py recreates the schema.
+-- ShopAssist :: PostgreSQL seed data (IISc alumni shop merchandise, INR pricing)
+-- Straight port of db/seed_sqlite.sql - identical INSERT statements (plain
+-- ANSI SQL, no SQLite-specific syntax) minus the SQLite-only
+-- `PRAGMA foreign_keys` line. See that file for the full seed-data
+-- rationale (naming conventions, shipping_fee rule, etc.) - not duplicated
+-- here.
 --
--- user_id / item_id / order_id are explicit, human-readable IDs
--- (alum-1001, item-1001, ord-1001 ...), same idea as session_id already
--- being a recognizable token instead of an opaque integer. These are
--- exactly the IDs to type as the "User ID" at shopassist-client's login
--- for that seeded customer's data to resolve (see db/README.md).
---
--- Item names deliberately drop the "IISc " prefix (descriptions still
--- reference the institute/crest/alumni context where natural) - a
--- deliberate style choice for this repo's seed data, not a sync error
--- against shopassist-database's own seed.sql, which does prefix names.
---
--- shipping_fee is 0 above a Rs. 999 subtotal, 49 below it; total_amount =
--- subtotal - discount + shipping_fee throughout, same as a real storefront.
-
-PRAGMA foreign_keys = ON;
+-- Loaded automatically on first container start via docker-entrypoint-
+-- initdb.d, after schema_postgres.sql (see docker-compose.yml).
 
 -- ---------------------------------------------------------------------------
 -- customers (10)
@@ -209,7 +199,7 @@ INSERT INTO order_items (order_id, item_id, quantity, unit_price, line_total) VA
 
 -- ---------------------------------------------------------------------------
 -- item_reviews (10) - user_id is a real FK to customers, one of the 10
--- seeded above (schema_sqlite.sql's file header explains why); reviewers
+-- seeded above (schema_postgres.sql's file header explains why); reviewers
 -- here happen to be reviewing items they've actually bought in the
 -- order_items seed data above, though the schema doesn't require that.
 -- ---------------------------------------------------------------------------
