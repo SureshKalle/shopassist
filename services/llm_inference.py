@@ -253,7 +253,7 @@ class LLMInferenceService:
                 "which specialized agent should handle the request. "
                 "You must respond with a JSON object containing three fields: " 
                 "1. `agent_name`: The name of the agent to invoke. Choose from: "
-                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
                 "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
                 "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
                 "If no specific parameters are extracted, return an empty object {}. "

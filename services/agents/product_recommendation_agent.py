@@ -9,6 +9,8 @@ logger = logging.getLogger(__name__)
 
 SEARCH_ITEMS_TOOL = "ECommerceAPI.searchItems"
 GET_POPULAR_CATEGORY_TOOL = "ECommerceAPI.getPopularCategory"
+ADD_REVIEW_TOOL = "ECommerceAPI.addReview"
+REMOVE_REVIEW_TOOL = "ECommerceAPI.removeReview"
 
 class ProductRecommendationAgent(BaseAgent):
     """
@@ -52,6 +54,21 @@ class ProductRecommendationAgent(BaseAgent):
             ),
             GET_POPULAR_CATEGORY_TOOL: lambda params: self.ecommerce_api_client.get_popular_category(
                 limit=params.get("limit", 1)
+            ),
+            # Same LLM param-naming looseness as searchItems above - accept the
+            # common synonyms rather than dropping the review on a mismatch.
+            # user_id is always the requesting customer, never LLM-supplied -
+            # add_review()'s own verified-purchase guard is what actually
+            # decides whether this succeeds, not anything extracted here.
+            ADD_REVIEW_TOOL: lambda params: self.ecommerce_api_client.add_review(
+                item_id=params.get("item_id") or params.get("product_id"),
+                user_id=user_id,
+                review_title=params.get("review_title") or params.get("title") or "",
+                review_content=params.get("review_content") or params.get("content") or params.get("review") or "",
+            ),
+            REMOVE_REVIEW_TOOL: lambda params: self.ecommerce_api_client.remove_review(
+                review_id=params.get("review_id"),
+                user_id=user_id,
             ),
         }
 
@@ -117,6 +134,36 @@ class ProductRecommendationAgent(BaseAgent):
                     agent_name=self.name,
                     status="failure",
                     result_data={"message": "Not enough order history yet to determine a popular category."},
+                )
+
+            if reason_response.tool_name == ADD_REVIEW_TOOL:
+                if tool_result.get("error"):
+                    return StructuredAgentResult(
+                        task_id=task.task_id,
+                        agent_name=self.name,
+                        status="failure",
+                        result_data={"message": tool_result["error"]},
+                    )
+                return StructuredAgentResult(
+                    task_id=task.task_id,
+                    agent_name=self.name,
+                    status="success",
+                    result_data={"message": "Thanks for your review!", **tool_result},
+                )
+
+            if reason_response.tool_name == REMOVE_REVIEW_TOOL:
+                if tool_result.get("error"):
+                    return StructuredAgentResult(
+                        task_id=task.task_id,
+                        agent_name=self.name,
+                        status="failure",
+                        result_data={"message": tool_result["error"]},
+                    )
+                return StructuredAgentResult(
+                    task_id=task.task_id,
+                    agent_name=self.name,
+                    status="success",
+                    result_data={"message": "Your review has been deleted.", **tool_result},
                 )
 
         # Fallback: original RAG-based flow (unchanged) for queries the LLM

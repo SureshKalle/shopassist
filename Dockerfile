@@ -14,7 +14,7 @@ COPY api ./api
 COPY services ./services
 COPY clients ./clients
 COPY common ./common
-COPY db/init_db.py db/schema_sqlite.sql db/seed_data.sql ./db/
+COPY db/init_db.py db/schema_sqlite.sql db/seed_sqlite.sql ./db/
 
 EXPOSE 8000
 

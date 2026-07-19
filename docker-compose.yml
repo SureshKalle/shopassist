@@ -6,9 +6,11 @@
 # layers the platform network + real Ollama/Postgres URLs on top. The
 # service key is `api` (not `shopassist-api`) to match that override.
 #
-# Standalone, this container reaches Ollama (and Postgres, if DATABASE_URL
-# is set) on the host via host.docker.internal. Leave DATABASE_URL unset to
-# use the disposable SQLite dev DB rebuilt on every start (see Dockerfile).
+# Standalone, this container reaches Ollama on the host via
+# host.docker.internal. Leave DATABASE_URL unset to use the disposable
+# SQLite dev DB rebuilt on every start (see Dockerfile) - or point it at
+# the `postgres` service below for a real Postgres instance, local to this
+# compose file (independent of shopassist-devops's own Postgres).
 #
 # Use `docker compose up -d --build`, not plain `up -d`: the image is a
 # one-time snapshot of the source tree, so without --build this silently
@@ -42,8 +44,10 @@ services:
       OLLAMA_GENERATIVE_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
       OLLAMA_EMBEDDING_MODEL: nomic-embed-text
       # Left unset (not blank - see .env.example) to use the disposable
-      # SQLite dev DB. Uncomment for real Postgres instead:
-      # DATABASE_URL: postgresql://shopassist:shopassist123@host.docker.internal:5432/shopassist
+      # SQLite dev DB. Uncomment for the `postgres` service below (same
+      # compose network, so the hostname is the service name, not
+      # host.docker.internal):
+      # DATABASE_URL: postgresql://shopassist:shopassist123@postgres:5432/shopassist
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -55,6 +59,41 @@ services:
     networks:
       - shopassist-api-network
 
+  # Standalone Postgres for local dev - swap DATABASE_URL (api service
+  # above, or your host-side .env for running api outside Docker) to point
+  # here instead of the default SQLite dev DB. Independent of
+  # shopassist-devops's own Postgres; not started by shopassist-devops's
+  # compose file at all, only by this one.
+  postgres:
+    image: postgres:16-alpine
+    container_name: shopassist-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shopassist
+      POSTGRES_PASSWORD: shopassist123
+      POSTGRES_DB: shopassist
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - shopassist-postgres-data:/var/lib/postgresql/data
+      # Official postgres image runs every *.sql file here, in name order,
+      # but only against a brand-new (empty) data directory - re-running
+      # `docker compose up` against an existing volume does NOT re-apply
+      # these. Drop the volume (see db/README.md) to force a reload.
+      - ./db/schema_postgres.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./db/seed_postgres.sql:/docker-entrypoint-initdb.d/02_seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopassist -d shopassist"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - shopassist-api-network
+
 networks:
   shopassist-api-network:
     name: shopassist-api-network
+
+volumes:
+  shopassist-postgres-data:
