@@ -238,10 +238,17 @@ class LLMInferenceService:
         """Decide which specialist agent should handle this query.
 
         Sends the (PII-masked) conversation history plus the current query and
-        asks the LLM to pick one of the five known agent names with a confidence
+        asks the LLM to pick one of the four known agent names with a confidence
         score. Falls back to GeneralPurposeAgent - at a lower confidence each
         time - if the LLM names an unknown agent, returns invalid JSON, or the
         call itself fails (network error, model not pulled, etc.).
+
+        The agent list here must match api/dependencies.py's get_agents()
+        exactly - a name that "sounds real" (e.g. a former 'ReturnsAgent')
+        but isn't actually registered doesn't fail loudly: orchestrator.py's
+        dispatch (self.agents.get(agent_name)) just silently falls back to
+        GeneralPurposeAgent/EscalationAgent, so the intended specialist agent
+        never runs and nobody notices unless they go looking for it.
         """
         logger.info("call_router: provider=%s model=%s query=%r", self.router_provider, self.router_model, request.current_query)
         
@@ -253,7 +260,9 @@ class LLMInferenceService:
                 "which specialized agent should handle the request. "
                 "You must respond with a JSON object containing three fields: " 
                 "1. `agent_name`: The name of the agent to invoke. Choose from: "
-                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "OrderTrackingAgent handles order status/tracking AND order cancellation requests alike - "
+                "there is no separate returns/cancellation agent. "
                 "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
                 "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
                 "If no specific parameters are extracted, return an empty object {}. "
@@ -281,7 +290,7 @@ class LLMInferenceService:
             )
 
             # Simple check for known agents, fallback if LLM invents one
-            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
+            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "GeneralPurposeAgent", "EscalationAgent"]:
                 logger.warning("call_router: LLM suggested unknown agent '%s' - falling back to GeneralPurposeAgent", parsed_invocation.agent_name)
                 return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
 

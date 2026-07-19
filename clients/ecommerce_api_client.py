@@ -56,15 +56,17 @@ class EcommerceClient:
 
             logger.debug("get_order_details: row found - %s", dict(order_row))
 
-            # Ownership check: only enforce when user_id actually looks like a
-            # seeded business key (alum-1001 style - see db/README.md), so it
-            # degrades gracefully instead of rejecting every real lookup.
-            #
-            # TODO: Temporarily commented out - re-enable once shopassist-client
-            # sends the real logged-in user_id on every request instead of this
-            # being hardcoded (api/routers/chat.py, main_simulation.py).
-            #if user_id.startswith("alum-") and user_id != order_row["user_id"]:
-            #    return {"error": "Order not found", "order_id": order_id}
+            # Ownership check: a caller can only see their own orders. Returns
+            # the same "not found" error as a missing order_id rather than a
+            # distinct "forbidden" - that keeps this indistinguishable from a
+            # typo'd order_id to the caller, instead of confirming that a
+            # given order_id exists but belongs to someone else.
+            if user_id != order_row["user_id"]:
+                logger.warning(
+                    "get_order_details: ownership mismatch - user_id=%s requested order_id=%s owned by %s",
+                    user_id, order_id, order_row["user_id"],
+                )
+                return {"error": "Order not found", "order_id": order_id}
 
             item_rows = conn.execute(
                 text(
@@ -108,6 +110,13 @@ class EcommerceClient:
 
             if not order_row:
                 logger.warning("cancel_order: order_id=%s not found in orders table", order_id)
+                return {"error": "Order not found", "order_id": order_id}
+
+            if user_id != order_row["user_id"]:
+                logger.warning(
+                    "cancel_order: ownership mismatch - user_id=%s requested order_id=%s owned by %s",
+                    user_id, order_id, order_row["user_id"],
+                )
                 return {"error": "Order not found", "order_id": order_id}
 
             current_status = order_row["status"].lower()
