@@ -81,15 +81,18 @@ class EcommerceClient:
 
             logger.debug("get_order_details: row found - %s", dict(order_row))
 
-            # Ownership check: only enforce when user_id actually looks like a
-            # seeded business key (alum-1001 style - see db/README.md), so it
-            # degrades gracefully instead of rejecting every real lookup.
-            #
-            # TODO: Temporarily commented out - re-enable once shopassist-client
-            # sends the real logged-in user_id on every request instead of this
-            # being hardcoded (api/routers/chat.py, main_simulation.py).
-            #if user_id.startswith("alum-") and user_id != order_row["user_id"]:
-            #    return {"error": "Order not found", "order_id": order_id}
+            # Ownership guardrail: only enforce when user_id actually looks like
+            # a seeded business key (alum-1001 style - see db/README.md), so it
+            # degrades gracefully instead of rejecting every lookup. Re-enabled
+            # (was previously disabled pending shopassist-client sending a real
+            # per-session user_id - it now does, see login.py there) to close
+            # an IDOR: without this, any caller could read any other
+            # customer's order by guessing/incrementing order_id.
+            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+                logger.warning(
+                    "get_order_details: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
+                )
+                return {"error": "Order not found", "order_id": order_id}
 
             item_rows = conn.execute(
                 text(
@@ -133,6 +136,16 @@ class EcommerceClient:
 
             if not order_row:
                 logger.warning("cancel_order: order_id=%s not found in orders table", order_id)
+                return {"error": "Order not found", "order_id": order_id}
+
+            # Ownership guardrail - see get_order_details()'s matching comment
+            # for why this is enabled now. This one never had even a disabled
+            # placeholder: without it, any caller could cancel any other
+            # customer's order by guessing/incrementing order_id.
+            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+                logger.warning(
+                    "cancel_order: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
+                )
                 return {"error": "Order not found", "order_id": order_id}
 
             current_status = order_row["status"].lower()
@@ -285,6 +298,19 @@ class EcommerceClient:
                 logger.warning("delete_order: order_id=%s not found in orders table", order_id)
                 return {"error": "Order not found", "order_id": order_id}
 
+            # Ownership guardrail - see get_order_details()'s matching comment
+            # for why this is enabled now. Especially important here: this is
+            # a hard, irreversible DELETE, not a status change. Checked
+            # before the status guard below so a non-owner gets the same
+            # generic "not found" regardless of the order's real status -
+            # otherwise this would leak another customer's order status
+            # (e.g. "delivered") to someone who doesn't own it.
+            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+                logger.warning(
+                    "delete_order: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
+                )
+                return {"error": "Order not found", "order_id": order_id}
+
             current_status = order_row["status"].lower()
             if current_status not in _DELETABLE_STATUSES:
                 logger.info("delete_order: order_id=%s status=%s cannot be deleted", order_id, current_status)
@@ -292,12 +318,6 @@ class EcommerceClient:
                     "error": f"Order is {current_status} and can no longer be deleted - it can only be cancelled",
                     "order_id": order_id,
                 }
-
-            # Ownership check intentionally left disabled, same as
-            # get_order_details()/cancel_order() above - see the TODO on
-            # get_order_details() for why.
-            #if user_id.startswith("alum-") and user_id != order_row["user_id"]:
-            #    return {"error": "Order not found", "order_id": order_id}
 
             item_rows = conn.execute(
                 text(
