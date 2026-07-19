@@ -23,6 +23,12 @@ ORDER_ID_PATTERN = re.compile(r"\b(\d{4,})\b")
 
 GET_ORDER_DETAILS_TOOL = "ECommerceAPI.getOrderDetails"
 CANCEL_ORDER_TOOL = "ECommerceAPI.cancelOrder"
+DELETE_ORDER_TOOL = "ECommerceAPI.deleteOrder"
+
+# Tools whose EcommerceClient guard (order not cancellable/deletable, not
+# found) returns a specific reason worth surfacing verbatim - unlike
+# getOrderDetails, which keeps the generic "could not find" message below.
+_ACTION_TOOLS_WITH_OWN_ERROR_MESSAGE = {CANCEL_ORDER_TOOL, DELETE_ORDER_TOOL}
 
 class OrderTrackingAgent(BaseAgent):
     """
@@ -54,6 +60,7 @@ class OrderTrackingAgent(BaseAgent):
         tools: dict[str, Callable[[], dict]] = {
             GET_ORDER_DETAILS_TOOL: lambda: self.ecommerce_api_client.get_order_details(user_id, order_id),
             CANCEL_ORDER_TOOL: lambda: self.ecommerce_api_client.cancel_order(user_id, order_id),
+            DELETE_ORDER_TOOL: lambda: self.ecommerce_api_client.delete_order(user_id, order_id),
         }
 
         # 1. Use LLMInf_AgentReason for structured workflow planning/tool selection
@@ -89,10 +96,11 @@ class OrderTrackingAgent(BaseAgent):
             )
 
         if not raw_order_details or "error" in raw_order_details:
-            # cancelOrder's guard (already delivered/cancelled, not found) returns
-            # a specific reason worth surfacing; getOrderDetails keeps the
-            # existing generic message rather than exposing raw DB wording.
-            if invoked_tool == CANCEL_ORDER_TOOL and raw_order_details.get("error"):
+            # cancelOrder/deleteOrder's guards (already delivered/cancelled, not
+            # found, wrong status to delete) return a specific reason worth
+            # surfacing; getOrderDetails keeps the existing generic message
+            # rather than exposing raw DB wording.
+            if invoked_tool in _ACTION_TOOLS_WITH_OWN_ERROR_MESSAGE and raw_order_details.get("error"):
                 message = raw_order_details["error"]
             else:
                 message = f"Could not find details for order {order_id}. Please check the ID or try again."
@@ -105,16 +113,19 @@ class OrderTrackingAgent(BaseAgent):
 
         # 3. Diagnose the order (e.g. shipping delay, payment pending) from the
         # raw DB row via the LLM's interpret step.
+        if invoked_tool == CANCEL_ORDER_TOOL:
+            interpretation_goal = "confirm the cancellation and note anything the customer should know"
+        elif invoked_tool == DELETE_ORDER_TOOL:
+            interpretation_goal = "confirm the deletion and note anything the customer should know"
+        else:
+            interpretation_goal = "diagnose order issue"
+
         interpret_response = self.llm_inference_client.call_agent_interpret(
             LLMAgentInterpretRequest(
                 session_id=task.session_id,
                 agent_name=self.name,
                 raw_data=raw_order_details,
-                interpretation_goal=(
-                    "confirm the cancellation and note anything the customer should know"
-                    if invoked_tool == CANCEL_ORDER_TOOL
-                    else "diagnose order issue"
-                ),
+                interpretation_goal=interpretation_goal,
             )
         )
 
