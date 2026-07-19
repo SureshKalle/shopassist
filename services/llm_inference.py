@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import BaseModel, ValidationError
-
+from services.rag  import RAGPipeline
 from common.models import (
     RoutingRequest, AgentInvocation,
     LLMAgentReasonRequest, LLMAgentReasonResponse,
@@ -681,17 +681,10 @@ class LLMInferenceService:
                 confidence=0.0
             )
 
-    def call_embeddings(self, text: str) -> List[float]:
-        """Return a vector for `text`, used by services/rag.py for similarity search.
-
-        This is a deterministic stub, not a real embedding model call: it maps
-        the first 16 characters to floats via `ord()`. Good enough for the
-        in-memory RAG demo (services/rag.py's MockRAGService does substring/
-        keyword matching, not real vector similarity), not representative of
-        real embedding quality or dimensionality (real models return
-        hundreds-to-thousands of dimensions; this returns at most 16).
-        """
-        return [float(ord(c)) / 100 for c in text[:16]]
+    def call_embeddings(self, text: str):
+        ragservice = RAGPipeline()
+        return ragservice.query_rag_pipeline(text)     
+      
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
@@ -700,10 +693,10 @@ if __name__ == "__main__":
     llm_service = LLMInferenceService()
     
     # Mock a router call
-    router_req = RoutingRequest(session_id="test_123", conversation_history=[], current_query="Check my order")
-    agent_invoc = llm_service.call_router(router_req)
-    print(f"\nRouter Result: {agent_invoc}")
+    #router_req = RoutingRequest(session_id="test_123", conversation_history=[], current_query="Check my order")
+    #agent_invoc = llm_service.call_router(router_req)
+    #print(f"\nRouter Result: {agent_invoc}")
     
     # Mock an embedding call
-    embedding = llm_service.call_embeddings("Hello World")
-    print(f"Embedding: {embedding[:5]}...")
+    embedding = llm_service.call_embeddings("What return and refund policy")
+    print(f"Embedding from Rag: {embedding}")

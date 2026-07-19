@@ -21,7 +21,7 @@ from clients.ecommerce_api_client import EcommerceClient
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
 from services.classifier_client import ClassifierClient
-from services.rag import MockRAGService
+from services.rag import RAGPipeline
 from services.data_pipeline import DataIngestionPipeline
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
     llm_inference_service = LLMInferenceService()
-    rag_service = MockRAGService(llm_inference_service) # RAG needs LLM for embeddings
+    rag_service = RAGPipeline() # RAG needs LLM for embeddings
     ecommerce_api_client = EcommerceClient()
     classifier_client = ClassifierClient() # sentiment; fails soft if not started separately (shopassist-model)
 
@@ -75,9 +75,9 @@ if __name__ == "__main__":
         RawProductRecord(product_id="PROD_LAP_001", raw_description="High-performance gaming laptop with an i7 processor, 16GB RAM, and a 1TB SSD. Stunning display and RGB keyboard.", specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"}, reviews=["Great product!", "Fast delivery.", "Screen is amazing!"], price="₹1200.00"),
         RawProductRecord(product_id="PROD_HEAD_002", raw_description="Premium noise-cancelling headphones for immersive audio. Comfortable earcups and 20-hour battery life.", specs={"Color": "Black", "Battery": "20h"}, reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."], price="₹250.00"),
     ]
-    cleaned_products = data_pipeline.ingest_product_catalog(raw_product_catalog)
-    print(f"\nSample Cleaned Product Description for LLM Fine-tuning: '{cleaned_products[0].clean_description[:50]}...'")
-    print(f"Product RAG vector DB now contains {len(rag_service.vector_db)} documents from initial ingestion.")
+    status = data_pipeline.ingest_product_catalog()
+    print(f"\n -In simmulations RAG Pipeline Build Completed Successfully!")
+    print(f"Statistics: {status}")
 
     # Synthetic E-commerce Queries
     synthetic_queries = data_pipeline.generate_synthetic_queries(["Where is my shipment?", "Suggest a gift.", "How do I return an item?"])

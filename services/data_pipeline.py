@@ -16,8 +16,7 @@ from common.models import (
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
 from services.classifier_client import ClassifierClient
-from services.rag import MockRAGService
-
+from services.rag import RAGPipeline
 logger = logging.getLogger(__name__)
 
 class DataIngestionPipeline:
@@ -26,7 +25,7 @@ class DataIngestionPipeline:
     for RAG and LLM fine-tuning. This is typically a batch or streaming system,
     not a real-time microservice.
     """
-    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: MockRAGService,
+    def __init__(self, pii_masker: PIIMasker, llm_inference_client: LLMInferenceService, rag_service: RAGPipeline,
                  classifier_client: ClassifierClient = None):
         self.pii_masker = pii_masker
         self.llm_inference_client = llm_inference_client
@@ -60,8 +59,10 @@ class DataIngestionPipeline:
                 metadata={**raw_conv.metadata, "original_text_hash": masked_data.original_text_hash}
             ))
 
+            
             # --- 3. Chunking and Embedding for RAG ---
             # Only chunk/embed if content is meaningful after masking
+            """
             if masked_text and len(masked_text) > 20: # Example length threshold
                 chunks = [masked_text] # Simple: one chunk per conversation; real: recursive chunking
                 for i, chunk_content in enumerate(chunks):
@@ -73,66 +74,18 @@ class DataIngestionPipeline:
                         metadata={"conv_id": raw_conv.id, "chunk_idx": i}
                     )
                     self.rag_service.ingest_document(chunk)
+            """
         logger.info("Customer conversation ingestion complete: %d record(s)", len(cleaned_conversations))
         return cleaned_conversations
 
-    def ingest_product_catalog(self, raw_products: List[RawProductRecord]) -> List[CleanedProductRecord]:
-        logger.info("Ingesting %d product record(s)", len(raw_products))
-        cleaned_products = []
-        for raw_prod in raw_products:
-            logger.debug("Processing raw product ID: %s", raw_prod.product_id)
-            
-            # --- 1. Cleaning & Organization ---
-            clean_description = raw_prod.raw_description.strip()
-            # Handle missing values: e.g., default values, imputation
-            # De-duplicate product listings: based on unique identifiers or content hashing
-            # Normalize variations: e.g., "CPU: i7" vs "Processor: Intel Core i7" -> "cpu": "intel_core_i7"
-            # Reconcile inconsistent price formats: already done via float conversion
-            try:
-                normalized_price = float(raw_prod.price.replace('₹', '').replace('$', '').replace(',', ''))
-            except ValueError:
-                normalized_price = 0.0 # Assign default or flag as error
+    def ingest_product_catalog(self):
+        logger.info("Ingesting product catalog into RAG store")
+        status=self.rag_service.build_rag_pipeline()
+        logger.info("RAG Pipeline Build Completed Successfully!")
+        logger.info(f"Statistics: {status}")
+        return status
 
-            # Extract structured entities from free-text (e.g., features from description)
-            structured_specs = {k.lower().replace(' ', '_'): v for k, v in raw_prod.specs.items()}
-            
-            # Process reviews: de-duplicate, standardize, sentiment analysis
-            sentiment_analyzed_reviews = []
-            for review_text in set(raw_prod.reviews): # Use set to de-duplicate
-                # Real classifier call (services/classifier_client.py) - fails
-                # soft to label="unknown" if that service isn't running, so
-                # ingestion never breaks on it being unavailable.
-                sentiment = self.classifier_client.classify_sentiment(review_text)
-
-                # --- 2. PII Masking for Reviews ---
-                masked_review_data = self.pii_masker.mask_text(review_text)
-                sentiment_analyzed_reviews.append({"text": masked_review_data.masked_text, "sentiment": sentiment.label, "sentiment_score": sentiment.score, "original_hash": masked_review_data.original_text_hash})
-            
-            cleaned_products.append(CleanedProductRecord(
-                product_id=raw_prod.product_id,
-                clean_description=clean_description,
-                structured_specs=structured_specs,
-                sentiment_analyzed_reviews=sentiment_analyzed_reviews,
-                normalized_price=normalized_price,
-                metadata={"original_price_str": raw_prod.price}
-            ))
-
-            # --- 3. Chunking and Embedding for RAG ---
-            # Combine relevant info for retrieval: description, key specs, summary of positive/negative reviews
-            reviews_summary = ". ".join([r['text'] for r in sentiment_analyzed_reviews])
-            content_for_rag = f"Product: {clean_description}. Specifications: {raw_prod.specs}. Customer Reviews: {reviews_summary}"
-            
-            chunk = ChunkedDocument(
-                doc_id=f"prod_chunk_{raw_prod.product_id}",
-                content=content_for_rag,
-                embedding=self.llm_inference_client.call_embeddings(content_for_rag),
-                source_type="product_catalog",
-                metadata={"product_id": raw_prod.product_id}
-            )
-            self.rag_service.ingest_document(chunk)
-        logger.info("Product catalog ingestion complete: %d record(s)", len(cleaned_products))
-        return cleaned_products
-
+                       
     def generate_synthetic_queries(self, base_queries: List[str]) -> List[str]:
         logger.info("Generating synthetic queries from %d base quer(y/ies)", len(base_queries))
         synthetic_queries = []

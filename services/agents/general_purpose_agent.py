@@ -18,11 +18,8 @@ class GeneralPurposeAgent(BaseAgent):
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 
         # 1. Try a RAG lookup for general knowledge
-        rag_results = self.rag_service.query_knowledge_base(
-            self.llm_inference_client.call_embeddings(task.original_query),
-            task.original_query
-        )
-
+        rag_results = self.rag_service.query_rag_pipeline(task.original_query)    
+        
         if rag_results:
             logger.info("RAG match found for task_id=%s", task.task_id)
             # Return the content of the most relevant document
@@ -30,7 +27,7 @@ class GeneralPurposeAgent(BaseAgent):
                 task_id=task.task_id,
                 agent_name=self.name,
                 status="success",
-                result_data={"answer_snippet": rag_results[0].content},
+                result_data={"answer_snippet": rag_results},
             )
         else:
             logger.info("No RAG match for task_id=%s - returning generic response", task.task_id)
