@@ -251,11 +251,20 @@ class LLMInferenceService:
                 "You are an expert routing agent for an e-commerce customer service chatbot. "
                 "Your task is to analyze the user's current query and conversation history to determine "
                 "which specialized agent should handle the request. "
-                "You must respond with a JSON object containing three fields: " 
+                "You must respond with a JSON object containing three fields: "
                 "1. `agent_name`: The name of the agent to invoke. Choose from: "
                 "'OrderTrackingAgent', 'ProductRecommendationAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "`OrderTrackingAgent` owns EVERY request about a specific order, not just status lookups - "
+                "this includes checking an order's status, placing/creating a new order, updating an order, "
+                "and cancelling an order (e.g. 'where is my order', 'cancel order 12345', 'I want to order "
+                "2 red t-shirts', 'change the shipping address on my order' all route to OrderTrackingAgent). "
                 "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
-                "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "(e.g., {'order_id': '12345'} for a status/cancel request to OrderTrackingAgent, "
+                "{'keyword': 'red t-shirt'} for a new-order request to OrderTrackingAgent, "
+                "{'order_id': '12345', 'shipping_address': 'the new address text'} for an address-change "
+                "request to OrderTrackingAgent - always use the exact key `shipping_address`, never a "
+                "variant like `new_shipping_address`, "
+                "{'product_type': 'laptop'} for ProductRecommendationAgent). "
                 "If no specific parameters are extracted, return an empty object {}. "
                 "3. `confidence`: A float between 0.0 and 1.0 representing your confidence in this routing decision. " # <--- ADDED HERE
                 "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent'. "
@@ -280,8 +289,12 @@ class LLMInferenceService:
                 temperature=0.0, seed=42, # low temp + fixed seed for deterministic routing
             )
 
-            # Simple check for known agents, fallback if LLM invents one
-            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
+            # Simple check for known agents, fallback if LLM invents one.
+            # 'ReturnsAgent' was previously (wrongly) listed here - no such
+            # agent is registered anywhere (see api/routers - only the four
+            # below exist) - so it could never actually be dispatched to;
+            # removed rather than kept as a dead fallback target.
+            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "GeneralPurposeAgent", "EscalationAgent"]:
                 logger.warning("call_router: LLM suggested unknown agent '%s' - falling back to GeneralPurposeAgent", parsed_invocation.agent_name)
                 return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
 
@@ -315,13 +328,20 @@ class LLMInferenceService:
                 "decide the SINGLE NEXT action the agent should take. "
                 "You must respond with a JSON object containing exactly these fields: "
                 "1. `action`: one of 'call_api', 'query_rag', 'return_result', 'escalate'. "
-                "2. `tool_name`: The general name of the tool category (e.g., 'ECommerceAPI', 'RAG'). "
+                "2. `tool_name`: The tool category, taken from the part before the '.' in one of the "
+                "   'Available tools' entries below (e.g. if 'Available tools' contains "
+                "   'ECommerceAPI.getOrderDetails', use tool_name 'ECommerceAPI'). Never invent a "
+                "   category, such as 'RAG', that has no matching entry in 'Available tools'. "
                 "   Return null if `action` is 'return_result' or 'escalate'. "
                 "3. `tool_params`: A JSON object of parameters required for that tool call. "
                 "   If `action` is 'call_api' or 'query_rag', this object MUST include a `method` field "
-                "   specifying the exact function to call within that tool (e.g., {'method': 'getOrderDetails', 'order_id': '123'}). "
+                "   whose value is the part after the '.' in the matching 'Available tools' entry "
+                "   (e.g. {'method': 'getOrderDetails', 'order_id': '123'} for 'ECommerceAPI.getOrderDetails'). "
                 "   Otherwise, return null. "
                 "4. `thought`: A brief chain-of-thought explanation for this decision. "
+                "Only ever call a tool whose 'tool_name.method' combination appears verbatim in "
+                "'Available tools' - if the task doesn't need any of them, use 'return_result' directly "
+                "rather than inventing one. "
                 "Use 'return_result' once enough information has been gathered to answer the task. "
                 "Use 'escalate' only if the task cannot be resolved with the available tools. "
                 "Always output a valid JSON object. Do NOT include any other text."

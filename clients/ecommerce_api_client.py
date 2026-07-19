@@ -40,6 +40,11 @@ _DELETABLE_STATUSES = {"pending", "cancelled"}
 # item) even though the status set happens to match today.
 _UNFULFILLED_ORDER_STATUSES = {"pending", "confirmed", "shipped"}
 
+# update_order() (address/quantity/item edits) guards the same way
+# cancel_order() does - once an order is 'delivered', 'cancelled', or
+# 'returned' there's nothing left to safely change.
+_EDITABLE_STATUSES = {"pending", "confirmed", "shipped"}
+
 
 class EcommerceClient:
     """Data-access layer for the orders/customers/items DB - the one place
@@ -256,6 +261,204 @@ class EcommerceClient:
             "status": "Pending",
             "items": [{"name": line["name"], "qty": line["quantity"]} for line in resolved_items],
             "total_amount": total_amount,
+            "estimated_delivery": None,
+        }
+
+    def update_order(
+        self,
+        user_id: str,
+        order_id: str,
+        shipping_address: str | None = None,
+        item_updates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Edit an existing order's shipping_address and/or item quantities.
+
+        item_updates is a list of {"item_id": ..., "quantity": ...}: a
+        quantity of 0 removes that item from the order, any other quantity
+        upserts it (adding the item if it wasn't already on the order).
+        Every changed line is repriced at the item's *current* catalog price
+        and stock_quantity is adjusted by the delta (increased if the new
+        quantity is lower, decreased if higher) - the same per-item stock
+        check create_order() does, just against a delta instead of the full
+        quantity. subtotal/shipping_fee/total_amount are recomputed from
+        scratch afterwards using create_order()'s same free-shipping-at-999
+        rule.
+
+        Guard: only while the order is still in _EDITABLE_STATUSES (module
+        constant above) - 'pending', 'confirmed', or 'shipped'. A
+        'delivered', 'cancelled', or 'returned' order can no longer be
+        edited, same boundary cancel_order() enforces for cancellation.
+
+        Returns the same shape as get_order_details()/cancel_order()/
+        create_order() (order_id/user_id/status/items/estimated_delivery) so
+        callers (services/agents/order_tracking_agent.py's tool registry)
+        can feed any of them through the same diagnose/summarize pipeline.
+        """
+        logger.info(
+            "update_order: user_id=%s order_id=%s shipping_address=%s item_updates=%s",
+            user_id, order_id, shipping_address, item_updates,
+        )
+
+        with self.engine.begin() as conn:
+            order_row = conn.execute(
+                text("SELECT order_id, user_id, status FROM orders WHERE order_id = :order_id"),
+                {"order_id": order_id},
+            ).mappings().first()
+
+            if not order_row:
+                logger.warning("update_order: order_id=%s not found in orders table", order_id)
+                return {"error": "Order not found", "order_id": order_id}
+
+            current_status = order_row["status"].lower()
+            if current_status not in _EDITABLE_STATUSES:
+                logger.info("update_order: order_id=%s status=%s cannot be edited", order_id, current_status)
+                return {
+                    "error": f"Order is {current_status} and can no longer be edited",
+                    "order_id": order_id,
+                }
+
+            # Pass 1: validate every requested item change up front (reads
+            # only) so a failure partway through (e.g. the 2nd of 3 items is
+            # out of stock) can't leave the 1st item's change committed while
+            # rejecting the whole request - engine.begin() only rolls back on
+            # an exception, not on an early `return`.
+            resolved_updates = []
+            for update in item_updates or []:
+                item_id = update["item_id"]
+                new_quantity = update["quantity"]
+                if new_quantity < 0:
+                    return {"error": f"Invalid quantity for {item_id}: {new_quantity}"}
+
+                existing_line = conn.execute(
+                    text("SELECT quantity FROM order_items WHERE order_id = :order_id AND item_id = :item_id"),
+                    {"order_id": order_id, "item_id": item_id},
+                ).mappings().first()
+                old_quantity = existing_line["quantity"] if existing_line else 0
+
+                if new_quantity == 0:
+                    if not existing_line:
+                        return {"error": f"Item {item_id} is not part of this order", "item_id": item_id}
+                    resolved_updates.append({"item_id": item_id, "remove": True, "old_quantity": old_quantity})
+                    continue
+
+                item_row = conn.execute(
+                    text("SELECT item_id, name, price, stock_quantity, is_active FROM items WHERE item_id = :item_id"),
+                    {"item_id": item_id},
+                ).mappings().first()
+                if not item_row or not item_row["is_active"]:
+                    return {"error": f"Item not found or unavailable: {item_id}"}
+
+                delta = new_quantity - old_quantity
+                if delta > 0 and item_row["stock_quantity"] < delta:
+                    return {
+                        "error": f"Insufficient stock for {item_row['name']}: "
+                                 f"{item_row['stock_quantity']} available, {delta} more requested"
+                    }
+
+                resolved_updates.append({
+                    "item_id": item_id, "remove": False, "exists": existing_line is not None,
+                    "quantity": new_quantity, "unit_price": float(item_row["price"]), "delta": delta,
+                })
+
+            # Reject up front - before pass 2 mutates anything - if applying
+            # these changes would leave the order with zero items, so a
+            # request that removes the last item fails cleanly instead of
+            # committing the removal and then reporting an error about it.
+            existing_item_ids = {
+                row["item_id"] for row in conn.execute(
+                    text("SELECT item_id FROM order_items WHERE order_id = :order_id"),
+                    {"order_id": order_id},
+                ).mappings().all()
+            }
+            final_item_ids = set(existing_item_ids)
+            for change in resolved_updates:
+                if change["remove"]:
+                    final_item_ids.discard(change["item_id"])
+                else:
+                    final_item_ids.add(change["item_id"])
+            if not final_item_ids:
+                return {"error": "An order must contain at least one item", "order_id": order_id}
+
+            # Pass 2: apply. Every change above already passed its guard, so
+            # nothing here can fail.
+            if shipping_address is not None:
+                conn.execute(
+                    text("UPDATE orders SET shipping_address = :shipping_address WHERE order_id = :order_id"),
+                    {"shipping_address": shipping_address, "order_id": order_id},
+                )
+
+            for change in resolved_updates:
+                item_id = change["item_id"]
+                if change["remove"]:
+                    conn.execute(
+                        text("DELETE FROM order_items WHERE order_id = :order_id AND item_id = :item_id"),
+                        {"order_id": order_id, "item_id": item_id},
+                    )
+                    conn.execute(
+                        text("UPDATE items SET stock_quantity = stock_quantity + :quantity WHERE item_id = :item_id"),
+                        {"quantity": change["old_quantity"], "item_id": item_id},
+                    )
+                    continue
+
+                line_total = change["unit_price"] * change["quantity"]
+                if change["exists"]:
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE order_items SET quantity = :quantity, unit_price = :unit_price, line_total = :line_total
+                            WHERE order_id = :order_id AND item_id = :item_id
+                            """
+                        ),
+                        {"quantity": change["quantity"], "unit_price": change["unit_price"], "line_total": line_total, "order_id": order_id, "item_id": item_id},
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            """
+                            INSERT INTO order_items (order_id, item_id, quantity, unit_price, line_total)
+                            VALUES (:order_id, :item_id, :quantity, :unit_price, :line_total)
+                            """
+                        ),
+                        {"order_id": order_id, "item_id": item_id, "quantity": change["quantity"], "unit_price": change["unit_price"], "line_total": line_total},
+                    )
+                conn.execute(
+                    text("UPDATE items SET stock_quantity = stock_quantity - :delta WHERE item_id = :item_id"),
+                    {"delta": change["delta"], "item_id": item_id},
+                )
+
+            item_rows = conn.execute(
+                text(
+                    """
+                    SELECT i.name, i.item_id, oi.quantity, oi.line_total
+                    FROM order_items oi
+                    JOIN items i ON i.item_id = oi.item_id
+                    WHERE oi.order_id = :order_id
+                    """
+                ),
+                {"order_id": order_id},
+            ).mappings().all()
+
+            subtotal = sum(float(row["line_total"]) for row in item_rows)
+            shipping_fee = 0.0 if subtotal >= 999 else 49.0
+            total_amount = subtotal + shipping_fee
+            conn.execute(
+                text(
+                    """
+                    UPDATE orders
+                    SET subtotal = :subtotal, shipping_fee = :shipping_fee, total_amount = :total_amount,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = :order_id
+                    """
+                ),
+                {"subtotal": subtotal, "shipping_fee": shipping_fee, "total_amount": total_amount, "order_id": order_id},
+            )
+
+        logger.info("update_order: order_id=%s updated (status=%s)", order_id, current_status)
+        return {
+            "order_id": order_row["order_id"],
+            "user_id": order_row["user_id"],
+            "status": order_row["status"].capitalize(),
+            "items": [{"name": row["name"], "qty": row["quantity"]} for row in item_rows],
             "estimated_delivery": None,
         }
 
