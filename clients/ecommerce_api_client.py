@@ -5,6 +5,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
 try:
     from sqlalchemy import create_engine, text
 except Exception:  # pragma: no cover - optional dependency for dev/editor
@@ -65,6 +69,9 @@ class EcommerceClient:
             logger.warning("Database not reachable", exc_info=True)
             return False
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_get_order_details")
+    # --- Langfuse Integration End ---
     def get_order_details(self, user_id: str, order_id: str) -> dict[str, Any]:
         logger.info("get_order_details: user_id=%s order_id=%s", user_id, order_id)
         logger.debug("Using database URL: %s", self.engine.url)
@@ -116,6 +123,9 @@ class EcommerceClient:
             "estimated_delivery": None,
         }
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_cancel_order")
+    # --- Langfuse Integration End ---
     def cancel_order(self, user_id: str, order_id: str) -> dict[str, Any]:
         """Cancel an order in place. Returns the same shape as
         get_order_details() (order_id/user_id/status/items/estimated_delivery)
@@ -166,6 +176,9 @@ class EcommerceClient:
             "estimated_delivery": None,
         }
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_create_order")
+    # --- Langfuse Integration End ---
     def create_order(self, user_id: str, line_items: list[dict[str, Any]], shipping_address: str | None = None) -> dict[str, Any]:
         """Place a new order. line_items is a list of {"item_id": ..., "quantity": ...}.
 
@@ -259,6 +272,9 @@ class EcommerceClient:
             "estimated_delivery": None,
         }
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_delete_order")
+    # --- Langfuse Integration End ---
     def delete_order(self, user_id: str, order_id: str) -> dict[str, Any]:
         """Permanently delete an order and its line items (ON DELETE CASCADE -
         schema_sqlite.sql/schema_postgres.sql). Unlike cancel_order() (a status
@@ -322,6 +338,9 @@ class EcommerceClient:
             "estimated_delivery": None,
         }
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_get_customer_history")
+    # --- Langfuse Integration End ---
     def get_customer_history(self, user_id: str) -> dict[str, Any]:
         logger.info("get_customer_history: user_id=%s", user_id)
 
@@ -367,6 +386,9 @@ class EcommerceClient:
         )
         return {"last_purchase": last_purchase, "favorite_category": favorite_category}
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_get_customer")
+    # --- Langfuse Integration End ---
     def get_customer(self, user_id: str) -> dict[str, Any] | None:
         logger.info("get_customer: user_id=%s", user_id)
         with self.engine.connect() as conn:
@@ -384,6 +406,9 @@ class EcommerceClient:
             return None
         return dict(row)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_get_item")
+    # --- Langfuse Integration End ---
     def get_item(self, item_id: str) -> dict[str, Any] | None:
         logger.info("get_item: item_id=%s", item_id)
         with self.engine.connect() as conn:
@@ -401,6 +426,9 @@ class EcommerceClient:
             return None
         return dict(row)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_search_items")
+    # --- Langfuse Integration End ---
     def search_items(self, category: str | None = None, keyword: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
         logger.info("search_items: category=%s keyword=%s limit=%d", category, keyword, limit)
         clauses = ["is_active"]
@@ -426,6 +454,9 @@ class EcommerceClient:
         logger.debug("search_items: %d result(s)", len(rows))
         return [dict(row) for row in rows]
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_add_item")
+    # --- Langfuse Integration End ---
     def add_item(
         self,
         item_id: str,
@@ -464,6 +495,9 @@ class EcommerceClient:
         logger.info("add_item: item_id=%s added", item_id)
         return {"item_id": item_id, "name": name, "added": True}
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_remove_item")
+    # --- Langfuse Integration End ---
     def remove_item(self, item_id: str) -> dict[str, Any]:
         """Deactivate a catalog item (is_active = FALSE) rather than a hard
         DELETE - order_items.item_id has ON DELETE RESTRICT (schema_sqlite.sql),
@@ -504,6 +538,9 @@ class EcommerceClient:
         logger.info("remove_item: item_id=%s deactivated", item_id)
         return {"item_id": item_id, "removed": True}
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_list_orders_for_customer")
+    # --- Langfuse Integration End ---
     def list_orders_for_customer(self, user_id: str, limit: int = 10) -> list[dict[str, Any]]:
         logger.info("list_orders_for_customer: user_id=%s limit=%d", user_id, limit)
         with self.engine.connect() as conn:
@@ -520,6 +557,9 @@ class EcommerceClient:
         logger.debug("list_orders_for_customer: %d order(s) for user_id=%s", len(rows), user_id)
         return [dict(row) for row in rows]
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_get_popular_category")
+    # --- Langfuse Integration End ---
     def get_popular_category(self, limit: int = 1) -> list[dict[str, Any]]:
         """Categories ranked by total units sold, most popular first.
 
@@ -546,6 +586,9 @@ class EcommerceClient:
         logger.debug("get_popular_category: %d categor(y/ies)", len(rows))
         return [dict(row) for row in rows]
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_add_review")
+    # --- Langfuse Integration End ---
     def add_review(self, item_id: str, user_id: str, review_title: str, review_content: str) -> dict[str, Any]:
         """Add a review. Guard: user_id must actually have bought item_id - an
         order_items row for this item on one of their orders that isn't
@@ -585,6 +628,9 @@ class EcommerceClient:
         logger.info("add_review: review_id=%s added for item_id=%s by user_id=%s", review_id, item_id, user_id)
         return {"review_id": review_id, "item_id": item_id, "user_id": user_id, "added": True}
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="ecommerce_client_remove_review")
+    # --- Langfuse Integration End ---
     def remove_review(self, review_id: str, user_id: str) -> dict[str, Any]:
         """Delete a review. Guard: only the review's own author can delete it."""
         logger.info("remove_review: review_id=%s user_id=%s", review_id, user_id)

@@ -17,6 +17,10 @@ from typing import Callable, Optional # Added Optional
 from common.models import AgentTask, StructuredAgentResult, StructuredOrderSummary, LLMAgentReasonRequest, LLMAgentInterpretRequest
 from services.agents.base_agent import BaseAgent
 
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
 logger = logging.getLogger(__name__)
 
 ORDER_ID_PATTERN = re.compile(r"\b(\d{4,})\b")
@@ -42,7 +46,9 @@ class OrderTrackingAgent(BaseAgent):
         match = ORDER_ID_PATTERN.search(text or "")
         return match.group(1) if match else None
 
-    # (Langfuse decorator would go here, when we add it back)
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="order_tracking_agent_process_task")
+    # --- Langfuse Integration End ---
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 

@@ -12,7 +12,10 @@ and isn't shared across multiple replicas. Fine for local dev/demo; would need
 a real store (Redis, a DB table) before running more than one instance.
 """
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+# --- Langfuse Integration Start: Only import observe ---
+from langfuse import observe
+# --- Langfuse Integration End ---
 from common.models import (
     CustomerQuery, ChatbotResponse,
     RoutingRequest, AgentInvocation, AgentTask, StructuredAgentResult, NLGRequest,
@@ -55,6 +58,9 @@ class AgentOrchestratorService:
         # query skips a second LLM router call. Grows unbounded for the process lifetime.
         self.orchestrator_routing_cache: Dict[str, AgentInvocation] = {}
 
+    # --- Langfuse Integration Start: Root Trace using @observe decorator ---
+    @observe(name="orchestrator_handle_customer_query")
+    # --- Langfuse Integration End ---
     def handle_customer_query(self, query: CustomerQuery) -> ChatbotResponse:
         """Run one customer message through the full pipeline and return a reply.
 

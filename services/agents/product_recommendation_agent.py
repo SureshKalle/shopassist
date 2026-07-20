@@ -4,6 +4,9 @@ from typing import Any, Callable
 
 from common.models import AgentTask, StructuredAgentResult, StructuredProductRecommendation, LLMAgentReasonRequest
 from services.agents.base_agent import BaseAgent
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,9 @@ class ProductRecommendationAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__("ProductRecommendationAgent", *args, **kwargs)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="product_recommendation_agent_process_task")
+    # --- Langfuse Integration End ---
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         """Recommend a product, either via a direct catalog tool call or,
         failing that, the RAG-based fallback below.

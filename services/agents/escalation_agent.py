@@ -7,6 +7,10 @@ from pydantic import BaseModel # Added to check if task.params is a BaseModel
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
 
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
 logger = logging.getLogger(__name__)
 
 class EscalationAgent(BaseAgent):
@@ -17,6 +21,9 @@ class EscalationAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__("EscalationAgent", *args, **kwargs)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="escalation_agent_process_task")
+    # --- Langfuse Integration End ---
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         # Robustly handle task.params, ensuring it's a dict for .get() access
         # If task.params is a Pydantic BaseModel, convert it to a dict using .model_dump()
