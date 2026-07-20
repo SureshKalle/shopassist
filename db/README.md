@@ -103,12 +103,16 @@ customer's data to resolve.
 
 ## Switching to PostgreSQL
 
-`docker-compose.yml`'s `postgres` service spins up a local Postgres 16
-instance and loads `schema_postgres.sql` then `seed_postgres.sql`
-automatically via Postgres's `docker-entrypoint-initdb.d` mechanism — those
-two files are a straight port of the SQLite schema/seed above (same
-tables/columns/FKs, see `schema_postgres.sql`'s own header for the exact
-SQLite → Postgres adaptations).
+`docker-compose.yml`'s `postgres` service spins up a local Postgres 17
+instance (`pgvector/pgvector:pg17` - Postgres 17 with the pgvector
+extension pre-built, needed for `document_chunks`' `VECTOR(768)` column;
+see that table's own header comment in `schema_postgres.sql` - infra-ready
+for a real vector-search RAG, not read/written by `services/rag.py` yet)
+and loads `schema_postgres.sql` then `seed_postgres.sql` automatically via
+Postgres's `docker-entrypoint-initdb.d` mechanism — those two files are a
+straight port of the SQLite schema/seed above (same tables/columns/FKs,
+see `schema_postgres.sql`'s own header for the exact SQLite → Postgres
+adaptations).
 
 ```bash
 docker compose up -d postgres
@@ -127,11 +131,15 @@ or, if `api` also runs via this same `docker-compose.yml`, uncomment the
 
 **Note:** `docker-entrypoint-initdb.d` only runs on a brand-new (empty) data
 volume — editing `schema_postgres.sql`/`seed_postgres.sql` after the
-container's first start won't reapply them. To force a reload:
+container's first start won't reapply them, and neither does a Postgres
+major-version image bump (e.g. the 16 → 17 upgrade above) - old data
+directories from a different major version won't even start under a newer
+Postgres binary. To force a reload (also required once, right after that
+upgrade, for anyone with a pre-existing volume):
 
 ```bash
 docker compose down postgres
-docker volume rm shopassist-postgres-data
+docker volume rm shopassist_shopassist-postgres-data  # project-prefixed - see `docker compose config --volumes` if this repo is ever renamed/moved
 docker compose up -d postgres
 ```
 
@@ -146,15 +154,18 @@ SQLite or Postgres — it's an in-memory store regardless of `DATABASE_URL`.
 
 ## Known gaps
 
-- `main_simulation.py`'s sample queries and
-  `services/agents/order_tracking_agent.py`'s order-ID extraction regex
-  (`\b(\d{4,})\b`) only match purely numeric IDs (`"order 12345"`), not
-  business keys like `ord-1001`. A numeric-looking ID won't match any
-  seeded row.
-- `EcommerceClient.get_order_details()`'s check that the requesting
-  `user_id` actually owns the order is commented out (see the `TODO` in
-  that method) - any `user_id` can fetch any `order_id` until it's
-  re-enabled.
+- ~~`services/agents/order_tracking_agent.py`'s order-ID extraction regex
+  only matched purely numeric IDs~~ - fixed: `ORDER_ID_PATTERN` now matches
+  the full `ord-<n>` business-key format this schema actually uses, and a
+  new `_normalize_order_id()` step recovers that full form even when the
+  LLM router's own extraction strips the `ord-` prefix (its prompt's
+  example happens to be a bare number, which biased it that way - see that
+  method's docstring). This was the root cause of the intermittent
+  "sometimes can't find my order" symptom.
+- ~~`EcommerceClient.get_order_details()`'s ownership check was commented
+  out~~ - re-enabled, and extended to `cancel_order()`/`delete_order()`
+  (which never had it at all) as part of this project's guardrails - see
+  the main README's "Guardrails" section.
 
-Both are in `services/agents/` or the caller side of `clients/`, not this
-folder's schema/seed data.
+Both fixes are in `services/agents/`/`clients/`, not this folder's
+schema/seed data.

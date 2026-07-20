@@ -1,5 +1,9 @@
 -- ShopAssist :: PostgreSQL schema
--- Target: PostgreSQL 13+
+-- Target: PostgreSQL 17 (docker-compose.yml's `postgres` service runs the
+-- pgvector/pgvector:pg17 image - Postgres 17 with the pgvector extension
+-- pre-built, needed for document_chunks' embedding column below; the bare
+-- postgres image doesn't bundle it). Every table but document_chunks would
+-- still run fine on plain PostgreSQL 13+.
 -- Purpose: production-like database, swapped in for the SQLite dev DB via
 -- DATABASE_URL (see .env.example, db/README.md).
 --
@@ -27,6 +31,10 @@
 -- Loaded automatically on first container start via
 -- docker-entrypoint-initdb.d (see docker-compose.yml's postgres service) -
 -- alongside seed_postgres.sql, which runs after this file.
+
+-- Needed for document_chunks' embedding column near the end of this file -
+-- see that table's own header comment.
+CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ---------------------------------------------------------------------------
 -- customers
@@ -142,6 +150,35 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 
 -- ---------------------------------------------------------------------------
+-- document_chunks
+-- ---------------------------------------------------------------------------
+-- Backing store for a real vector-search-based RAG, matching
+-- shopassist-database's own document_chunks table 1:1 (same columns/types)
+-- so both projects agree on shape. Infra-ready only, added alongside the
+-- Postgres 16 -> 17/pgvector upgrade above: `services/rag.py`'s
+-- MockRAGService still does in-memory substring matching today and doesn't
+-- read or write this table yet - see README.md's Known Gaps. Column shape
+-- mirrors common/models.py's ChunkedDocument 1:1 (doc_id/content/embedding/
+-- source_type/metadata) so a future real RAG service needs no ID/field
+-- translation at this boundary.
+--
+-- embedding is a fixed VECTOR(768) - nomic-embed-text's output dimension
+-- (the embedding model already bundled via the `ollama` service) - pgvector
+-- rejects any INSERT whose vector isn't exactly this width.
+CREATE TABLE IF NOT EXISTS document_chunks (
+    doc_id          VARCHAR(255)  PRIMARY KEY,
+    content         TEXT          NOT NULL,
+    embedding       VECTOR(768)   NOT NULL,
+    source_type     VARCHAR(50)   NOT NULL,
+    metadata        JSONB         NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+COMMENT ON TABLE document_chunks IS 'Chunked text + embeddings for a future vector-search RAG (product catalog, support policy, conversation history) - not yet read/written by services/rag.py.';
+COMMENT ON COLUMN document_chunks.embedding IS 'nomic-embed-text output dimension (768) via the bundled ollama service - see docker-compose.yml.';
+
+-- ---------------------------------------------------------------------------
 -- Indexes
 -- ---------------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_items_category         ON items(category);
@@ -152,3 +189,11 @@ CREATE INDEX IF NOT EXISTS idx_orders_user_id          ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status           ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_order_items_order_id    ON order_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_order_items_item_id     ON order_items(item_id);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_source_type ON document_chunks(source_type);
+
+-- HNSW over IVFFlat: no list-count "training" step needed, good recall/
+-- latency out of the box at this project's scale. Cosine ops since
+-- nomic-embed-text is designed to be compared by cosine similarity - same
+-- choice shopassist-database's own indexes.sql makes for this table.
+CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding
+    ON document_chunks USING hnsw (embedding vector_cosine_ops);

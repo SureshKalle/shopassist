@@ -1,16 +1,31 @@
-# ShopAssist :: FastAPI backend, standalone.
+# ShopAssist :: capstone stack, self-contained.
 #
-# `docker compose up` from inside this repo alone builds and runs just this
-# container - same pattern as shopassist-client's own docker-compose.yml.
-# shopassist-devops's root docker-compose.yml `include:`s this file and
-# layers the platform network + real Ollama/Postgres URLs on top. The
-# service key is `api` (not `shopassist-api`) to match that override.
+# `docker compose up -d --build` from inside this repo alone brings up the
+# whole capstone-relevant stack in one command: `api`, its Postgres DB, the
+# sentiment/topic classifier, AND a bundled Ollama already stocked with a
+# small Llama model - a brand-new developer needs nothing else installed.
+# No need to separately run shopassist-devops's, shopassist-database's, or
+# shopassist-model's own compose files. Only shopassist-model is still
+# touched, and only as a build-time source (see `classifier`/
+# `classifier-bootstrap` and `ollama-bootstrap` below, which build
+# `../shopassist-model/classifier` and `../shopassist-model/generative`
+# unmodified) - it's never `docker compose up`'d on its own for this to work.
 #
-# Standalone, this container reaches Ollama on the host via
-# host.docker.internal. Leave DATABASE_URL unset to use the disposable
-# SQLite dev DB rebuilt on every start (see Dockerfile) - or point it at
-# the `postgres` service below for a real Postgres instance, local to this
-# compose file (independent of shopassist-devops's own Postgres).
+# Deliberately NOT folded in here (by design, run separately):
+# - Gemini - a cloud API, not a container; only needs GEMINI_API_KEY set.
+#
+# Already have Ollama running on your machine and don't want a second,
+# containerized one? See README.md's "Switching Ollama" section - a
+# two-line `.env` change (comment out COMPOSE_PROFILES, point
+# OLLAMA_API_BASE_URL at host.docker.internal) skips `ollama`/
+# `ollama-bootstrap` below entirely and talks to your existing one instead.
+#
+# shopassist-devops's root docker-compose.yml can still `include:` this
+# file standalone-project-style and layer its own platform network / real
+# Ollama URL on top if you're running the full multi-repo platform instead
+# of just this capstone slice - the service key is `api` (not
+# `shopassist-api`) to match that override. Independent of that: this file
+# alone is a complete, self-sufficient stack.
 #
 # Use `docker compose up -d --build`, not plain `up -d`: the image is a
 # one-time snapshot of the source tree, so without --build this silently
@@ -34,22 +49,61 @@ services:
       # this compose file works standalone with no other setup.
       API_KEY: ${API_KEY:-}
       API_KEY_ENFORCE: ${API_KEY_ENFORCE:-false}
-      CHAT_REQUEST_TIMEOUT_SECONDS: ${CHAT_REQUEST_TIMEOUT_SECONDS:-60}
+      # 360, not a shorter default - see .env.example's own comment on this
+      # var: the shipped fully-local *_PROVIDER config makes 4 sequential
+      # CPU-only LLM calls per request, measured at ~200s end to end.
+      CHAT_REQUEST_TIMEOUT_SECONDS: ${CHAT_REQUEST_TIMEOUT_SECONDS:-360}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-30}
-      OLLAMA_API_BASE_URL: http://host.docker.internal:11434
-      # Must name a model actually pulled into that Ollama instance (see .env.example).
-      OLLAMA_ROUTER_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
-      OLLAMA_AGENT_REASON_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
-      OLLAMA_AGENT_INTERPRET_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
-      OLLAMA_GENERATIVE_MODEL: ${SHOPASSIST_MODEL:-llama3.1:8b}
+      # Defaults to the bundled `ollama` service below (by service name, same
+      # network) - unset in .env, same reasoning as CLASSIFIER_API_BASE_URL:
+      # a literal "localhost" from .env would mean this container itself,
+      # not the ollama container. See README.md's "Switching Ollama" section
+      # to point this at host.docker.internal:11434 instead.
+      OLLAMA_API_BASE_URL: ${OLLAMA_API_BASE_URL:-http://ollama:11434}
+      # llama3.2:3b - already pulled into the shopassist-ollama-models volume
+      # (see `ollama`/`ollama-bootstrap` below), so no fresh download on
+      # first `docker compose up`. Change SHOPASSIST_MODEL to use a
+      # different tag (must be pulled into whichever Ollama you point at).
+      OLLAMA_ROUTER_MODEL: ${SHOPASSIST_MODEL:-llama3.2:3b}
+      OLLAMA_AGENT_REASON_MODEL: ${SHOPASSIST_MODEL:-llama3.2:3b}
+      OLLAMA_AGENT_INTERPRET_MODEL: ${SHOPASSIST_MODEL:-llama3.2:3b}
+      OLLAMA_GENERATIVE_MODEL: ${SHOPASSIST_MODEL:-llama3.2:3b}
       OLLAMA_EMBEDDING_MODEL: nomic-embed-text
-      # Left unset (not blank - see .env.example) to use the disposable
-      # SQLite dev DB. Uncomment for the `postgres` service below (same
-      # compose network, so the hostname is the service name, not
-      # host.docker.internal):
-      # DATABASE_URL: postgresql://shopassist:shopassist123@postgres:5432/shopassist
+      # Hybrid local/cloud routing (services/llm_inference.py) - each role
+      # defaults to "local" (Ollama, above) same as .env.example. These were
+      # missing from this list entirely, so setting them in the host .env
+      # had no effect on the container until they were added here -
+      # docker compose only injects vars that are explicitly referenced in
+      # this environment: block, it doesn't forward the whole .env file.
+      GENERATIVE_PROVIDER: ${GENERATIVE_PROVIDER:-local}
+      ROUTER_PROVIDER: ${ROUTER_PROVIDER:-local}
+      AGENT_REASON_PROVIDER: ${AGENT_REASON_PROVIDER:-local}
+      AGENT_INTERPRET_PROVIDER: ${AGENT_INTERPRET_PROVIDER:-local}
+      # Required only once some *_PROVIDER above is "gemini" - see
+      # services/llm_inference.py::_gemini_client(). Blank (not omitted) by
+      # default so this compose file still works standalone with no key.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_API_BASE_URL: ${GEMINI_API_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/openai/}
+      GEMINI_GENERATIVE_MODEL: ${GEMINI_GENERATIVE_MODEL:-gemini-2.5-flash}
+      # Points at the `postgres` service below by service name (same
+      # compose network, not host.docker.internal) - this container always
+      # runs against real Postgres, never the SQLite dev DB (that fallback
+      # in clients/ecommerce_api_client.py only matters when DATABASE_URL is
+      # unset, e.g. running this API on the host outside Docker).
+      DATABASE_URL: postgresql://shopassist:shopassist123@postgres:5432/shopassist
+      # shopassist-model's encoder-family classifier service (sentiment +
+      # zero-shot topic classification, services/classifier_client.py) -
+      # `classifier` service below, same compose network, so by service
+      # name rather than localhost:8100 (that default is for running this
+      # API on the host against shopassist-model's own standalone compose
+      # instead - see that repo's README "Connecting shopassist to this
+      # service" section). Fails soft if unreachable, same as before.
+      CLASSIFIER_API_BASE_URL: http://classifier:8000
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    depends_on:
+      classifier:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
       interval: 15s
@@ -59,13 +113,27 @@ services:
     networks:
       - shopassist-api-network
 
-  # Standalone Postgres for local dev - swap DATABASE_URL (api service
-  # above, or your host-side .env for running api outside Docker) to point
-  # here instead of the default SQLite dev DB. Independent of
-  # shopassist-devops's own Postgres; not started by shopassist-devops's
-  # compose file at all, only by this one.
+  # Postgres for this capstone stack - `api` above already points at it by
+  # default. Independent of shopassist-devops's and shopassist-database's
+  # own Postgres containers/volumes; not started by either of those compose
+  # files, only by this one. Point your host-side .env at this same
+  # localhost:5432 to run api outside Docker against it instead.
+  #
+  # pgvector/pgvector:pg17, not the bare postgres image - Postgres 17 with
+  # the pgvector extension pre-built, needed for document_chunks'
+  # VECTOR(768) column (db/schema_postgres.sql) - infra-ready for a real
+  # vector-search RAG later; services/rag.py's MockRAGService doesn't read
+  # or write it yet, so this is a version/capability upgrade only, no
+  # change to today's chat behavior. Official image maintained by the
+  # pgvector project, matching shopassist-database's own choice.
+  #
+  # Major-version bump from the previous postgres:16-alpine - Postgres data
+  # directories aren't compatible across major versions, so an existing
+  # shopassist-postgres-data volume from before this change needs dropping
+  # (`docker compose down -v`, or `docker volume rm` just that one) before
+  # `docker compose up` will start cleanly; see db/README.md.
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg17
     container_name: shopassist-postgres
     restart: unless-stopped
     environment:
@@ -91,9 +159,126 @@ services:
     networks:
       - shopassist-api-network
 
+  # --- Bundled Ollama, so this repo's `docker compose up` needs no
+  # separately-installed Ollama for a first run - build/config copied from
+  # shopassist-model/generative unmodified, see that repo's README for the
+  # "Choosing a chat model" background. `profiles: [bundled-ollama]` (active
+  # by default via COMPOSE_PROFILES in .env) is the on/off switch: comment
+  # that out to skip both services below entirely and use a host Ollama
+  # instead - see README.md's "Switching Ollama" section. ---
+  ollama:
+    image: ollama/ollama:${OLLAMA_IMAGE_TAG:-latest}
+    container_name: shopassist-ollama
+    restart: unless-stopped
+    profiles: ["bundled-ollama"]
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - shopassist-ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # Capstone-laptop-sized default - see shopassist-model's README's
+          # "Scaling to production" section before raising this.
+          memory: ${OLLAMA_MEMORY_LIMIT:-6g}
+    networks:
+      - shopassist-api-network
+
+  # One-shot job: pulls whatever's listed in config/generative.yaml (this
+  # repo's own copy - see that file's header) into `ollama` above, then
+  # exits. Safe to re-run: Ollama skips a tag it already has, so this is
+  # near-instant after the first `docker compose up`.
+  ollama-bootstrap:
+    build:
+      context: ../shopassist-model/generative
+    container_name: shopassist-ollama-bootstrap
+    profiles: ["bundled-ollama"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      GENERATIVE_CONFIG: /app/config/generative.yaml
+    volumes:
+      - ./config:/app/config:ro
+    networks:
+      - shopassist-api-network
+    restart: "no"
+
+  # --- shopassist-model's encoder-family classifier, folded in so this
+  # repo's own `docker compose up` is a complete, single-command,
+  # end-to-end stack (same idea as `postgres` above) - build
+  # context/config/code copied from shopassist-model/classifier and
+  # shopassist-model/config unmodified, see that repo's README's "Encoder
+  # models" section for what these two models do and why they're served
+  # outside Ollama. ---
+  #
+  # One-shot job: downloads the encoder models into the shared HF cache
+  # volume, then exits. `classifier` below waits for it to finish rather
+  # than starting concurrently - a cold download racing the server's own
+  # startup would otherwise make its first request wait on an
+  # incompletely-cached model.
+  classifier-bootstrap:
+    build:
+      context: ../shopassist-model/classifier
+    container_name: shopassist-classifier-bootstrap
+    environment:
+      CLASSIFIERS_CONFIG: /app/config/classifiers.yaml
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ../shopassist-model/config:/app/config:ro
+      - shopassist-classifier-models:/root/.cache/huggingface
+    command: ["python", "bootstrap.py"]
+    networks:
+      - shopassist-api-network
+    restart: "no"
+
+  classifier:
+    build:
+      context: ../shopassist-model/classifier
+    container_name: shopassist-classifier
+    restart: unless-stopped
+    depends_on:
+      classifier-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      CLASSIFIERS_CONFIG: /app/config/classifiers.yaml
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ../shopassist-model/config:/app/config:ro
+      - shopassist-classifier-models:/root/.cache/huggingface
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${CLASSIFIER_PORT:-8100}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${CLASSIFIER_MEMORY_LIMIT:-4g}
+    networks:
+      - shopassist-api-network
+
 networks:
   shopassist-api-network:
     name: shopassist-api-network
 
 volumes:
   shopassist-postgres-data:
+  # name (not external) - created fresh on a clean machine, or reused
+  # as-is if shopassist-model already populated it, same convention that
+  # repo's own docker-compose.yml uses for both volumes below.
+  shopassist-classifier-models:
+    name: shopassist-classifier-models
+  shopassist-ollama-models:
+    name: shopassist-ollama-models

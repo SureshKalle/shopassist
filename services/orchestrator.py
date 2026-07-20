@@ -26,6 +26,7 @@ from common.models import (
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
 from services.classifier_client import ClassifierClient
+from services.guardrails import GuardrailService
 from services.agents.base_agent import BaseAgent  # for type hinting the agents dict
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,8 @@ class AgentOrchestratorService:
     conversation history, and final customer-facing natural language synthesis.
     """
     def __init__(self, llm_inference_client: LLMInferenceService, pii_masker: PIIMasker,
-                 agents: Dict[str, BaseAgent], classifier_client: ClassifierClient = None):
+                 agents: Dict[str, BaseAgent], classifier_client: ClassifierClient = None,
+                 guardrail_service: GuardrailService = None):
         self.llm_inference_client = llm_inference_client
         self.pii_masker = pii_masker
         self.agents = agents  # agent_name -> agent instance (see api/dependencies.py get_agents())
@@ -45,6 +47,11 @@ class AgentOrchestratorService:
         # default until that's started separately - see ClassifierClient's
         # fail-soft behaviour) rather than requiring every caller to build one.
         self.classifier_client = classifier_client or ClassifierClient()
+        # Stateless rule-based checks (services/guardrails.py) - defaults the
+        # same way classifier_client does, so existing callers
+        # (api/dependencies.py, main_simulation.py) need no changes to get
+        # guardrails for free.
+        self.guardrail_service = guardrail_service or GuardrailService()
         # Per-session conversation turns, oldest first. Not persisted anywhere.
         self.conversation_history_db: Dict[str, List[Message]] = {}
         # Last agent/result per session - currently write-only, no reader consults it yet.
@@ -109,23 +116,43 @@ class AgentOrchestratorService:
         current_history: List[Message] = [Message(**m) if isinstance(m, dict) else m for m in current_history_raw]
         current_history.append(Message(role="user", content=masked_query.masked_text))
 
+        # 2.5. Input guardrail (services/guardrails.py) - screens for blatant
+        # prompt-injection/jailbreak attempts before anything reaches the LLM
+        # router. A block substitutes the routing decision below with
+        # EscalationAgent instead of special-casing control flow - the same
+        # agent-run -> NLG path every other route already takes, so the
+        # customer still gets a natural reply, just never gets to the router
+        # or a specialist agent.
+        input_verdict = self.guardrail_service.screen_input(masked_query.masked_text)
+
         # 3. Route to a specialist agent. Cache hit skips a second LLM call for an
         # identical masked query (e.g. a user resending the same message).
-        logger.debug("Consulting orchestrator routing cache...")
-        routing_key = masked_query.masked_text  # simple key; could incorporate user_id if needed
         agent_invocation: AgentInvocation
-        if routing_key in self.orchestrator_routing_cache:
-            agent_invocation = self.orchestrator_routing_cache[routing_key]
-            logger.debug("Routing cache hit for session_id=%s", session_id)
-        else:
-            logger.debug("Routing cache miss - calling the LLM router")
-            routing_request = RoutingRequest(
-                session_id=session_id,
-                conversation_history=current_history,
-                current_query=masked_query.masked_text
+        if input_verdict.blocked:
+            logger.warning(
+                "Routing bypassed - input guardrail blocked this message: session_id=%s category=%s",
+                session_id, input_verdict.category,
             )
-            agent_invocation = self.llm_inference_client.call_router(routing_request)
-            self.orchestrator_routing_cache[routing_key] = agent_invocation
+            agent_invocation = AgentInvocation(
+                agent_name="EscalationAgent",
+                confidence=1.0,
+                parameters={"reason": f"Blocked by input guardrail (category={input_verdict.category})"},
+            )
+        else:
+            logger.debug("Consulting orchestrator routing cache...")
+            routing_key = masked_query.masked_text  # simple key; could incorporate user_id if needed
+            if routing_key in self.orchestrator_routing_cache:
+                agent_invocation = self.orchestrator_routing_cache[routing_key]
+                logger.debug("Routing cache hit for session_id=%s", session_id)
+            else:
+                logger.debug("Routing cache miss - calling the LLM router")
+                routing_request = RoutingRequest(
+                    session_id=session_id,
+                    conversation_history=current_history,
+                    current_query=masked_query.masked_text
+                )
+                agent_invocation = self.llm_inference_client.call_router(routing_request)
+                self.orchestrator_routing_cache[routing_key] = agent_invocation
 
         logger.info(
             "Routing decision: agent=%s confidence=%s",
@@ -198,6 +225,14 @@ class AgentOrchestratorService:
 
         final_nlg_output: FinalNLGOutput = self.llm_inference_client.call_generative(nlg_request)
         final_response_text = final_nlg_output.response_text
+
+        # 5.5. Output guardrail (services/guardrails.py) - the counterpart to
+        # step 1's input-side PII masking: scans what the LLM actually
+        # generated (which can echo back a tool result or a shipping
+        # address) for PII/secret-shaped substrings and redacts any hit
+        # before it reaches the customer.
+        output_verdict = self.guardrail_service.screen_output(final_response_text)
+        final_response_text = output_verdict.safe_text
 
         # 6. Persist the turn and return. conversation_history_db/agent_state_store
         # are per-process only (see class docstring) - both reset on restart.
