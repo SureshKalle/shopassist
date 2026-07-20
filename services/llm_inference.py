@@ -45,6 +45,10 @@ from common.models import (
     OrderIssueAnalysis,    
     FinalNLGOutput                
 )
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -234,6 +238,9 @@ class LLMInferenceService:
                 schema=schema, temperature=temperature, seed=seed,
             )
 
+    # --- Langfuse Integration Start: @observe decorator for call_router ---
+    @observe(name="llm_inference_call_router")
+    # --- Langfuse Integration End ---
     def call_router(self, request: RoutingRequest) -> AgentInvocation:
         """Decide which specialist agent should handle this query.
 
@@ -305,6 +312,9 @@ class LLMInferenceService:
                 parameters={"original_query": request.current_query, "error": f"LLM routing general error: {e}"}
             )
 
+    # --- Langfuse Integration Start: @observe decorator for call_agent_reason ---
+    @observe(name="llm_inference_call_agent_reason")
+    # --- Langfuse Integration End ---
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
         logger.info("call_agent_reason: provider=%s model=%s agent=%s", self.agent_reason_provider, self.agent_reason_model, request.agent_name)
 
@@ -396,7 +406,9 @@ class LLMInferenceService:
                 thought=f"LLM agent-reason general error: {e}"
             )
 
-
+    # --- Langfuse Integration Start: @observe decorator for call_agent_interpret ---
+    @observe(name="llm_inference_call_agent_interpret")
+    # --- Langfuse Integration End ---
     def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
         """Turn a tool's raw output into a structured diagnosis.
 
@@ -468,6 +480,9 @@ class LLMInferenceService:
                 thought=f"LLM agent-interpret general error for goal '{request.interpretation_goal}'"
             )
     
+    # --- Langfuse Integration Start: @observe decorator for call_agent_generate ---
+    @observe(name="llm_inference_call_agent_generate")
+    # --- Langfuse Integration End ---
     def call_agent_generate(self, request: LLMAgentReasonRequest) -> AgentGenerationOutput:
         """Generate a short natural-language snippet for a single agent-level task.
 
@@ -529,7 +544,10 @@ class LLMInferenceService:
                 confidence=0.0, # Zero confidence for general errors
                 context_used=[f"LLM general error: {e}"]
             )
-        
+
+    # --- Langfuse Integration Start: @observe decorator for call_generative ---
+    @observe(name="llm_inference_call_generative")
+    # --- Langfuse Integration End ---  
     def call_generative(self, request: NLGRequest) -> FinalNLGOutput:
         """Synthesize the final customer-facing reply from the agent's result(s).
 
@@ -681,6 +699,9 @@ class LLMInferenceService:
                 confidence=0.0
             )
 
+    # --- Langfuse Integration Start: @observe decorator for call_embeddings ---
+    #@observe(name="llm_inference_call_embeddings")
+    # --- Langfuse Integration End ---
     def call_embeddings(self, text: str) -> List[float]:
         """Return a vector for `text`, used by services/rag.py for similarity search.
 

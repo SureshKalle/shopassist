@@ -29,6 +29,12 @@ from services.agents.general_purpose_agent import GeneralPurposeAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.orchestrator import AgentOrchestratorService
 
+# --- Langfuse Integration Start ---
+from common.langfuse_config import initialize_langfuse_client, get_langfuse_client_instance
+# No need to import `get_client` from `langfuse` itself if we only use `get_langfuse_client_instance`
+# from langfuse import get_client as get_langfuse_context_client # Alias to avoid conflict if `get_client` is used elsewhere
+# --- Langfuse Integration End ---
+
 # Same LOG_LEVEL convention api/main.py uses - the services/ layer logs via
 # the standard `logging` module now (see e.g. clients/ecommerce_api_client.py),
 # so this is required for those log lines to actually show up when running
@@ -44,6 +50,12 @@ logging.basicConfig(
 
 if __name__ == "__main__":
     print("--- Initializing Chatbot System Components ---")
+
+    # --- Langfuse Integration Start: Initialize Client ---
+    print("--- Initializing Langfuse Client ---")
+    initialize_langfuse_client()
+    print("--- Langfuse Client Initialized ---")
+    # --- Langfuse Integration End ---
 
     # 0. Initialize/Rebuild the local dev DB (schema + seed data)
     build_db()
@@ -114,21 +126,21 @@ if __name__ == "__main__":
     # api/routers/chat.py needs no such hardcode - it already takes user_id
     # straight from the request, since shopassist-client sends one at login.
 
-    ## Interaction 1: Order Status
-    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    #customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order ord-1001.")
-    #print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
-    #response_1 = orchestrator.handle_customer_query(customer_query_1)
-    #print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
-    #print("-" * 80)
+    #Interaction 1: Order Status
+    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    customer_query_1 = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="Hi, I'd like to check my order status for order ord-1001.")
+    print(f"\n>>> Customer: '{customer_query_1.text}' (Session: {customer_query_1.session_id})")
+    response_1 = orchestrator.handle_customer_query(customer_query_1)
+    print(f"\n<<< Chatbot: '{response_1.response_text}' (Agent: {response_1.agent_invoked})")
+    print("-" * 80)
 
     # Interaction 2: Order Deletion
-    current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
-    customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="alum-1003", text="Hi, I dont need this order ord-1003.")
-    print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
-    response_2 = orchestrator.handle_customer_query(customer_query_2)
-    print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
-    print("-" * 80)
+    #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
+    #customer_query_2 = CustomerQuery(session_id=current_session_id, user_id="alum-1003", text="Hi, I dont need this order ord-1003.")
+    #print(f"\n>>> Customer: '{customer_query_2.text}' (Session: {customer_query_2.session_id})")
+    #response_2 = orchestrator.handle_customer_query(customer_query_2)
+    #print(f"\n<<< Chatbot: '{response_2.response_text}' (Agent: {response_2.agent_invoked})")
+    #print("-" * 80)
 
     # Interaction 2: Product Recommendation
     #current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
@@ -163,3 +175,14 @@ if __name__ == "__main__":
     #print("-" * 80)
 
     print("\n--- Simulation Complete ---")
+
+     # --- Langfuse Integration Start: Flush Traces ---
+    # For a short-lived script like main_simulation, an explicit flush
+    # ensures all traces are sent before the program exits, providing immediate feedback.
+    print("--- Flushing Langfuse traces ---")
+    langfuse_client = get_langfuse_client_instance()
+    if langfuse_client:
+        langfuse_client.flush()
+        # Removed: langfuse_client.wait_for_flush()
+    print("--- Langfuse traces flushed ---")
+    # --- Langfuse Integration End ---

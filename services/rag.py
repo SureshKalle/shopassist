@@ -11,6 +11,9 @@ import logging
 from typing import List, Dict
 from common.models import ChunkedDocument
 from services.llm_inference import LLMInferenceService # To get embeddings
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,9 @@ class MockRAGService:
         self.rag_query_cache: Dict[str, List[ChunkedDocument]] = {}
         self.llm_inference_client = llm_inference_client
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="rag_service_query_knowledge_base")
+    # --- Langfuse Integration End ---
     def query_knowledge_base(self, query_embedding: List[float], query_text: str, top_k: int = 1) -> List[ChunkedDocument]:
         """Return up to `top_k` documents matching `query_text`.
 
@@ -63,6 +69,9 @@ class MockRAGService:
         logger.info("query_knowledge_base: %d result(s) for %r", len(results[:top_k]), query_text)
         return results[:top_k]
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="rag_service_ingest_document")
+    # --- Langfuse Integration End ---
     def ingest_document(self, doc: ChunkedDocument):
         """
         Ingests a chunked document into the RAG vector database.

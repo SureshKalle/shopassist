@@ -4,6 +4,10 @@ import logging
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
 
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
 logger = logging.getLogger(__name__)
 
 class GeneralPurposeAgent(BaseAgent):
@@ -14,6 +18,9 @@ class GeneralPurposeAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__("GeneralPurposeAgent", *args, **kwargs)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="general_purpose_agent_process_task")
+    # --- Langfuse Integration End ---
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 
