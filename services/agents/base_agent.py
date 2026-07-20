@@ -10,7 +10,7 @@ EcommerceClient, query the RAG store, or ask the LLM to reason/interpret.
 from abc import ABC, abstractmethod
 from common.models import AgentTask, StructuredAgentResult
 from services.llm_inference import LLMInferenceService
-from services.rag import MockRAGService
+from services.rag import RAGService
 from clients.ecommerce_api_client import EcommerceClient
 from services.pii_masker import PIIMasker
 
@@ -19,7 +19,7 @@ class BaseAgent(ABC):
     Abstract Base Class for all Specialized AI Agents.
     Defines the common interface and shared dependencies.
     """
-    def __init__(self, name: str, llm_inference_client: LLMInferenceService, rag_service: MockRAGService,
+    def __init__(self, name: str, llm_inference_client: LLMInferenceService, rag_service: RAGService,
                  ecommerce_api_client: EcommerceClient, pii_masker: PIIMasker):
         self.name = name
         self.llm_inference_client = llm_inference_client
