@@ -63,7 +63,7 @@ if __name__ == "__main__":
     # --- Langfuse Integration End ---
 
     # 0. Initialize/Rebuild the local dev DB (schema + seed data)
-    build_db()
+    #build_db()
     
     # 1. Initialize Core Services
     pii_masker = PIIMasker()
@@ -126,7 +126,7 @@ if __name__ == "__main__":
 
     # --- MODIFIED: Ingest PDF documents (from user-provided 'docs' folder) ---
     # Check if there are any PDF files in the default docs folder
-    """ pdf_files_in_docs_folder = [f for f in os.listdir(DEFAULT_DOCS_FOLDER) if f.lower().endswith(".pdf")]
+    pdf_files_in_docs_folder = [f for f in os.listdir(DEFAULT_DOCS_FOLDER) if f.lower().endswith(".pdf")]
     
     if pdf_files_in_docs_folder:
         print(f"\n--- Ingesting PDF Documents from '{DEFAULT_DOCS_FOLDER}' for RAG Knowledge Base ---")
@@ -157,8 +157,8 @@ if __name__ == "__main__":
         print(f"Ingested {num_pdf_chunks} chunks from PDF documents into RAG.")
         print(f"Total RAG doc_store size after PDF ingestion: {len(rag_service.doc_store)} documents.")
     else:
-        print(f"\n--- Skipping PDF ingestion: No PDF files found in '{DEFAULT_DOCS_FOLDER}'. Please add PDFs there to enable this. ---") """
-    # --- END MODIFIED ---
+        print(f"\n--- Skipping PDF ingestion: No PDF files found in '{DEFAULT_DOCS_FOLDER}'. Please add PDFs there to enable this. ---") 
+    # --- END MODIFIED --- 
 
     # Synthetic E-commerce Queries
     synthetic_queries = data_pipeline.generate_synthetic_queries(["Where is my shipment?", "Suggest a gift.", "How do I return an item?"])
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     # --- NEW ACTIVE INTERACTION: Query about RAG-ingested policy (unconditional) ---
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
     # This query is designed to hit the policy info from the ingested data (product catalog, customer conversations, OR PDFs)
-    customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is your domestic shipping policy?")
+    customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is your domestic shipping policy and Where is my order ord-1001?")
     print(f"\n>>> Customer (RAG Test): '{customer_query_rag_test.text}' (Session: {customer_query_rag_test.session_id})")
     response_rag_test = orchestrator.handle_customer_query(customer_query_rag_test)
     print(f"\n<<< Chatbot (RAG Test): '{response_rag_test.response_text}' (Agent: {response_rag_test.agent_invoked})")

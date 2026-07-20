@@ -92,6 +92,7 @@ class OrderTrackingAgent(BaseAgent):
         # Resolve order_id at the very beginning to avoid NameError
         resolved_order_id: Optional[str] = task.params.get('order_id') or self._extract_order_id(task.original_query)
         resolved_order_id = self._normalize_order_id(resolved_order_id, task.original_query)
+        logger.debug("OrderTrackingAgent: Initial resolved_order_id=%s from task.params/query", resolved_order_id) 
         logger.info("Resolved order_id=%s user_id=%s", resolved_order_id, user_id)
 
         # Tool registry:
@@ -130,6 +131,7 @@ class OrderTrackingAgent(BaseAgent):
             
             if invoked_tool_identifier in tools:
                 raw_order_details = tools[invoked_tool_identifier]()
+                logger.debug("OrderTrackingAgent: Raw order details from ECommerceClient: %s", raw_order_details)
                 logger.info("EcommerceClient returned: %s", raw_order_details)
             else:
                 logger.warning(

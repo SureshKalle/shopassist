@@ -27,6 +27,7 @@ callers never need to handle an LLM-specific exception themselves.
 import logging
 import os
 from typing import List, Optional, Type, TypeVar
+from anyio import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -46,13 +47,16 @@ from common.models import (
     GeneralPurposeAnswer,
     EscalationDetails,
     OrderIssueAnalysis,
-    FinalNLGOutput
+    FinalNLGOutput,
+    DecomposedQuery, DecomposedSubTask # For task decomposition
 )
 # --- Langfuse Integration Start ---
 from langfuse import observe
 # --- Langfuse Integration End ---
 
-load_dotenv()
+os.environ["OLLAMA_EMBEDDING_MODEL"] = "nomic-embed-text:latest"
+
+load_dotenv(override=True)  # Load .env file, allowing overrides from the environment
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +95,13 @@ class LLMInferenceService:
         # isn't listed here: it's a deterministic stub today (see its
         # docstring), not a real model call, so there's no client to route yet.
         self.router_client, self.router_model, self.router_mode, self.router_provider, self.router_local_model = self._resolve_role(
-            "ROUTER", "llama3:8b-instruct", "gemini-2.5-flash"
+            "ROUTER", "llama3.2:latest", "gemini-2.5-flash"
         )
         self.agent_reason_client, self.agent_reason_model, self.agent_reason_mode, self.agent_reason_provider, self.agent_reason_local_model = self._resolve_role(
-            "AGENT_REASON", "llama3:8b-instruct", "gemini-2.5-flash"
+            "AGENT_REASON", "llama3.2:latest", "gemini-2.5-flash"
         )
         self.agent_interpret_client, self.agent_interpret_model, self.agent_interpret_mode, self.agent_interpret_provider, self.agent_interpret_local_model = self._resolve_role(
-            "AGENT_INTERPRET", "llama3:8b-instruct", "gemini-2.5-flash"
+            "AGENT_INTERPRET", "llama3.2:latest", "gemini-2.5-flash"
         )
         # Shared by call_generative() and call_agent_generate() - both
         # already used the same self.generative_model before this refactor.
@@ -106,11 +110,21 @@ class LLMInferenceService:
         #           to "llama3.2:latest" or ensure it's set via OLLAMA_GENERATIVE_MODEL env var.
         #           The traceback suggests it's trying to use llama3.2:latest for generative.
         self.generative_client, self.generative_model, self.generative_mode, self.generative_provider, self.generative_local_model = self._resolve_role(
-            "GENERATIVE", "llama3:8b-instruct", "gemini-2.5-pro"
+            "GENERATIVE", "llama3.2:latest", "gemini-2.5-pro"
         )
         # --- END NOTE ---
+        # --- NEW LLM ROLE FOR DECOMPOSER ---
+        self.decomposer_client, self.decomposer_model, self.decomposer_mode, self.decomposer_provider, self.decomposer_local_model = self._resolve_role(
+            "DECOMPOSER", "llama3.2:latest", "gemini-2.5-pro" # Use a capable model for decomposition
+        )
+        # --- END NEW LLM ROLE ---
 
-        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        logger.info(f"DEBUG PATH: Current Working Directory is: {os.getcwd()}")
+        logger.info(f"DEBUG PATH: Expected .env path would be: {Path(os.getcwd()) / '.env'}")
+        logger.info(f"DEBUG ENV: Raw system value before assignment: {os.environ.get('OLLAMA_EMBEDDING_MODEL')}")
+        
+        self.embedding_model =  "nomic-embed-text"
+        logger.info(f"DEBUG: LLMInferenceService.embedding_model (from env) is: {self.embedding_model}")
 
         # One line, always at INFO regardless of LOG_LEVEL, showing exactly
         # which provider/model handles each pipeline step for this process -
@@ -118,12 +132,13 @@ class LLMInferenceService:
         # took effect without digging through per-request logs.
         # --- MODIFIED LOGGING HERE ---
         logger.info(
-            "LLMInferenceService ready | ROUTER=%s:%s AGENT_REASON=%s:%s AGENT_INTERPRET=%s:%s GENERATIVE=%s:%s EMBEDDING=ollama:%s",
+            "LLMInferenceService ready | ROUTER=%s:%s DECOMPOSER=%s:%s AGENT_REASON=%s:%s AGENT_INTERPRET=%s:%s GENERATIVE=%s:%s EMBEDDING=ollama:%s",
             self.router_provider, self.router_model,
+            self.decomposer_provider, self.decomposer_model, # Added decomposer to startup log
             self.agent_reason_provider, self.agent_reason_model,
             self.agent_interpret_provider, self.agent_interpret_model,
             self.generative_provider, self.generative_model,
-            self.embedding_model # Added embedding model to startup log
+            self.embedding_model
         )
         # --- END MODIFIED LOGGING ---
 
@@ -749,6 +764,80 @@ class LLMInferenceService:
             logger.error("call_embeddings: General error generating embedding for model %s: %s", self.embedding_model, e, exc_info=True)
             logger.warning("call_embeddings: Falling back to zero-vector embedding due to general error.")
             return FALLBACK_EMBEDDING
+    
+    # --- Langfuse Integration Start: @observe decorator for call_task_decomposer ---
+    @observe(name="llm_inference_call_task_decomposer")
+    # --- Langfuse Integration End ---
+    def call_task_decomposer(self, session_id: str, query: str) -> DecomposedQuery:
+        """
+        Decomposes a complex user query into a list of smaller, actionable sub-tasks.
+        Each sub-task includes an inferred agent and its parameters.
+        """
+        logger.info("call_task_decomposer: provider=%s model=%s query=%r", self.decomposer_provider, self.decomposer_model, query)
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are an expert AI task decomposition engine for an e-commerce customer service chatbot. "
+                "Your task is to break down complex, multi-intent user queries into a list of independent sub-tasks. "
+                "For each sub-task, identify the relevant part of the original query, "
+                "infer the most appropriate specialized agent to handle it, and extract any necessary parameters. "
+                "You must respond with a JSON object containing three fields: "
+                "1. `primary_intent_summary`: A brief summary of the user's overall goal. "
+                "2. `sub_tasks`: A list of JSON objects, each representing a 'DecomposedSubTask'. Each 'DecomposedSubTask' MUST contain: "
+                "   - `original_segment`: The direct quote or paraphrase of the part of the original query addressed by this sub-task. "
+                "   - `inferred_agent_name`: The name of the agent. Choose from: "
+                "     'OrderTrackingAgent', 'ProductRecommendationAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
+                "   - `inferred_parameters`: A JSON object of key-value pairs relevant to the agent's task "
+                "     (e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "     If no specific parameters are extracted, return an empty object {}. "
+                "3. `overall_confidence`: A float between 0.0 and 1.0 representing your confidence in this decomposition. "
+                "If the query is simple and clearly single-intent, return a single sub-task. "
+                "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent' for that sub-task. "
+                "If the request implies an unresolvable issue or an explicit need for human intervention, choose 'EscalationAgent' for that sub-task. "
+                "Always output a valid JSON object strictly adhering to the DecomposedQuery schema. Do NOT include any other text."
+            )},
+            {"role": "user", "content": f"Decompose the following customer query: \"{query}\""}
+        ]
+
+        try:
+            parsed_decomposition = self._complete_structured(
+                caller="call_task_decomposer", provider=self.decomposer_provider,
+                client=self.decomposer_client, model=self.decomposer_model, mode=self.decomposer_mode,
+                messages=messages, schema=DecomposedQuery,
+                fallback_model=self.decomposer_local_model,
+                temperature=0.0, seed=42, # low temp + fixed seed for deterministic decomposition
+            )
+            logger.debug("call_task_decomposer: Raw decomposition result: %s", parsed_decomposition.model_dump_json(indent=2))
+            logger.info("call_task_decomposer: decomposed into %d sub-task(s)", len(parsed_decomposition.sub_tasks))
+            return parsed_decomposition
+
+        except ValidationError as e:
+            logger.warning("call_task_decomposer: LLM output invalid (%s) - falling back to single GeneralPurposeAgent", e)
+            return DecomposedQuery(
+                primary_intent_summary="Error in task decomposition",
+                sub_tasks=[
+                    DecomposedSubTask(
+                        original_segment=query,
+                        inferred_agent_name="GeneralPurposeAgent",
+                        inferred_parameters={"original_query": query},
+                    )
+                ],
+                overall_confidence=0.3
+            )
+        except Exception as e:
+            logger.error("call_task_decomposer: error calling decomposer LLM: %s", e, exc_info=True)
+            return DecomposedQuery(
+                primary_intent_summary="Error in task decomposition",
+                sub_tasks=[
+                    DecomposedSubTask(
+                        original_segment=query,
+                        inferred_agent_name="GeneralPurposeAgent",
+                        inferred_parameters={"original_query": query},
+                    )
+                ],
+                overall_confidence=0.2
+            )
+    # --- END NEW METHOD call_task_decomposer ---
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
@@ -761,6 +850,12 @@ if __name__ == "__main__":
     agent_invoc = llm_service.call_router(router_req)
     print(f"\nRouter Result: {agent_invoc}")
 
+    decomposer_query = "What is your return policy and where is my order 123?"
+    decomposed_result = llm_service.call_task_decomposer("test_decomp_session", decomposer_query)
+    print(f"\nDecomposer Result for '{decomposer_query}':")
+    print(f"  Primary Intent: {decomposed_result.primary_intent_summary}")
+    for i, sub_task in enumerate(decomposed_result.sub_tasks):
+        print(f"  Sub-task {i+1}: Segment='{sub_task.original_segment}', Agent='{sub_task.inferred_agent_name}', Params={sub_task.inferred_parameters}")
     # --- MODIFIED EMBEDDING TEST ---
     # Test a normal embedding call
     embedding = llm_service.call_embeddings("Hello World from the real embedding model!")

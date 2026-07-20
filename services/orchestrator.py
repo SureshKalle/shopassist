@@ -22,6 +22,8 @@ from common.models import (
     Message,
     FinalNLGOutput,
     SentimentResult,
+    # --- NEW IMPORTS: For multi-intent decomposition ---
+    DecomposedQuery, DecomposedSubTask,
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
@@ -63,7 +65,9 @@ class AgentOrchestratorService:
         self.session_sentiment: Dict[str, SentimentResult] = {}
         # Routing decisions keyed by exact masked-text match, so a repeated identical
         # query skips a second LLM router call. Grows unbounded for the process lifetime.
-        self.orchestrator_routing_cache: Dict[str, AgentInvocation] = {}
+        # --- MODIFIED: Cache now stores DecomposedQuery for multi-intent ---
+        self.orchestrator_routing_cache: Dict[str, DecomposedQuery] = {}
+        # --- END MODIFIED ---
 
     # --- Langfuse Integration Start: Root Trace using @observe decorator ---
     @observe(name="orchestrator_handle_customer_query")
@@ -125,92 +129,87 @@ class AgentOrchestratorService:
         # or a specialist agent.
         input_verdict = self.guardrail_service.screen_input(masked_query.masked_text)
 
-        # 3. Route to a specialist agent. Cache hit skips a second LLM call for an
-        # identical masked query (e.g. a user resending the same message).
-        agent_invocation: AgentInvocation
+        agent_results: List[StructuredAgentResult] = []
+        final_user_intent_summary: str # To be set by decomposition or single-intent routing
+
         if input_verdict.blocked:
             logger.warning(
                 "Routing bypassed - input guardrail blocked this message: session_id=%s category=%s",
                 session_id, input_verdict.category,
             )
-            agent_invocation = AgentInvocation(
-                agent_name="EscalationAgent",
-                confidence=1.0,
-                parameters={"reason": f"Blocked by input guardrail (category={input_verdict.category})"},
-            )
-        else:
-            logger.debug("Consulting orchestrator routing cache...")
-            routing_key = masked_query.masked_text  # simple key; could incorporate user_id if needed
-            if routing_key in self.orchestrator_routing_cache:
-                agent_invocation = self.orchestrator_routing_cache[routing_key]
-                logger.debug("Routing cache hit for session_id=%s", session_id)
-            else:
-                logger.debug("Routing cache miss - calling the LLM router")
-                routing_request = RoutingRequest(
-                    session_id=session_id,
-                    conversation_history=current_history,
-                    current_query=masked_query.masked_text
-                )
-                agent_invocation = self.llm_inference_client.call_router(routing_request)
-                self.orchestrator_routing_cache[routing_key] = agent_invocation
-
-        logger.info(
-            "Routing decision: agent=%s confidence=%s",
-            agent_invocation.agent_name, agent_invocation.confidence,
-        )
-
-        # 4. Run the chosen agent. If the router named an agent that isn't
-        # registered (e.g. a name change on one side but not the other), or
-        # confidence is too low to trust the routing decision, fall back instead
-        # of erroring: low confidence goes to EscalationAgent (treat it as
-        # unresolvable), anything else goes to GeneralPurposeAgent.
-        target_agent: BaseAgent = self.agents.get(agent_invocation.agent_name)
-        if not target_agent:
-            logger.warning(
-                "Agent '%s' not found - falling back to GeneralPurposeAgent/EscalationAgent",
-                agent_invocation.agent_name,
-            )
-            if agent_invocation.confidence < 0.5:  # arbitrary cutoff, not tuned against real data
-                target_agent = self.agents["EscalationAgent"]
-                agent_invocation.agent_name = "EscalationAgent"
-                agent_invocation.parameters = {"reason": f"No agent found for intent: {agent_invocation.agent_name}, low confidence."}
-            else:
-                target_agent = self.agents["GeneralPurposeAgent"]
-                agent_invocation.agent_name = "GeneralPurposeAgent"
-                agent_invocation.parameters = {"query": masked_query.masked_text}
-
-        agent_task = AgentTask(
-            session_id=session_id,
-            user_id=query.user_id,
-            original_query=masked_query.masked_text,
-            intent=agent_invocation.agent_name,  # the agent name doubles as the intent label here
-            params=agent_invocation.parameters,
-            conversation_context=current_history
-        )
-
-        # Only one agent ever runs per request today (no fan-out/parallel agents),
-        # so this list always ends up with exactly one result.
-        agent_results: List[StructuredAgentResult] = []
-        try:
-            result = target_agent.process_task(agent_task)
-            agent_results.append(result)
-        except Exception as e:
-            # Catch-all: whatever the agent raised (LLM error, bad tool response,
-            # unhandled edge case), the customer still gets a coherent reply
-            # instead of a stack trace - EscalationAgent packages it for a human.
-            logger.error(
-                "Agent %s failed processing task_id=%s: %s - falling back to EscalationAgent",
-                target_agent.name, agent_task.task_id, e, exc_info=True,
-            )
+            # If blocked, directly invoke EscalationAgent
             escalation_task = AgentTask(
                 session_id=session_id,
                 user_id=query.user_id,
                 original_query=masked_query.masked_text,
-                intent="escalation_due_to_error",
-                params={"reason": f"Agent {target_agent.name} failed with error: {e}"},
+                intent="escalation_due_to_guardrail",
+                params={"reason": f"Blocked by input guardrail (category={input_verdict.category})"},
                 conversation_context=current_history
             )
             agent_results.append(self.agents["EscalationAgent"].process_task(escalation_task))
+            final_user_intent_summary = "Blocked by guardrail, escalated."
+        else:
+            # --- START MODIFIED BLOCK: Multi-intent handling replaces old single-intent routing logic ---
+            decomposed_query: DecomposedQuery
+            # For now, we always try to decompose. A future optimization could
+            # use a lightweight classifier to decide if decomposition is needed.
+            # We can also add caching for decomposition results here if the exact
+            # masked query is repeated (orchestrator_routing_cache is typed for this).
+            decomposed_query = self.llm_inference_client.call_task_decomposer(session_id, masked_query.masked_text)
+            final_user_intent_summary = decomposed_query.primary_intent_summary or "Customer query" # Set primary intent from decomposer
+
+            logger.info(
+                "Decomposed query into %d sub-task(s). Primary intent: '%s'",
+                len(decomposed_query.sub_tasks), final_user_intent_summary
+            )
+
+            # Process each sub-task
+            for sub_task in decomposed_query.sub_tasks:
+                logger.info(
+                    "Processing sub-task: original_segment='%s', inferred_agent_name='%s'",
+                    sub_task.original_segment, sub_task.inferred_agent_name
+                )
+                target_agent_name = sub_task.inferred_agent_name
+                target_agent: BaseAgent = self.agents.get(target_agent_name)
+
+                # Fallback if decomposer suggests an unknown agent
+                if not target_agent:
+                    logger.warning(
+                        "Decomposer suggested unknown agent '%s' for sub-task '%s' - falling back to GeneralPurposeAgent",
+                        target_agent_name, sub_task.original_segment
+                    )
+                    target_agent = self.agents["GeneralPurposeAgent"]
+                    target_agent_name = "GeneralPurposeAgent"
+                    sub_task.inferred_parameters = {"query": sub_task.original_segment} # Ensure GP agent gets the segment
+
+                sub_agent_task = AgentTask(
+                    session_id=session_id,
+                    user_id=query.user_id,
+                    original_query=sub_task.original_segment, # Use the segment for the agent's context
+                    intent=target_agent_name,
+                    params=sub_task.inferred_parameters,
+                    conversation_context=current_history # Full history is still relevant
+                )
+
+                try:
+                    result = target_agent.process_task(sub_agent_task)
+                    agent_results.append(result)
+                except Exception as e:
+                    logger.error(
+                        "Agent %s failed processing sub-task '%s': %s - falling back to EscalationAgent for this sub-task",
+                        target_agent.name, sub_task.original_segment, e, exc_info=True,
+                    )
+                    # For a failed sub-task, escalate just that sub-task's issue
+                    escalation_task = AgentTask(
+                        session_id=session_id,
+                        user_id=query.user_id,
+                        original_query=sub_task.original_segment,
+                        intent="escalation_due_to_sub_task_error",
+                        params={"reason": f"Agent {target_agent.name} failed with error during sub-task: {e}"},
+                        conversation_context=current_history
+                    )
+                    agent_results.append(self.agents["EscalationAgent"].process_task(escalation_task))
+            # --- END MODIFIED BLOCK ---
 
         # 5. Turn the agent's structured result (a StructuredOrderSummary, a
         # StructuredProductRecommendation, etc.) into a natural-language reply.
@@ -218,8 +217,8 @@ class AgentOrchestratorService:
         nlg_request = NLGRequest(
             session_id=session_id,
             conversation_history=current_history,
-            agent_results=agent_results,
-            final_user_intent=agent_invocation.agent_name,  # simplified: the routed agent name stands in for intent
+            agent_results=agent_results, # Now a list of results from potentially multiple agents
+            final_user_intent=final_user_intent_summary, # Use the summary from decomposition
             customer_sentiment=self.session_sentiment.get(session_id),  # from step 1.5; None/"unknown" is a no-op in call_generative
         )
 
@@ -237,18 +236,26 @@ class AgentOrchestratorService:
         # 6. Persist the turn and return. conversation_history_db/agent_state_store
         # are per-process only (see class docstring) - both reset on restart.
         self.conversation_history_db[session_id] = current_history + [Message(role="assistant", content=final_response_text)]
-        self.agent_state_store[session_id] = {"last_agent": agent_invocation.agent_name, "last_result": agent_results}
+        # --- MODIFIED: agent_state_store update to reflect multi-agent orchestration ---
+        self.agent_state_store[session_id] = {
+            "primary_intent": final_user_intent_summary,
+            "invoked_agents": [res.agent_name for res in agent_results],
+            "all_results": agent_results # Store all results for potential debugging/analysis
+        }
+        # --- END MODIFIED ---
 
         logger.info(
-            "Query handled: session_id=%s agent=%s confidence=%s",
-            session_id, agent_invocation.agent_name, final_nlg_output.confidence,
+            "Query handled: session_id=%s primary_intent='%s' invoked_agents=%s confidence=%s",
+            session_id, final_user_intent_summary, [res.agent_name for res in agent_results], final_nlg_output.confidence,
         )
+        # --- MODIFIED: ChatbotResponse.agent_invoked to reflect multi-agent orchestration ---
         return ChatbotResponse(
             session_id=session_id,
             response_text=final_response_text,
-            agent_invoked=agent_invocation.agent_name,
+            agent_invoked="Multi-Agent Orchestrator" if len(agent_results) > 1 else agent_results[0].agent_name if agent_results else None,
             confidence_score=final_nlg_output.confidence
         )
+        # --- END MODIFIED ---
 
 # Not meant to be run directly - api/dependencies.py and main_simulation.py both
 # construct this with real dependencies and call handle_customer_query() on it.

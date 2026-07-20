@@ -75,6 +75,7 @@ class EcommerceClient:
     def get_order_details(self, user_id: str, order_id: str) -> dict[str, Any]:
         logger.info("get_order_details: user_id=%s order_id=%s", user_id, order_id)
         logger.debug("Using database URL: %s", self.engine.url)
+        logger.debug("EcommerceClient.get_order_details received: user_id=%s, order_id=%s", user_id, order_id)
 
         with self.engine.connect() as conn:
             order_row = conn.execute(
