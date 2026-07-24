@@ -206,7 +206,9 @@ if __name__ == "__main__":
     # --- NEW ACTIVE INTERACTION: Query about RAG-ingested policy (unconditional) ---
     current_session_id = f"user_session_{uuid.uuid4().hex[:8]}"
     # This query is designed to hit the policy info from the ingested data (product catalog, customer conversations, OR PDFs)
-    customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is your domestic shipping policy and Where is my order ord-1001?")
+    #customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is your domestic shipping policy and Where is my order ord-1001?")
+    #customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is your domestic shipping policy")
+    customer_query_rag_test = CustomerQuery(session_id=current_session_id, user_id="alum-1001", text="What is status of my orders ord-1001,tell about your return policy")
     print(f"\n>>> Customer (RAG Test): '{customer_query_rag_test.text}' (Session: {customer_query_rag_test.session_id})")
     response_rag_test = orchestrator.handle_customer_query(customer_query_rag_test)
     print(f"\n<<< Chatbot (RAG Test): '{response_rag_test.response_text}' (Agent: {response_rag_test.agent_invoked})")
