@@ -14,7 +14,7 @@ a real store (Redis, a DB table) before running more than one instance.
 import logging
 from typing import Dict, Any, List, Optional
 # --- Langfuse Integration Start: Only import observe ---
-from langfuse import observe
+from langfuse import observe, get_client
 # --- Langfuse Integration End ---
 from common.models import (
     CustomerQuery, ChatbotResponse,
@@ -70,7 +70,12 @@ class AgentOrchestratorService:
         # --- END MODIFIED ---
 
     # --- Langfuse Integration Start: Root Trace using @observe decorator ---
-    @observe(name="orchestrator_handle_customer_query")
+    # capture_input/output=False: `query.text` (the decorator's default input
+    # capture target) is raw, UNMASKED customer text - PII masking happens
+    # inside this function, not before it. Input/output are set manually
+    # below, after masking/guardrail screening, so the trace still shows
+    # something useful without ever sending raw PII to Langfuse Cloud.
+    @observe(name="orchestrator_handle_customer_query", capture_input=False, capture_output=False)
     # --- Langfuse Integration End ---
     def handle_customer_query(self, query: CustomerQuery) -> ChatbotResponse:
         """Run one customer message through the full pipeline and return a reply.
@@ -95,6 +100,13 @@ class AgentOrchestratorService:
         # on receipt, since there's no separate edge layer in this project yet.
         masked_query = self.pii_masker.mask_text(query.text, session_id=query.session_id, user_id=query.user_id)
         logger.debug("Masked query: '%s'", masked_query.masked_text)
+
+        # Set the trace's input now that it's masked (see capture_input=False
+        # above) - session_id/user_id are opaque identifiers, not PII content.
+        get_client().update_current_span(
+            input=masked_query.masked_text,
+            metadata={"session_id": query.session_id, "user_id": query.user_id, "source_channel": query.source_channel},
+        )
 
         # 1.5. Sentiment of the customer's message, via the (separate,
         # optional) encoder-model classifier service - see
@@ -232,6 +244,13 @@ class AgentOrchestratorService:
         # before it reaches the customer.
         output_verdict = self.guardrail_service.screen_output(final_response_text)
         final_response_text = output_verdict.safe_text
+
+        # Set the trace's output now that it's guardrail-screened (see
+        # capture_output=False above).
+        get_client().update_current_span(
+            output=final_response_text,
+            metadata={"primary_intent": final_user_intent_summary, "confidence": final_nlg_output.confidence},
+        )
 
         # 6. Persist the turn and return. conversation_history_db/agent_state_store
         # are per-process only (see class docstring) - both reset on restart.

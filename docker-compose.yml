@@ -113,6 +113,14 @@ services:
       timeout: 10s
       retries: 10
       start_period: 20s
+    deploy:
+      resources:
+        limits:
+          # conversation_history_db/agent_state_store (services/orchestrator.py)
+          # are unbounded in-memory dicts for the process lifetime - a cap
+          # here turns a slow memory leak into a container restart (still
+          # healthchecked back up) instead of it taking down the host.
+          memory: ${API_MEMORY_LIMIT:-2g}
     networks:
       - shopassist-api-network
 
@@ -159,6 +167,10 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-1g}
     networks:
       - shopassist-api-network
 
@@ -225,9 +237,17 @@ networks:
     name: shopassist-api-network
 
 volumes:
+  # No name/external - project-local, not shared with any other repo
+  # (unlike shopassist-classifier-models below). Auto-named by Compose,
+  # created fresh on a clean machine.
   shopassist-postgres-data:
-  # name (not external) - created fresh on a clean machine, or reused
-  # as-is if shopassist-model already populated it, same convention that
-  # repo's own docker-compose.yml uses for both volumes below.
+  # external: true - this volume is owned/created by shopassist-model's own
+  # docker-compose.yml (the classifier's HuggingFace model cache); this repo
+  # only ever reuses it if already populated, never creates or deletes it.
+  # Without external: true, Compose treats it as this project's own instead
+  # - warns about a project-ownership mismatch on every `up` (harmless, but
+  # noisy), and `docker compose down -v` here would delete shopassist-model's
+  # shared cache, which we never want.
   shopassist-classifier-models:
     name: shopassist-classifier-models
+    external: true

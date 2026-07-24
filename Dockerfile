@@ -10,14 +10,25 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api ./api
-COPY services ./services
-COPY clients ./clients
-COPY common ./common
-COPY db/init_db.py db/schema_sqlite.sql db/seed_sqlite.sql ./db/
+# Non-root - defense in depth: if a dependency vulnerability ever allowed
+# code execution inside this container, a non-root user limits the blast
+# radius versus the default root. Fixed UID/GID (not auto-assigned) so the
+# --chown below is deterministic.
+RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m appuser
+
+COPY --chown=appuser:appuser api ./api
+COPY --chown=appuser:appuser services ./services
+COPY --chown=appuser:appuser clients ./clients
+COPY --chown=appuser:appuser common ./common
+COPY --chown=appuser:appuser db/init_db.py db/schema_sqlite.sql db/seed_sqlite.sql ./db/
 # Policy PDFs ingested into RAG at startup - see api/dependencies.py's
 # warm_up_services() / services/data_pipeline.py's ingest_pdf_documents().
-COPY docs ./docs
+# --chown (not root-owned): services/rag.py creates docs/rag_data/ at
+# startup (the generated FAISS index + JSONL store) - appuser needs write
+# access here to do that.
+COPY --chown=appuser:appuser docs ./docs
+
+USER appuser
 
 EXPOSE 8000
 
