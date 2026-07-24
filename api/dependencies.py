@@ -22,13 +22,13 @@ from services.data_pipeline import DataIngestionPipeline
 from services.llm_inference import LLMInferenceService
 from services.orchestrator import AgentOrchestratorService
 from services.pii_masker import PIIMasker
-from services.rag import MockRAGService
+from services.rag import RAGService
 
 logger = logging.getLogger(__name__)
 
 # Same sample data main_simulation.py ingests before its demo queries, so
-# the RAG store isn't empty on this API's first request. No policy docs
-# seeded - DataIngestionPipeline has no ingest_policy_documents method yet.
+# the RAG store isn't empty on this API's first request. Policy PDFs
+# (docs/) are ingested separately below, also matching main_simulation.py.
 _SAMPLE_CONVERSATIONS = [
     RawCustomerConversation(
         id="conv_001",
@@ -82,8 +82,8 @@ def get_llm_service() -> LLMInferenceService:
 
 
 @lru_cache
-def get_rag_service() -> MockRAGService:
-    return MockRAGService(get_llm_service())
+def get_rag_service() -> RAGService:
+    return RAGService(get_llm_service())
 
 
 @lru_cache
@@ -127,4 +127,5 @@ def warm_up_services() -> None:
     pipeline = get_data_pipeline()
     pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)
     pipeline.ingest_product_catalog(_SAMPLE_PRODUCTS)
+    pipeline.ingest_pdf_documents(docs_folder="docs", source_type="customer_policy")
     logger.info("[API] Service warm-up complete.")

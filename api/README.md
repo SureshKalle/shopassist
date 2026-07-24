@@ -49,7 +49,7 @@ Response body (`ChatResponse`, `200 OK`):
 |---|---|---|
 | `session_id` | string | Echoes the request's `session_id`, or the newly generated one if omitted — persist this for the next turn. |
 | `response_text` | string | The reply to show the customer. |
-| `agent_invoked` | string \| null | Which specialist handled it: `OrderTrackingAgent`, `ProductRecommendationAgent`, `GeneralPurposeAgent`, or `EscalationAgent`. `EscalationAgent` means the gateway couldn't resolve the request automatically — there is no ticket/CRM concept at this API layer, so if the client needs a support-ticket UI flow, it must synthesize that client-side when it sees this value. |
+| `agent_invoked` | string \| null | Which specialist handled it: `OrderTrackingAgent`, `ProductRecommendationAgent`, `GeneralPurposeAgent`, or `EscalationAgent`. A single message can decompose into sub-tasks handled by more than one agent (e.g. an order-status question plus a policy question in one turn) — when that happens this is the literal string `"Multi-Agent Orchestrator"` instead of one of the four names above. `EscalationAgent` means the gateway couldn't resolve the request automatically — there is no ticket/CRM concept at this API layer, so if the client needs a support-ticket UI flow, it must synthesize that client-side when it sees this value. |
 | `confidence_score` | float | 0.0–1.0, from the LLM's own self-reported confidence — not independently validated. |
 | `timestamp` | string (ISO-8601) | Server-side response time. |
 

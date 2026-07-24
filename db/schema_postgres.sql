@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS order_items (
 -- shopassist-database's own document_chunks table 1:1 (same columns/types)
 -- so both projects agree on shape. Infra-ready only, added alongside the
 -- Postgres 16 -> 17/pgvector upgrade above: `services/rag.py`'s
--- MockRAGService still does in-memory substring matching today and doesn't
+-- RAGService still does in-memory substring matching today and doesn't
 -- read or write this table yet - see README.md's Known Gaps. Column shape
 -- mirrors common/models.py's ChunkedDocument 1:1 (doc_id/content/embedding/
 -- source_type/metadata) so a future real RAG service needs no ID/field

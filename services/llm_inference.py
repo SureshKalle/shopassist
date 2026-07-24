@@ -27,7 +27,6 @@ callers never need to handle an LLM-specific exception themselves.
 import logging
 import os
 from typing import List, Optional, Type, TypeVar
-from anyio import Path
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -54,8 +53,6 @@ from common.models import (
 from langfuse import observe
 # --- Langfuse Integration End ---
 
-os.environ["OLLAMA_EMBEDDING_MODEL"] = "nomic-embed-text:latest"
-
 load_dotenv(override=True)  # Load .env file, allowing overrides from the environment
 
 logger = logging.getLogger(__name__)
@@ -63,8 +60,10 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 # --- MODIFIED FALLBACK EMBEDDING DIMENSION ---
-# Based on the traceback, nomic-embed-text generates 3072-dimensional embeddings.
-FALLBACK_EMBEDDING = [0.0] * 3072
+# nomic-embed-text generates 768-dimensional embeddings - must match
+# services/rag.py's DEFAULT_EMBEDDING_DIM or every fallback embedding gets
+# rejected by RAGService's dimension check.
+FALLBACK_EMBEDDING = [0.0] * 768
 # --- END MODIFIED ---
 
 
@@ -119,12 +118,7 @@ class LLMInferenceService:
         )
         # --- END NEW LLM ROLE ---
 
-        logger.info(f"DEBUG PATH: Current Working Directory is: {os.getcwd()}")
-        logger.info(f"DEBUG PATH: Expected .env path would be: {Path(os.getcwd()) / '.env'}")
-        logger.info(f"DEBUG ENV: Raw system value before assignment: {os.environ.get('OLLAMA_EMBEDDING_MODEL')}")
-        
-        self.embedding_model =  "nomic-embed-text"
-        logger.info(f"DEBUG: LLMInferenceService.embedding_model (from env) is: {self.embedding_model}")
+        self.embedding_model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
 
         # One line, always at INFO regardless of LOG_LEVEL, showing exactly
         # which provider/model handles each pipeline step for this process -

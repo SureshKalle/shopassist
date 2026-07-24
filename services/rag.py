@@ -5,9 +5,9 @@ FAISS-powered vector store for RAG. Documents are ingested via ingest_document()
 do this at startup).
 
 Retrieval now uses FAISS for vector similarity search against the document
-embeddings, and the JSON Lines file (`rag_knowledge_base.jsonl`) serves as
-the persistent store for the full ChunkedDocument objects (content + metadata)
-which are mapped by their integer index in the FAISS vector index.
+embeddings, and the JSON Lines file (`docs/rag_data/rag_knowledge_base.jsonl`)
+serves as the persistent store for the full ChunkedDocument objects (content +
+metadata) which are mapped by their integer index in the FAISS vector index.
 """
 import logging
 import json
@@ -24,8 +24,8 @@ from langfuse import observe
 logger = logging.getLogger(__name__)
 
 # --- MODIFIED DEFAULT_EMBEDDING_DIM ---
-# Set default embedding dimension to match nomic-embed-text (3072)
-DEFAULT_EMBEDDING_DIM = 3072
+# Set default embedding dimension to match nomic-embed-text (768)
+DEFAULT_EMBEDDING_DIM = 768
 # --- END MODIFIED ---
 
 class RAGService:
@@ -34,14 +34,22 @@ class RAGService:
     a JSON Lines file for persistent storage of ChunkedDocument data.
     """
     def __init__(self, llm_inference_client: LLMInferenceService,
-                 db_file_path: str = "rag_knowledge_base.jsonl",
-                 faiss_index_path: str = "faiss_index.bin"):
+                 db_file_path: str = "docs/rag_data/rag_knowledge_base.jsonl",
+                 faiss_index_path: str = "docs/rag_data/faiss_index.bin"):
         self.llm_inference_client = llm_inference_client
         self.db_file_path = db_file_path
         self.faiss_index_path = faiss_index_path
 
         self.doc_store: List[ChunkedDocument] = [] # Stores ChunkedDocument objects, indexed by list position
         self.faiss_index: Optional[faiss.Index] = None # The FAISS vector index
+
+        # Both paths can include a directory component (e.g. docs/rag_data/) -
+        # create it if missing so a fresh checkout doesn't crash on first
+        # write. os.path.dirname("") for a bare filename is a no-op-safe "".
+        for path in (self.db_file_path, self.faiss_index_path):
+            dir_name = os.path.dirname(path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
 
         # --- MODIFIED: Setup FAISS index at initialization ---
         self._setup_faiss_index()
@@ -228,8 +236,8 @@ if __name__ == "__main__":
     llm_inf_client = LLMInferenceService()
 
     # --- MODIFIED RAG Service initialization for file paths ---
-    rag_data_file = "demo_rag_knowledge_base.jsonl"
-    faiss_index_file = "demo_faiss_index.bin"
+    rag_data_file = "docs/rag_data/demo_rag_knowledge_base.jsonl"
+    faiss_index_file = "docs/rag_data/demo_faiss_index.bin"
 
     # Clean up previous demo files for a fresh run
     if os.path.exists(rag_data_file):

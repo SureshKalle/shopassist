@@ -15,6 +15,9 @@ COPY services ./services
 COPY clients ./clients
 COPY common ./common
 COPY db/init_db.py db/schema_sqlite.sql db/seed_sqlite.sql ./db/
+# Policy PDFs ingested into RAG at startup - see api/dependencies.py's
+# warm_up_services() / services/data_pipeline.py's ingest_pdf_documents().
+COPY docs ./docs
 
 EXPOSE 8000
 
