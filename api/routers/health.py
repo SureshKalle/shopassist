@@ -17,7 +17,7 @@ from api.config import settings
 from api.dependencies import get_agents, get_ecommerce_client, get_rag_service
 from api.schemas import HealthResponse
 from clients.ecommerce_api_client import EcommerceClient
-from services.rag import MockRAGService
+from services.rag import RAGService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/health", tags=["health"])
@@ -38,7 +38,7 @@ def _ollama_reachable(timeout: float = 3.0) -> bool:
 @router.get("", response_model=HealthResponse)
 def health_check(
     agents: dict = Depends(get_agents),
-    rag_service: MockRAGService = Depends(get_rag_service),
+    rag_service: RAGService = Depends(get_rag_service),
     ecommerce_client: EcommerceClient = Depends(get_ecommerce_client),
 ) -> HealthResponse:
     """
@@ -49,7 +49,7 @@ def health_check(
     return HealthResponse(
         status="ok",
         registered_agents=list(agents.keys()),
-        rag_documents_indexed=len(rag_service.vector_db),
+        rag_documents_indexed=len(rag_service.doc_store),
         database_reachable=ecommerce_client.is_reachable(),
         llm_reachable=_ollama_reachable(),
         api_key_enforced=settings.api_key_enforce,

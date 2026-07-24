@@ -58,10 +58,10 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-# --- MODIFIED FALLBACK EMBEDDING DIMENSION ---
-# Based on the traceback, nomic-embed-text generates 3072-dimensional embeddings.
-FALLBACK_EMBEDDING = [0.0] * 3072
-# --- END MODIFIED ---
+# nomic-embed-text's actual native output dimension (see rag_knowledge_base.jsonl's
+# persisted embeddings, all length 768) - must match services/rag.py's
+# DEFAULT_EMBEDDING_DIM or every doc fails FAISS's dimension check.
+FALLBACK_EMBEDDING = [0.0] * 768
 
 
 class LLMInferenceService:

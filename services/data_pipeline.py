@@ -144,7 +144,7 @@ class DataIngestionPipeline:
                 content=content_for_rag,
                 embedding=self.llm_inference_client.call_embeddings(content_for_rag),
                 source_type="product_catalog",
-                metadata={"product_id": raw_prod.product_id}
+                metadata={"product_id": raw_prod.product_id, "price": normalized_price}
             )
             self.rag_service.ingest_document(chunk)
         logger.info("Product catalog ingestion complete: %d record(s)", len(cleaned_products))

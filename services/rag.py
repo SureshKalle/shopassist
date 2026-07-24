@@ -23,10 +23,9 @@ from langfuse import observe
 
 logger = logging.getLogger(__name__)
 
-# --- MODIFIED DEFAULT_EMBEDDING_DIM ---
-# Set default embedding dimension to match nomic-embed-text (3072)
-DEFAULT_EMBEDDING_DIM = 3072
-# --- END MODIFIED ---
+# nomic-embed-text's actual native output dimension - must match
+# services/llm_inference.py's FALLBACK_EMBEDDING.
+DEFAULT_EMBEDDING_DIM = 768
 
 class RAGService:
     """
@@ -91,6 +90,24 @@ class RAGService:
         This method is called once at service startup.
         """
         self.doc_store = self._load_from_file() # Populate doc_store from JSONL file
+
+        # Some persisted documents may carry embeddings from an earlier,
+        # differently-dimensioned embedding model (or a zero-vector fallback
+        # written while it was unreachable). Drop them here, before any FAISS
+        # index is built/loaded against doc_store, so the two stay
+        # positionally aligned - query_knowledge_base() indexes into
+        # doc_store by the integer position FAISS returns, so any mismatch
+        # between the two would silently return the wrong document instead
+        # of erroring.
+        valid_docs = [doc for doc in self.doc_store if len(doc.embedding) == DEFAULT_EMBEDDING_DIM]
+        skipped = len(self.doc_store) - len(valid_docs)
+        if skipped:
+            logger.warning(
+                "Dropping %d document(s) with embedding dimension != %d (stale/corrupted "
+                "embeddings) - re-ingest them to restore full RAG coverage.",
+                skipped, DEFAULT_EMBEDDING_DIM,
+            )
+        self.doc_store = valid_docs
 
         if os.path.exists(self.faiss_index_path):
             try:

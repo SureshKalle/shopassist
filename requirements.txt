@@ -19,3 +19,20 @@ psycopg2-binary>=2.9
 # services/classifier_client.py: HTTP client for shopassist-model's
 # classifier service (sentiment/feedback-topic encoder models).
 requests>=2.31
+
+# services/rag.py: vector index + embeddings backing RAGService.
+faiss-cpu>=1.8
+numpy>=1.26
+
+# services/data_pipeline.py: PDF ingestion into the RAG knowledge base
+# (pypdf/reportlab) and chunking ingested text (langchain-text-splitters).
+pypdf>=4.0
+reportlab>=4.0
+langchain-text-splitters>=0.3
+
+# common/langfuse_config.py, services/*: LLM call tracing/observability.
+# Disabled automatically if LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are unset.
+langfuse>=2.50,<5
+
+# evaluation/metrics.py: scoring for evaluation/ scripts.
+scikit-learn>=1.5

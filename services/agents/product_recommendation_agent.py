@@ -189,12 +189,19 @@ class ProductRecommendationAgent(BaseAgent):
             # In a real system, LLMInf_AgentInterpret might help select the best product and reason
             product_info_doc = next((doc for doc in rag_results if doc.source_type == 'product_catalog'), None)
             if product_info_doc:
-                # Mock a structured recommendation
+                # product_id/price come from services/data_pipeline.py's real
+                # ingestion metadata (see ingest_product_catalog). There's no
+                # discrete product name anywhere upstream - RawProductRecord
+                # only has a free-text description - so derive a short label
+                # from that real description rather than showing the customer
+                # a fabricated one.
+                description_snippet = product_info_doc.content[:150]
+                derived_name = description_snippet.removeprefix("Product: ").split(".")[0][:60].strip()
                 recommended_product = StructuredProductRecommendation(
-                    product_id="PROD_XYZ", # This would be extracted from product_info_doc
-                    name="Super Widget Pro",
-                    description_snippet=product_info_doc.content[:50] + "...", # Use snippet from RAG
-                    price=299.99, # This would be looked up from a product DB based on product_id
+                    product_id=product_info_doc.metadata.get("product_id", product_info_doc.doc_id),
+                    name=derived_name or product_info_doc.metadata.get("product_id", product_info_doc.doc_id),
+                    description_snippet=description_snippet,
+                    price=product_info_doc.metadata.get("price", 0.0),
                     reason=f"it aligns with your interest in {customer_history.get('favorite_category')} and similar to your last purchase '{customer_history.get('last_purchase', 'no previous purchase')}' as suggested by our knowledge base."
                 )
         
