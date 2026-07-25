@@ -12,15 +12,16 @@ Two entry points, one shared `services/` layer underneath:
 Same steps for both entry points (`services/orchestrator.py`, `AgentOrchestratorService.handle_customer_query`):
 
 1. `PIIMasker.mask_text()` replaces a small set of known sample names/emails with `[NAME]`/`[EMAIL]` before anything reaches the LLM. It's pattern matching against hardcoded sample strings, not a real NER/regex PII detector - fine for the demo data, not production-ready as-is.
+1.5. `ClassifierClient.classify_sentiment()` (shopassist-model's encoder service) labels the message's sentiment. Doesn't affect routing - only calibrates step 5's reply tone. Fails soft to "unknown" if that service isn't running.
 2. The message is appended to that session's in-memory conversation history (a plain dict keyed by `session_id`, not backed by any external store - lost on process restart).
-2.5. `GuardrailService.screen_input()` (see [Guardrails](#guardrails)) screens the masked text for blatant prompt-injection/jailbreak attempts. A hit substitutes the routing decision below with `EscalationAgent` instead of skipping the pipeline - the customer still gets a natural reply, just never reaches the router or a specialist agent.
-3. `LLMInferenceService.call_router()` asks the LLM which agent should handle it (`OrderTrackingAgent`, `ProductRecommendationAgent`, or `GeneralPurposeAgent`), with a confidence score. Recent identical queries reuse the last routing decision instead of asking again.
-4. The chosen agent runs its own logic:
+2.5. `GuardrailService.screen_input()` (see [Guardrails](#guardrails)) screens the masked text for blatant prompt-injection/jailbreak attempts. A hit substitutes the step below with `EscalationAgent` instead of skipping the pipeline - the customer still gets a natural reply, just never reaches the decomposer or a specialist agent.
+3. `LLMInferenceService.call_task_decomposer()` breaks the message into one or more sub-tasks, each assigned to an agent (`OrderTrackingAgent`, `ProductRecommendationAgent`, or `GeneralPurposeAgent`) - a single message like "where's my order and what's your return policy" dispatches to two agents in the same turn. A sub-task the decomposer assigns to an unknown agent name falls back to `GeneralPurposeAgent`.
+4. Each sub-task's assigned agent runs its own logic:
    - `OrderTrackingAgent` asks the LLM to plan a tool call, then actually queries the order DB via `EcommerceClient` (`clients/ecommerce_api_client.py` - SQLite locally, Postgres via `DATABASE_URL`). `get_order_details`/`cancel_order`/`delete_order` all enforce that the calling `user_id` actually owns the order - see [Guardrails](#guardrails).
    - `ProductRecommendationAgent` also goes through `EcommerceClient` (customer purchase history), then searches `RAGService` for a matching product.
-   - `GeneralPurposeAgent` only searches `RAGService`, an in-memory dict of ingested text chunks matched by substring/keyword - not a vector DB, and `call_embeddings()` is a deterministic stub, not a real embedding model.
-   - Any unhandled exception from an agent, or a routing failure, falls back to `EscalationAgent`, which packages the reason and last 3 turns for a human handover (it doesn't file a ticket anywhere - that's a stub too).
-5. `LLMInferenceService.call_generative()` turns the agent's structured result into a reply.
+   - `GeneralPurposeAgent` searches `RAGService` (`services/rag.py`) - a FAISS vector index over customer conversations, product descriptions, and PDF policy documents (`docs/`, ingested via `services/data_pipeline.py`) - using real embeddings from `call_embeddings()` (Ollama's `nomic-embed-text` locally, or Gemini if configured).
+   - Any unhandled exception from a sub-task's agent falls back to `EscalationAgent` for that sub-task only, which packages the reason and last 3 turns for a human handover (it doesn't file a ticket anywhere - that's a stub too).
+5. `LLMInferenceService.call_generative()` synthesizes every sub-task's result (potentially from several different agents) into one reply. If more than one agent contributed, the response's `agent_invoked` is the literal string `"Multi-Agent Orchestrator"` instead of a single agent name - see [`api/README.md`](api/README.md).
 5.5. `GuardrailService.screen_output()` scans that reply for PII/secret-shaped substrings (email, phone, credit-card-like digit runs, connection strings) and redacts any hit before it reaches the customer.
 6. The reply is appended to conversation history, and a response object goes back to the caller (`ChatbotResponse` internally, `ChatResponse` over HTTP).
 
@@ -46,41 +47,21 @@ uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ### Docker
 
 ```bash
-cp .env.example .env        # required - see the warning below
+cp .env.example .env        # see .env.example for what each value does
 docker compose up -d --build
 docker compose down
 ```
 
-**The `cp .env.example .env` step isn't optional here**, unlike the CLI section above where it's a nice-to-have: `docker-compose.yml`'s bundled `ollama`/`ollama-bootstrap` only start when Compose's `COMPOSE_PROFILES` variable is active, and that variable is set inside `.env.example` (`COMPOSE_PROFILES=bundled-ollama`) - Compose has no way to see it without a real `.env` file. Skip this step and `docker compose up -d --build` still succeeds and reports healthy containers, just without `ollama` - `api` then can't reach `http://ollama:11434` (nothing's listening), every chat request silently degrades to a generic "unexpected error" reply, and the only visible sign is `GET /api/v1/health` reporting `llm_reachable: false`. Confirmed by actually running this scenario end to end while writing this note.
+One command brings up `api`, its Postgres DB (`postgres`), and the sentiment/topic classifier (`classifier`). `classifier` is built from `../shopassist-model/classifier` - that sibling repo's checkout is needed as a build source, but its own `docker compose` is never invoked. You don't need to separately run shopassist-devops's, shopassist-database's, or shopassist-model's own compose files for local dev.
 
-One command brings up the whole capstone stack: `api`, its Postgres DB (`postgres`), the sentiment/topic classifier (`classifier`), and a bundled Ollama (`ollama`) already stocked with `llama3.2:3b` + `nomic-embed-text` - a brand-new developer needs nothing else installed, no manual `ollama pull`. `classifier` and `ollama` are built from `../shopassist-model/classifier` and `../shopassist-model/generative` respectively - that sibling repo's checkout is needed as a build source, but its own `docker compose` is never invoked. You don't need to separately run shopassist-devops's, shopassist-database's, or shopassist-model's own compose files for local dev.
+Deliberately left out, run these on your own:
 
-Deliberately left out, run it on its own:
+- **Ollama** - this compose file doesn't bundle one (a bundled `ollama`/`ollama-bootstrap` pair used to exist here; it was removed in favour of pointing at an Ollama you install yourself, to avoid duplicating shopassist-model's own Ollama container). Install Ollama and pull the models listed in `.env.example` (`OLLAMA_ROUTER_MODEL` etc.). `api`'s `OLLAMA_API_BASE_URL` defaults to `http://host.docker.internal:11434` inside the container - i.e. an Ollama running on your own machine, not a container (`docker-compose.yml`'s `extra_hosts` entry on `api` makes that hostname resolve cross-platform). Leave `OLLAMA_API_BASE_URL` commented out in `.env` for that default to apply - see `.env.example`'s own comment on that variable for why a single fixed value there can't be correct for both this container and `main_simulation.py`/`uvicorn --reload` run directly on the host. Want a bundled Ollama container instead? Run the full multi-repo platform via `shopassist-devops`, which still provides one.
+- **Gemini** - a cloud API, not a container. `.env.example` ships with every `*_PROVIDER` defaulting to `local` - Gemini needs no container and no key out of the box. Set `GEMINI_API_KEY` and flip the relevant `*_PROVIDER` to `gemini` (see that file's own comments) to route a pipeline role there instead - a real deployment likely wants at least `GENERATIVE_PROVIDER=gemini` for a faster, higher-quality customer-facing reply than the local model alone.
 
-- **Gemini** - a cloud API, not a container. `.env.example` ships with every `*_PROVIDER` defaulting to `local` (the bundled Ollama) - Gemini needs no container and no key out of the box. Set `GEMINI_API_KEY` and flip the relevant `*_PROVIDER` to `gemini` (see that file's own comments) to route a pipeline role there instead - a real deployment likely wants at least `GENERATIVE_PROVIDER=gemini` for a faster, higher-quality customer-facing reply than the local model alone.
+Everything comes up healthcheck-gated (`api` waits on `classifier`; `classifier-bootstrap` runs to completion before `classifier` accepts traffic), and `docker compose down` stops it gracefully. Always include `--build`: the image is a one-time snapshot of the source tree, not a live mount, so plain `docker compose up -d` silently keeps running whatever was last built and won't pick up newer code, committed or not.
 
-Everything comes up healthcheck-gated (`api` waits on `classifier`; `ollama-bootstrap`/`classifier-bootstrap` run to completion before `ollama`/`classifier` accept the model actually being ready), and `docker compose down` stops it gracefully. Always include `--build`: the image is a one-time snapshot of the source tree, not a live mount, so plain `docker compose up -d` silently keeps running whatever was last built and won't pick up newer code, committed or not.
-
-CPU-only inference is slow: `llama3.2:3b` on a capstone laptop can take 30-45s per call. With `.env.example`'s shipped defaults (every `*_PROVIDER=local`, no Gemini key needed to boot), a chat turn makes **four** sequential local calls - router, agent-reason, agent-interpret, *and* generative - measured end to end at **~200s** for a single order-tracking request. That leaves only ~40s of headroom under `CHAT_REQUEST_TIMEOUT_SECONDS=240`, so treat this as the slow path, not a worst case: set `GENERATIVE_PROVIDER=gemini` (needs `GEMINI_API_KEY`, see `.env.example`) to drop back to three local calls plus one fast cloud call, the configuration this project was actually developed and tuned against.
-
-#### Switching Ollama
-
-By default `docker compose up` starts its own `ollama` + `ollama-bootstrap` (a `bundled-ollama` Compose [profile](https://docs.docker.com/compose/how-tos/profiles/), active via `COMPOSE_PROFILES=bundled-ollama` in `.env`). If you already run Ollama on your machine and don't want a second one competing for port `11434`, switch to it instead - in `.env`:
-
-```bash
-# COMPOSE_PROFILES=bundled-ollama          # comment out: don't start the bundled ollama
-OLLAMA_API_BASE_URL=http://host.docker.internal:11434   # uncomment: point at your host Ollama
-SHOPASSIST_MODEL=llama3.2:latest           # or whatever tag your host Ollama actually has pulled
-```
-
-Then, since a bundled `ollama` from an earlier `docker compose up` isn't stopped by a plain `docker compose down` once its profile is disabled (Compose only tears down services in the currently active profile set):
-
-```bash
-docker compose --profile bundled-ollama down ollama ollama-bootstrap   # one-time: stop the leftover bundled container
-docker compose up -d --build                                           # api, postgres, classifier - no bundled ollama this time
-```
-
-To switch back, restore both `.env` lines and re-run `docker compose up -d --build`.
+CPU-only local inference is slow: `llama3.2:3b` on a capstone laptop can take 30-45s per call, and a chat turn now makes several sequential local calls per sub-task (task decomposition, agent-reason, agent-interpret) plus one final synthesis call - more of them the more intents a single message decomposes into. Treat local-only as the slow path: set `GENERATIVE_PROVIDER=gemini` (needs `GEMINI_API_KEY`, see `.env.example`) to route at least the customer-facing synthesis step to a fast cloud call instead, the configuration this project was actually developed and tuned against.
 
 ## Configuration
 
@@ -165,8 +146,8 @@ For a first pass at the codebase, in this order:
 ## Known gaps
 
 - `GET /api/v1/chat/{session_id}/history` and `DELETE /api/v1/chat/{session_id}` are mentioned in `api/routers/chat.py`'s docstring but not implemented.
-- Rate limiting and the request-routing cache are in-memory and per-process - fine for one instance, not for multiple replicas.
+- Rate limiting, conversation history, and agent state are in-memory and per-process - fine for one instance, not for multiple replicas.
 - `ProductRecommendationAgent` hardcodes the recommended `product_id`/`name`/`price` (see its docstring) - only the RAG-matched description snippet and the customer-history framing are real. Wiring the recommendation itself to `EcommerceClient.get_item()`/`search_items()` is a natural next step.
-- `MockRAGService.query_knowledge_base()` accepts a `query_embedding` parameter but matches purely by substring/keyword against `query_text` - the embedding is computed by every caller but never actually used. `LLMInferenceService.call_embeddings()` is a deterministic stub (16-dimensional at most), not a real embedding model, so this only matters once a real vector store replaces `MockRAGService`.
+- ~~`MockRAGService.query_knowledge_base()` matched purely by substring/keyword, and `call_embeddings()` was a deterministic stub~~ - fixed: `RAGService` (`services/rag.py`) now does real FAISS vector search over real Ollama/Gemini embeddings, ingesting customer conversations, product descriptions, and PDF policy documents (`docs/`, via `services/data_pipeline.py`).
 - `LLMInferenceService.call_agent_generate()` is fully implemented but not called by any agent or by the orchestrator today - every agent returns a structured result and lets `call_generative()` do the one customer-facing synthesis step instead.
 - See `db/README.md`'s own Known Gaps - both previously listed there (order-ID extraction, order-ownership enforcement) are now fixed.

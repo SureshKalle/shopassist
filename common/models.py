@@ -267,3 +267,18 @@ class ChunkedDocument(BaseModel):
     embedding: List[float]
     source_type: str # 'product_catalog', 'customer_support_policy'
     metadata: Dict[str, Any]
+
+# --- MULTI-INTENT & TASK DECOMPOSITION MODELS (NEW SECTION) ---
+
+class DecomposedSubTask(BaseModel):
+    """Represents a single sub-task extracted from a multi-intent query."""
+    sub_task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    original_segment: str # The part of the original query this sub-task addresses
+    inferred_agent_name: str # e.g., "OrderTrackingAgent", "GeneralPurposeAgent"
+    inferred_parameters: Dict[str, Any] = Field(default_factory=dict) # Parameters for the agent
+
+class DecomposedQuery(BaseModel):
+    """Output model for the LLM that decomposes a multi-intent query."""
+    primary_intent_summary: str # A summary of the overall user goal
+    sub_tasks: List[DecomposedSubTask] # List of individual sub-tasks
+    overall_confidence: float = Field(default=1.0, ge=0.0, le=1.0)

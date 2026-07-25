@@ -57,12 +57,31 @@ class OutputGuardrailVerdict:
 # upgrade path once this needs to catch more than the obvious cases - see
 # README.md's "Guardrails" section, "input scope/injection screen" row.
 _INJECTION_PATTERNS = [
-    re.compile(r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions", re.IGNORECASE),
-    re.compile(r"disregard\s+(all\s+)?(previous|prior|your)\s+instructions", re.IGNORECASE),
+    # Broadened verb/target coverage over the original ignore/disregard-only
+    # pair - still anchored on "instructions/rules/guidelines/restrictions"
+    # so it doesn't fire on ordinary complaints like "forget it, never mind".
+    re.compile(
+        r"(ignore|disregard|forget|override|bypass)\s+(all\s+)?(your\s+|the\s+)?"
+        r"(previous|prior|above|earlier)?\s*(system\s+)?(instructions|rules|guidelines|restrictions)",
+        re.IGNORECASE,
+    ),
     re.compile(r"you\s+are\s+now\s+(in\s+)?(developer|debug|dan|jailbreak)\s*mode", re.IGNORECASE),
-    re.compile(r"reveal\s+(your\s+)?(system\s+prompt|instructions)", re.IGNORECASE),
-    re.compile(r"print\s+(your\s+)?(system\s+prompt|instructions)", re.IGNORECASE),
-    re.compile(r"act\s+as\s+(if\s+you\s+(are|have)\s+no\s+restrictions|an?\s+unrestricted)", re.IGNORECASE),
+    re.compile(r"do\s+anything\s+now\b", re.IGNORECASE),  # the classic "DAN" jailbreak phrase
+    re.compile(
+        r"(reveal|print|repeat|output|show)\s+(your\s+|the\s+)?"
+        r"(system\s+prompt|initial\s+prompt|instructions)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"what\s+(is|are)\s+your\s+(system\s+prompt|instructions|rules)", re.IGNORECASE),
+    re.compile(
+        r"(act|pretend|roleplay)\s+as\s+(if\s+you\s+(are|have)\s+no\s+restrictions"
+        r"|an?\s+unrestricted|an?\s+ai\s+with\s+no\s+(rules|filters?|restrictions))",
+        re.IGNORECASE,
+    ),
+    # Covers phrasing that skips "as" entirely (e.g. "pretend you are an AI
+    # with no restrictions") - the "AI/assistant with no rules/filters" tail
+    # is unambiguous enough on its own to not need a preceding verb anchor.
+    re.compile(r"(ai|assistant|bot)\s+with\s+no\s+(rules|filters?|restrictions|limits)", re.IGNORECASE),
 ]
 
 # Categories mirror PIIMasker's own (email/phone/address/name) plus one it
@@ -71,12 +90,44 @@ _INJECTION_PATTERNS = [
 # a leaked name. `secret` catches connection strings/API-key-shaped tokens -
 # defense in depth against a tool result or stack trace fragment ending up
 # quoted back in a generated reply.
+# The store's own published support addresses - RAG-sourced replies
+# legitimately quote these back (e.g. "email us for an RMA"); redacting them
+# breaks the very instruction the customer needs. Not a PII leak, so
+# exempted from the email pattern below rather than tightening the pattern
+# itself (which would just re-open the false-negative side for a real leak).
+_SAFE_EMAILS = {"store@alumni.iisc.ac.in"}
+
 _OUTPUT_LEAK_PATTERNS = {
     "email": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
     "phone": re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b"),
+    # Luhn-validated in screen_output() below, not here - a bare 13-16 digit
+    # regex also matches order/tracking IDs and phone+extension numbers,
+    # which would otherwise get needlessly redacted as false positives.
     "credit_card": re.compile(r"\b(?:\d[ -]?){13,16}\b"),
-    "secret": re.compile(r"\b\w+://[^\s'\"]*:[^\s'\"]*@[^\s'\"]+|(?:sk|AIza)-?[A-Za-z0-9_-]{16,}"),
+    # AKIA... (AWS access key ID) and JWT-shaped tokens added alongside the
+    # original connection-string / OpenAI-Gemini-key coverage - all three
+    # are plausible secrets to end up quoted back by a tool result.
+    "secret": re.compile(
+        r"\b\w+://[^\s'\"]*:[^\s'\"]*@[^\s'\"]+"
+        r"|(?:sk|AIza|AKIA)-?[A-Za-z0-9_-]{16,}"
+        r"|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
+    ),
 }
+
+
+def _luhn_valid(digits: str) -> bool:
+    """Standard Luhn checksum - lets the credit_card pattern above tell a
+    plausible card number apart from any other 13-16 digit run (order ID,
+    tracking number, phone-with-extension) before redacting it."""
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
 
 
 class GuardrailService:
@@ -107,7 +158,42 @@ class GuardrailService:
         categories: List[str] = []
         try:
             for category, pattern in _OUTPUT_LEAK_PATTERNS.items():
-                if pattern.search(safe_text):
+                if category == "credit_card":
+                    redacted_any = False
+
+                    def _redact_if_valid(m: re.Match) -> str:
+                        nonlocal redacted_any
+                        if _luhn_valid(re.sub(r"[ -]", "", m.group(0))):
+                            redacted_any = True
+                            return "[REDACTED_CREDIT_CARD]"
+                        return m.group(0)  # fails Luhn - likely an order/tracking ID, leave as-is
+
+                    safe_text = pattern.sub(_redact_if_valid, safe_text)
+                    if redacted_any:
+                        categories.append(category)
+                elif category == "email":
+                    redacted_any = False
+
+                    def _redact_if_not_safe(m: re.Match) -> str:
+                        nonlocal redacted_any
+                        matched = m.group(0)
+                        # A domain never ends in a literal dot - the pattern's
+                        # greedy domain group otherwise sweeps up a
+                        # sentence-ending period, which would make even the
+                        # store's own address fail the exact-match check
+                        # below. Strip it, compare/redact, then re-append.
+                        trailing = ""
+                        while matched.endswith("."):
+                            matched, trailing = matched[:-1], "." + trailing
+                        if matched.lower() in _SAFE_EMAILS:
+                            return matched + trailing  # the store's own published contact address
+                        redacted_any = True
+                        return "[REDACTED_EMAIL]" + trailing
+
+                    safe_text = pattern.sub(_redact_if_not_safe, safe_text)
+                    if redacted_any:
+                        categories.append(category)
+                elif pattern.search(safe_text):
                     categories.append(category)
                     safe_text = pattern.sub(f"[REDACTED_{category.upper()}]", safe_text)
             if categories:

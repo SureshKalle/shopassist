@@ -75,6 +75,7 @@ class EcommerceClient:
     def get_order_details(self, user_id: str, order_id: str) -> dict[str, Any]:
         logger.info("get_order_details: user_id=%s order_id=%s", user_id, order_id)
         logger.debug("Using database URL: %s", self.engine.url)
+        logger.debug("EcommerceClient.get_order_details received: user_id=%s, order_id=%s", user_id, order_id)
 
         with self.engine.connect() as conn:
             order_row = conn.execute(
@@ -88,14 +89,17 @@ class EcommerceClient:
 
             logger.debug("get_order_details: row found - %s", dict(order_row))
 
-            # Ownership guardrail: only enforce when user_id actually looks like
-            # a seeded business key (alum-1001 style - see db/README.md), so it
-            # degrades gracefully instead of rejecting every lookup. Re-enabled
-            # (was previously disabled pending shopassist-client sending a real
-            # per-session user_id - it now does, see login.py there) to close
-            # an IDOR: without this, any caller could read any other
-            # customer's order by guessing/incrementing order_id.
-            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+            # Ownership guardrail - unconditional. Re-enabled (was previously
+            # disabled pending shopassist-client sending a real per-session
+            # user_id - it now does, see login.py there) to close an IDOR:
+            # without this, any caller could read any other customer's order
+            # by guessing/incrementing order_id. Previously gated behind
+            # `user_id.startswith("alum-")` "so it degrades gracefully" - that
+            # gate was itself the IDOR: any caller could bypass the whole
+            # check just by sending a user_id that doesn't start with
+            # "alum-" (trivial for anyone calling the API directly rather
+            # than through shopassist-client's UI).
+            if user_id != order_row["user_id"]:
                 logger.warning(
                     "get_order_details: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
                 )
@@ -148,11 +152,12 @@ class EcommerceClient:
                 logger.warning("cancel_order: order_id=%s not found in orders table", order_id)
                 return {"error": "Order not found", "order_id": order_id}
 
-            # Ownership guardrail - see get_order_details()'s matching comment
-            # for why this is enabled now. This one never had even a disabled
-            # placeholder: without it, any caller could cancel any other
-            # customer's order by guessing/incrementing order_id.
-            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+            # Ownership guardrail - unconditional, see get_order_details()'s
+            # matching comment for why the old startswith("alum-") gate was
+            # itself the IDOR. This one never had even a disabled placeholder:
+            # without it, any caller could cancel any other customer's order
+            # by guessing/incrementing order_id.
+            if user_id != order_row["user_id"]:
                 logger.warning(
                     "cancel_order: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
                 )
@@ -314,14 +319,15 @@ class EcommerceClient:
                 logger.warning("delete_order: order_id=%s not found in orders table", order_id)
                 return {"error": "Order not found", "order_id": order_id}
 
-            # Ownership guardrail - see get_order_details()'s matching comment
-            # for why this is enabled now. Especially important here: this is
-            # a hard, irreversible DELETE, not a status change. Checked
-            # before the status guard below so a non-owner gets the same
-            # generic "not found" regardless of the order's real status -
-            # otherwise this would leak another customer's order status
-            # (e.g. "delivered") to someone who doesn't own it.
-            if user_id.startswith("alum-") and user_id != order_row["user_id"]:
+            # Ownership guardrail - unconditional, see get_order_details()'s
+            # matching comment for why the old startswith("alum-") gate was
+            # itself the IDOR. Especially important here: this is a hard,
+            # irreversible DELETE, not a status change. Checked before the
+            # status guard below so a non-owner gets the same generic "not
+            # found" regardless of the order's real status - otherwise this
+            # would leak another customer's order status (e.g. "delivered")
+            # to someone who doesn't own it.
+            if user_id != order_row["user_id"]:
                 logger.warning(
                     "delete_order: ownership check failed - user_id=%s does not own order_id=%s", user_id, order_id
                 )
