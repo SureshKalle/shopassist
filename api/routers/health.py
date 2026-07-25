@@ -14,9 +14,10 @@ import urllib.request
 from fastapi import APIRouter, Depends
 
 from api.config import settings
-from api.dependencies import get_agents, get_ecommerce_client, get_rag_service
+from api.dependencies import get_agents, get_classifier_client, get_ecommerce_client, get_rag_service
 from api.schemas import HealthResponse
 from clients.ecommerce_api_client import EcommerceClient
+from services.classifier_client import ClassifierClient
 from services.rag import RAGService
 
 logger = logging.getLogger(__name__)
@@ -40,11 +41,13 @@ def health_check(
     agents: dict = Depends(get_agents),
     rag_service: RAGService = Depends(get_rag_service),
     ecommerce_client: EcommerceClient = Depends(get_ecommerce_client),
+    classifier_client: ClassifierClient = Depends(get_classifier_client),
 ) -> HealthResponse:
     """
     Never raises on a downstream outage — that should show up as
-    database_reachable=False / llm_reachable=False, not a 500 that takes
-    the health check down along with whatever it was trying to report on.
+    database_reachable=False / llm_reachable=False /
+    classifier_reachable=False, not a 500 that takes the health check down
+    along with whatever it was trying to report on.
     """
     return HealthResponse(
         status="ok",
@@ -52,5 +55,6 @@ def health_check(
         rag_documents_indexed=len(rag_service.doc_store),
         database_reachable=ecommerce_client.is_reachable(),
         llm_reachable=_ollama_reachable(),
+        classifier_reachable=classifier_client.is_reachable(),
         api_key_enforced=settings.api_key_enforce,
     )

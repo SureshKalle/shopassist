@@ -94,7 +94,7 @@ if __name__ == "__main__":
     print(f"Initialized RAGService. Using default JSONL: {DEFAULT_RAG_DATA_FILE}, default FAISS index: {DEFAULT_FAISS_INDEX_FILE}")
     
     ecommerce_api_client = EcommerceClient()
-    classifier_client = ClassifierClient() # sentiment; fails soft if not started separately (shopassist-model)
+    classifier_client = ClassifierClient() # sentiment; fails soft if not started separately
 
     # 2. Initialize Data Ingestion Pipeline
     data_pipeline = DataIngestionPipeline(pii_masker, llm_inference_service, rag_service, classifier_client)
