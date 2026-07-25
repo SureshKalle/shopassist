@@ -230,3 +230,8 @@ docs/rag_data/rag_knowledge_base.jsonl
 docs/rag_data/faiss_index.bin
 docs/rag_data/demo_rag_knowledge_base.jsonl
 docs/rag_data/demo_faiss_index.bin
+# evaluation - generated artifacts
+evaluation/results.json
+evaluation/report/report.html
+evaluation/**/__pycache__/
+evaluation/**/*.pyc
