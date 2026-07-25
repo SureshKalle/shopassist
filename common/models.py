@@ -143,8 +143,8 @@ class MaskedQuery(BaseModel):
     masked_text: str
     original_text_hash: str # To reference original for audit, but not store PII
 
-# SentimentResult: shopassist's local mirror of shopassist-model's classifier
-# service response (classifier/schemas.py SentimentResponse) - see
+# SentimentResult: shopassist's local mirror of the classifier service's
+# response shape (its own SentimentResponse schema) - see
 # services/classifier_client.py. Not yet consulted by routing/NLG - today
 # it's only logged/recorded (services/orchestrator.py's sentiment hook,
 # services/data_pipeline.py's review-sentiment call site).

@@ -1,21 +1,24 @@
 # ShopAssist :: capstone stack.
 #
 # `docker compose up -d --build` from inside this repo alone brings up
-# `api`, its Postgres DB, and the sentiment/topic classifier. It does NOT
-# bundle Ollama - point OLLAMA_API_BASE_URL (default below) at a
-# host-installed Ollama (http://host.docker.internal:11434, resolvable
-# cross-platform via `api`'s `extra_hosts` entry below), or run the full
-# multi-repo platform via shopassist-devops instead, whose own
-# docker-compose.yml brings in a real `ollama`/`ollama-bootstrap` pair from
-# shopassist-model's compose file. Only shopassist-model is still touched
-# here, and only as a build-time source (see `classifier`/
-# `classifier-bootstrap` below, which build `../shopassist-model/classifier`
-# unmodified) - it's never `docker compose up`'d on its own for this to work.
+# `api` and its Postgres DB - nothing else, and no other repo's source tree
+# needs to exist as a sibling checkout for this to build and start. This
+# file used to also build a classifier service from a sibling repo's
+# source unmodified - that's been removed: it made `docker compose up`
+# fail for anyone who didn't have that other repo checked out too, for a
+# service that's optional in the first place (see
+# services/classifier_client.py's fail-soft behaviour below).
 #
 # Deliberately NOT folded in here (by design, run separately):
 # - Gemini - a cloud API, not a container; only needs GEMINI_API_KEY set.
-# - Ollama - see above; this file expects one already running, not a
-#   bundled container.
+# - Ollama - this file expects one already running on your machine
+#   (OLLAMA_API_BASE_URL below), not a bundled container.
+# - The sentiment/topic classifier - optional; run it separately (its own
+#   project has a docker-compose.yml) and point CLASSIFIER_API_BASE_URL at
+#   it if you want sentiment classification, or run the full multi-repo
+#   platform via shopassist-devops instead, which still wires one in.
+#   Leaving it unset/unreachable doesn't break chat or product-catalog
+#   ingestion - ClassifierClient fails soft to label="unknown".
 #
 # shopassist-devops's root docker-compose.yml can still `include:` this
 # file standalone-project-style and layer its own platform network / real
@@ -94,18 +97,17 @@ services:
       # in clients/ecommerce_api_client.py only matters when DATABASE_URL is
       # unset, e.g. running this API on the host outside Docker).
       DATABASE_URL: postgresql://shopassist:shopassist123@postgres:5432/shopassist
-      # shopassist-model's encoder-family classifier service (sentiment +
-      # zero-shot topic classification, services/classifier_client.py) -
-      # `classifier` service below, same compose network, so by service
-      # name rather than localhost:8100 (that default is for running this
-      # API on the host against shopassist-model's own standalone compose
-      # instead - see that repo's README "Connecting shopassist to this
-      # service" section). Fails soft if unreachable, same as before.
-      CLASSIFIER_API_BASE_URL: http://classifier:8000
+      # This file doesn't bundle the classifier (see header comment) -
+      # defaults to host.docker.internal, i.e. a classifier service running
+      # separately on your machine (its own compose stack publishes this
+      # same port). Fails soft to label="unknown" if unreachable - see
+      # services/classifier_client.py - so leaving this un-started doesn't
+      # break chat or ingestion.
+      CLASSIFIER_API_BASE_URL: ${CLASSIFIER_API_BASE_URL:-http://host.docker.internal:8100}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
-      classifier:
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
@@ -174,80 +176,11 @@ services:
     networks:
       - shopassist-api-network
 
-  # --- shopassist-model's encoder-family classifier, folded in so this
-  # repo's own `docker compose up` is a complete, single-command,
-  # end-to-end stack (same idea as `postgres` above) - build
-  # context/config/code copied from shopassist-model/classifier and
-  # shopassist-model/config unmodified, see that repo's README's "Encoder
-  # models" section for what these two models do and why they're served
-  # outside Ollama. ---
-  #
-  # One-shot job: downloads the encoder models into the shared HF cache
-  # volume, then exits. `classifier` below waits for it to finish rather
-  # than starting concurrently - a cold download racing the server's own
-  # startup would otherwise make its first request wait on an
-  # incompletely-cached model.
-  classifier-bootstrap:
-    build:
-      context: ../shopassist-model/classifier
-    container_name: shopassist-classifier-bootstrap
-    environment:
-      CLASSIFIERS_CONFIG: /app/config/classifiers.yaml
-      HF_HOME: /root/.cache/huggingface
-    volumes:
-      - ../shopassist-model/config:/app/config:ro
-      - shopassist-classifier-models:/root/.cache/huggingface
-    command: ["python", "bootstrap.py"]
-    networks:
-      - shopassist-api-network
-    restart: "no"
-
-  classifier:
-    build:
-      context: ../shopassist-model/classifier
-    container_name: shopassist-classifier
-    restart: unless-stopped
-    depends_on:
-      classifier-bootstrap:
-        condition: service_completed_successfully
-    environment:
-      CLASSIFIERS_CONFIG: /app/config/classifiers.yaml
-      HF_HOME: /root/.cache/huggingface
-    volumes:
-      - ../shopassist-model/config:/app/config:ro
-      - shopassist-classifier-models:/root/.cache/huggingface
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports:
-      - "${CLASSIFIER_PORT:-8100}:8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-    deploy:
-      resources:
-        limits:
-          memory: ${CLASSIFIER_MEMORY_LIMIT:-4g}
-    networks:
-      - shopassist-api-network
-
 networks:
   shopassist-api-network:
     name: shopassist-api-network
 
 volumes:
-  # No name/external - project-local, not shared with any other repo
-  # (unlike shopassist-classifier-models below). Auto-named by Compose,
-  # created fresh on a clean machine.
+  # No name/external - project-local, not shared with any other repo.
+  # Auto-named by Compose, created fresh on a clean machine.
   shopassist-postgres-data:
-  # external: true - this volume is owned/created by shopassist-model's own
-  # docker-compose.yml (the classifier's HuggingFace model cache); this repo
-  # only ever reuses it if already populated, never creates or deletes it.
-  # Without external: true, Compose treats it as this project's own instead
-  # - warns about a project-ownership mismatch on every `up` (harmless, but
-  # noisy), and `docker compose down -v` here would delete shopassist-model's
-  # shared cache, which we never want.
-  shopassist-classifier-models:
-    name: shopassist-classifier-models
-    external: true

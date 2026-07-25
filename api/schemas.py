@@ -45,5 +45,6 @@ class HealthResponse(BaseModel):
     rag_documents_indexed: int
     database_reachable: bool
     llm_reachable: bool
+    classifier_reachable: bool
     api_key_enforced: bool
 

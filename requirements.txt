@@ -14,7 +14,7 @@ openai>=1.50
 SQLAlchemy>=2.0
 psycopg2-binary>=2.9
 
-# services/classifier_client.py: shopassist-model classifier HTTP client
+# services/classifier_client.py: classifier service HTTP client
 requests>=2.31
 
 # services/rag.py: FAISS vector index + embeddings
