@@ -262,8 +262,8 @@ if __name__ == "__main__":
     pii_masker_inst = PIIMasker()
     llm_inf_inst = LLMInferenceService()
     # --- MODIFIED: Use RAGService, not MockRAGService, and specify file paths ---
-    rag_data_file = "demo_rag_knowledge_base.jsonl"
-    faiss_index_file = "demo_faiss_index.bin"
+    rag_data_file = "docs/rag_data/demo_rag_knowledge_base.jsonl"
+    faiss_index_file = "docs/rag_data/demo_faiss_index.bin"
 
     # Clean up previous demo files for a fresh run
     if os.path.exists(rag_data_file):

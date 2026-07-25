@@ -32,6 +32,7 @@ from api.dependencies import warm_up_services
 from api.middleware import RequestLoggingMiddleware
 from api.request_context import RequestIDLogFilter
 from api.routers import chat, health
+from common.langfuse_config import initialize_langfuse_client
 
 # See .env.example / api/config.py for all api-owned settings.
 # LOG_LEVEL=DEBUG also enables full request/response body logging (api/middleware.py).
@@ -56,6 +57,10 @@ async def lifespan(app: FastAPI):
         "[API] API key auth: %s",
         "ENFORCED" if settings.api_key_enforce else "advisory only (set API_KEY_ENFORCE=true to require it)",
     )
+    # No-ops (logs a warning, doesn't raise) if LANGFUSE_PUBLIC_KEY/SECRET_KEY
+    # aren't set - see common/langfuse_config.py. Registers its own atexit
+    # flush hook, so traces are sent before the process exits on shutdown.
+    initialize_langfuse_client()
     warm_up_services()
     yield
     logger.info("[API] Shutting down.")

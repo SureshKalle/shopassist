@@ -24,9 +24,7 @@ from clients.ecommerce_api_client import EcommerceClient
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
 from services.classifier_client import ClassifierClient
-# --- MODIFIED: Import RAGService, not MockRAGService ---
 from services.rag import RAGService
-# --- END MODIFIED ---
 from services.data_pipeline import DataIngestionPipeline
 from services.agents.order_tracking_agent import OrderTrackingAgent
 from services.agents.product_recommendation_agent import ProductRecommendationAgent
@@ -70,8 +68,8 @@ if __name__ == "__main__":
     llm_inference_service = LLMInferenceService()
 
     # Define default file paths as per RAGService's __init__
-    DEFAULT_RAG_DATA_FILE = "rag_knowledge_base.jsonl"
-    DEFAULT_FAISS_INDEX_FILE = "faiss_index.bin"
+    DEFAULT_RAG_DATA_FILE = "docs/rag_data/rag_knowledge_base.jsonl"
+    DEFAULT_FAISS_INDEX_FILE = "docs/rag_data/faiss_index.bin"
     DEFAULT_DOCS_FOLDER = "docs" # Standard folder for user-provided documents
 
     # --- MODIFIED: Initial Cleanup Block (can be commented out to load existing files) ---

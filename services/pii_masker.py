@@ -20,11 +20,6 @@ class PIIMasker:
     microservice or a highly optimized shared library.
     """
     def mask_text(self, text: str, session_id: Optional[str] = None, user_id: Optional[str] = None) -> MaskedQuery:
-        # DEBUG only, and even then this is the raw, UNMASKED text - never log
-        # this at INFO or above. Fine for local dev, not for anywhere logs are
-        # less controlled than the LLM boundary itself.
-        logger.debug("Masking PII in text: %r", text)
-
         # --- Advanced PII Detection (Conceptual) ---
         # In a production system, this would involve:
         # 1. Named Entity Recognition (NER) models specifically fine-tuned for PII.

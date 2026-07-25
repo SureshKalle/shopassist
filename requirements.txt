@@ -7,15 +7,24 @@ uvicorn[standard]>=0.32
 pydantic>=2.9
 python-dotenv>=1.0
 
-# LLM calls (OpenAI-compatible client pointed at a local Ollama server by
-# default - see services/llm_inference.py / OLLAMA_API_BASE_URL)
+# LLM calls (OpenAI-compatible client, local Ollama by default)
 openai>=1.50
 
-# clients/ecommerce_api_client.py: SQLite locally (stdlib), Postgres in
-# docker-compose (see shopassist-devops) via DATABASE_URL.
+# clients/ecommerce_api_client.py: SQLite locally, Postgres via DATABASE_URL
 SQLAlchemy>=2.0
 psycopg2-binary>=2.9
 
-# services/classifier_client.py: HTTP client for shopassist-model's
-# classifier service (sentiment/feedback-topic encoder models).
+# services/classifier_client.py: shopassist-model classifier HTTP client
 requests>=2.31
+
+# services/rag.py: FAISS vector index + embeddings
+faiss-cpu>=1.8
+numpy>=1.26
+
+# services/data_pipeline.py: PDF ingestion and text chunking
+pypdf>=4.0
+reportlab>=4.0
+langchain-text-splitters>=0.3
+
+# common/langfuse_config.py: LLM call tracing (disabled if keys unset)
+langfuse>=2.50,<5
