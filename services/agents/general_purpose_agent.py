@@ -3,6 +3,7 @@ import logging
 
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
+from services.llm_inference import EmbeddingUnavailableError
 
 # --- Langfuse Integration Start ---
 from langfuse import observe
@@ -30,11 +31,19 @@ class GeneralPurposeAgent(BaseAgent):
         # chunk_size=1000), so a single top-1 chunk risks missing the other
         # half of one policy, or dropping an entire topic on a combined
         # multi-topic question (e.g. "return policy AND shipping times").
-        rag_results = self.rag_service.query_knowledge_base(
-            self.llm_inference_client.call_embeddings(task.original_query),
-            task.original_query,
-            top_k=3,
-        )
+        # If the embedding backend is down, treat it as "no RAG match" (the
+        # branch below already has a graceful generic response for that)
+        # rather than letting the exception crash this chat turn - see
+        # EmbeddingUnavailableError's docstring (services/llm_inference.py).
+        try:
+            rag_results = self.rag_service.query_knowledge_base(
+                self.llm_inference_client.call_embeddings(task.original_query),
+                task.original_query,
+                top_k=3,
+            )
+        except EmbeddingUnavailableError:
+            logger.error("process_task: embedding backend unavailable for RAG lookup - task_id=%s", task.task_id, exc_info=True)
+            rag_results = []
 
         if rag_results:
             logger.info("RAG match found for task_id=%s (%d chunk(s))", task.task_id, len(rag_results))

@@ -14,12 +14,10 @@ Interactive schema/try-it-out: `GET /docs` (Swagger UI) or `GET /redoc`.
 | Method | Path | Purpose |
 |---|---|---|
 | POST | `/api/v1/chat` | Send a customer message, get the orchestrated reply |
+| GET | `/api/v1/chat/{session_id}/history` | Retrieve a session's conversation history |
+| DELETE | `/api/v1/chat/{session_id}` | Clear a session's conversation history and agent state |
 | GET | `/api/v1/health` | Liveness + downstream-dependency status |
 | GET | `/` | Basic root/landing check |
-
-`GET /api/v1/chat/{session_id}/history` and `DELETE /api/v1/chat/{session_id}`
-are referenced in the router's docstring but **not implemented yet** — do not
-build against them.
 
 ### POST /api/v1/chat
 
@@ -64,6 +62,36 @@ Example:
   "timestamp": "2026-07-13T10:15:00.000000"
 }
 ```
+
+### GET /api/v1/chat/{session_id}/history
+
+Query params: `user_id` (**required**) — must match the `user_id` that
+started the session (the one from that session's first `POST /api/v1/chat`
+call). A mismatched `user_id` returns the same `404` as an unknown
+`session_id` — the response never reveals whether the session exists, only
+whether the caller owns it (same pattern as `EcommerceClient.get_order_details()`
+in the root `README.md`'s "Request flow").
+
+Response body (`ChatHistoryResponse`, `200 OK`):
+
+```json
+{
+  "session_id": "abc123",
+  "messages": [
+    {"role": "user", "content": "Where is my order ord-1001?"},
+    {"role": "assistant", "content": "Your order ord-1001 has been delivered..."}
+  ]
+}
+```
+
+`404` if `session_id` doesn't exist or wasn't started by `user_id`.
+
+### DELETE /api/v1/chat/{session_id}
+
+Query params: `user_id` (**required**) — same ownership check as the history
+endpoint above. Clears the session's conversation history, agent state, and
+cached sentiment. `204 No Content` on success, `404` on an unknown or
+not-owned `session_id`.
 
 ### GET /api/v1/health
 
@@ -118,6 +146,7 @@ before the gateway would have, defeating the point of the gateway timeout.
 | Status | When |
 |---|---|
 | `401` | `API_KEY_ENFORCE=true` and the key is missing/wrong |
+| `404` | `GET/DELETE /api/v1/chat/{session_id}...` with a `session_id` that doesn't exist, or that exists but wasn't started by the given `user_id` |
 | `422` | Request body fails schema validation (e.g. `text` empty or over 2000 chars, `user_id` missing) — standard FastAPI validation error body |
 | `429` | Rate limit exceeded |
 | `500` | Unhandled error in the orchestrator, or `API_KEY_ENFORCE=true` with no `API_KEY` configured (server misconfiguration) |

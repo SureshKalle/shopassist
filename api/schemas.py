@@ -11,7 +11,7 @@ layer can evolve its request/response shape independently.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -34,6 +34,16 @@ class ChatResponse(BaseModel):
     agent_invoked: Optional[str] = None
     confidence_score: float
     timestamp: datetime
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(description="Message author: 'user' or 'assistant'.")
+    content: str = Field(description="The message text.")
+
+
+class ChatHistoryResponse(BaseModel):
+    session_id: str
+    messages: List[ChatMessage] = Field(description="Conversation turns, oldest first.")
 
 
 # ---------------------------------------------------------------------------

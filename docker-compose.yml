@@ -96,7 +96,7 @@ services:
       # runs against real Postgres, never the SQLite dev DB (that fallback
       # in clients/ecommerce_api_client.py only matters when DATABASE_URL is
       # unset, e.g. running this API on the host outside Docker).
-      DATABASE_URL: postgresql://shopassist:shopassist123@postgres:5432/shopassist
+      DATABASE_URL: postgresql://shopassist:${POSTGRES_PASSWORD:-shopassist123}@postgres:5432/shopassist
       # This file doesn't bundle the classifier (see header comment) -
       # defaults to host.docker.internal, i.e. a classifier service running
       # separately on your machine (its own compose stack publishes this
@@ -151,7 +151,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: shopassist
-      POSTGRES_PASSWORD: shopassist123
+      # Overridable so this isn't a real credential in a committed file once
+      # this stack is ever reachable beyond localhost - kept as the same
+      # literal default so an existing local setup with no POSTGRES_PASSWORD
+      # in its .env keeps working identically. Must match the `api` service's
+      # DATABASE_URL above, which references this same variable.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-shopassist123}
       POSTGRES_DB: shopassist
     ports:
       - "${POSTGRES_PORT:-5432}:5432"

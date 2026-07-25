@@ -18,12 +18,14 @@ from langfuse import observe, get_client
 # --- Langfuse Integration End ---
 from common.models import (
     CustomerQuery, ChatbotResponse,
-    RoutingRequest, AgentInvocation, AgentTask, StructuredAgentResult, NLGRequest,
+    AgentTask, StructuredAgentResult, NLGRequest,
     Message,
     FinalNLGOutput,
     SentimentResult,
     # --- NEW IMPORTS: For multi-intent decomposition ---
     DecomposedQuery, DecomposedSubTask,
+    # For the passive faithfulness check below (step 5.6)
+    StructuredOrderSummary, StructuredProductRecommendation,
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
@@ -32,6 +34,40 @@ from services.guardrails import GuardrailService
 from services.agents.base_agent import BaseAgent  # for type hinting the agents dict
 
 logger = logging.getLogger(__name__)
+
+
+def _log_faithfulness_check(agent_results: List[StructuredAgentResult], response_text: str) -> None:
+    """Passive, logging-only check: does the generated reply actually
+    mention the key facts each successful agent result carried (an order's
+    ID, a recommended product's name)? Never blocks or alters the reply -
+    call_generative()'s own fallback/confidence handling already covers
+    outright failure; this is a narrower signal for a *plausible-looking but
+    wrong* reply (a dropped or misstated detail), worth a human glancing at
+    the trace for, not worth risking a false positive withholding a reply
+    that's actually fine. Checked against the pre-guardrail text
+    (call_generative()'s raw output) since this measures generation
+    faithfulness specifically, not the separate output-redaction concern.
+    """
+    lowered_response = (response_text or "").lower()
+    for result in agent_results:
+        if result.status != "success":
+            continue
+        data = result.result_data
+        if isinstance(data, StructuredOrderSummary):
+            if data.order_id and data.order_id.lower() not in lowered_response:
+                logger.warning(
+                    "Faithfulness check: generated reply does not mention order_id=%s (agent=%s) - "
+                    "possible dropped/hallucinated detail in call_generative()'s synthesis",
+                    data.order_id, result.agent_name,
+                )
+        elif isinstance(data, StructuredProductRecommendation):
+            if data.name and data.name.lower() not in lowered_response:
+                logger.warning(
+                    "Faithfulness check: generated reply does not mention recommended product name=%r (agent=%s) - "
+                    "possible dropped/hallucinated detail in call_generative()'s synthesis",
+                    data.name, result.agent_name,
+                )
+
 
 class AgentOrchestratorService:
     """
@@ -63,6 +99,17 @@ class AgentOrchestratorService:
         # NLGRequest.customer_sentiment / LLMInferenceService.call_generative)
         # - routing/agent selection still ignores it, only NLG consumes it.
         self.session_sentiment: Dict[str, SentimentResult] = {}
+        # user_id that first used each session_id - first-write-wins, never
+        # overwritten on later turns. Lets api/routers/chat.py's history/delete
+        # endpoints refuse a mismatched user_id the same way
+        # EcommerceClient.get_order_details() refuses a mismatched order owner.
+        self.session_owner: Dict[str, str] = {}
+        # session_id -> {"tool": ..., "order_id": ...} for a destructive order
+        # action (cancel/delete) awaiting the customer's yes/no - set below
+        # when an agent result carries needs_confirmation=True (see
+        # services/agents/order_tracking_agent.py's confirmation gate),
+        # cleared once that session's next turn resolves it either way.
+        self.pending_confirmation: Dict[str, Dict[str, Any]] = {}
         # Routing decisions keyed by exact masked-text match, so a repeated identical
         # query skips a second LLM router call. Grows unbounded for the process lifetime.
         # --- MODIFIED: Cache now stores DecomposedQuery for multi-intent ---
@@ -91,6 +138,9 @@ class AgentOrchestratorService:
              failure never surfaces as a raw error to the customer.
           5. Turn the agent's structured result into a natural-language reply,
              calibrated to the sentiment from step 1.5 when available.
+          5.6. Passive faithfulness check (_log_faithfulness_check) - logs a
+               warning if the reply omits a key fact an agent result carried;
+               never blocks or alters the reply.
           6. Persist the updated history and return the response.
         """
         logger.info("Handling customer query: session_id=%s user_id=%s", query.session_id, query.user_id)
@@ -125,6 +175,7 @@ class AgentOrchestratorService:
         # append the current turn, and hand the running list to every downstream
         # call (router, agent, NLG) so each has full conversational context.
         session_id = query.session_id
+        self.session_owner.setdefault(session_id, query.user_id)
 
         current_history_raw = self.conversation_history_db.get(session_id, [])
         # Defensive: tolerate plain dicts here too, in case a caller ever seeds
@@ -163,11 +214,37 @@ class AgentOrchestratorService:
         else:
             # --- START MODIFIED BLOCK: Multi-intent handling replaces old single-intent routing logic ---
             decomposed_query: DecomposedQuery
-            # For now, we always try to decompose. A future optimization could
-            # use a lightweight classifier to decide if decomposition is needed.
-            # We can also add caching for decomposition results here if the exact
-            # masked query is repeated (orchestrator_routing_cache is typed for this).
-            decomposed_query = self.llm_inference_client.call_task_decomposer(session_id, masked_query.masked_text)
+            # A reply to a previously-asked "are you sure?" (see
+            # services/agents/order_tracking_agent.py's confirmation gate)
+            # isn't itself a fresh request to route - skip the decomposer
+            # entirely and go straight back to OrderTrackingAgent with
+            # exactly what's pending, so a bare "yes"/"no" can never get
+            # misrouted to a different agent by the decomposer.
+            pending_confirmation = self.pending_confirmation.get(session_id)
+            if pending_confirmation:
+                logger.info(
+                    "Session %s has a pending order-action confirmation (%s) - routing this reply directly to OrderTrackingAgent",
+                    session_id, pending_confirmation,
+                )
+                decomposed_query = DecomposedQuery(
+                    primary_intent_summary="Confirming a previously requested order action",
+                    sub_tasks=[
+                        DecomposedSubTask(
+                            original_segment=masked_query.masked_text,
+                            inferred_agent_name="OrderTrackingAgent",
+                            inferred_parameters={"confirm_pending_action": True, **pending_confirmation},
+                        )
+                    ],
+                    overall_confidence=1.0,
+                )
+            else:
+                # For now, we always try to decompose. A future optimization could
+                # use a lightweight classifier to decide if decomposition is needed.
+                # We can also add caching for decomposition results here if the exact
+                # masked query is repeated (orchestrator_routing_cache is typed for this).
+                decomposed_query = self.llm_inference_client.call_task_decomposer(
+                    session_id, masked_query.masked_text, available_agents=list(self.agents)
+                )
             final_user_intent_summary = decomposed_query.primary_intent_summary or "Customer query" # Set primary intent from decomposer
 
             logger.info(
@@ -223,6 +300,18 @@ class AgentOrchestratorService:
                     agent_results.append(self.agents["EscalationAgent"].process_task(escalation_task))
             # --- END MODIFIED BLOCK ---
 
+            # Confirmation-gate bookkeeping: clear whatever was pending for
+            # this session - this turn resolved it one way or another (see
+            # OrderTrackingAgent._handle_confirmation_reply) - then check
+            # whether any agent result from *this* turn is itself a new
+            # confirmation request to remember for the next one.
+            if pending_confirmation:
+                self.pending_confirmation.pop(session_id, None)
+            for result in agent_results:
+                if isinstance(result.result_data, dict) and result.result_data.get("needs_confirmation"):
+                    self.pending_confirmation[session_id] = result.result_data["pending_confirmation"]
+                    break
+
         # 5. Turn the agent's structured result (a StructuredOrderSummary, a
         # StructuredProductRecommendation, etc.) into a natural-language reply.
         logger.debug("Aggregating agent results for final NLG...")
@@ -236,6 +325,11 @@ class AgentOrchestratorService:
 
         final_nlg_output: FinalNLGOutput = self.llm_inference_client.call_generative(nlg_request)
         final_response_text = final_nlg_output.response_text
+
+        # 5.6. Faithfulness check (see _log_faithfulness_check above) -
+        # passive/logging-only, never blocks or changes what the customer
+        # receives.
+        _log_faithfulness_check(agent_results, final_response_text)
 
         # 5.5. Output guardrail (services/guardrails.py) - the counterpart to
         # step 1's input-side PII masking: scans what the LLM actually

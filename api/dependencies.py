@@ -47,28 +47,38 @@ _SAMPLE_CONVERSATIONS = [
     ),
 ]
 
-_SAMPLE_PRODUCTS = [
-    RawProductRecord(
-        product_id="PROD_LAP_001",
-        raw_description=(
-            "High-performance gaming laptop with an i7 processor, 16GB RAM, "
-            "and a 1TB SSD. Stunning display and RGB keyboard."
-        ),
-        specs={"CPU": "i7", "RAM": "16GB", "Storage": "1TB SSD"},
-        reviews=["Great product!", "Fast delivery.", "Screen is amazing!"],
-        price="₹1200.00",
-    ),
-    RawProductRecord(
-        product_id="PROD_HEAD_002",
-        raw_description=(
-            "Premium noise-cancelling headphones for immersive audio. "
-            "Comfortable earcups and 20-hour battery life."
-        ),
-        specs={"Color": "Black", "Battery": "20h"},
-        reviews=["Awesome sound!", "John Doe found them comfy and fit perfectly."],
-        price="₹250.00",
-    ),
-]
+# Comfortably above the seeded catalog's real size (75 items as of
+# db/seed_postgres.sql) without hardcoding an exact count that would go
+# stale the moment the catalog grows.
+_CATALOG_INGEST_LIMIT = 500
+
+
+def _build_catalog_products(ecommerce_client: EcommerceClient) -> list[RawProductRecord]:
+    """Real catalog items, shaped for ingest_product_catalog() - replaces
+    two hardcoded phantom products (PROD_LAP_001/PROD_HEAD_002) that used to
+    be RAG-ingested here but were never real items.db rows: ProductRecommendationAgent's
+    RAG-fallback path resolves a RAG match's product_id via
+    EcommerceClient.get_item() before recommending it (services/agents/
+    product_recommendation_agent.py), so a RAG-indexed product that isn't a
+    real row can only ever end in "no recommendation found" - and, worse,
+    can win a nearest-neighbour match away from a real, relevant item on a
+    topically-similar query (e.g. "laptop" matching the phantom "gaming
+    laptop" text ahead of the real "Laptop Cooling Pad" row), turning a
+    resolvable recommendation into a dead end. Indexing the real catalog
+    instead makes every RAG match resolvable and removes that collision
+    risk entirely.
+    """
+    items = ecommerce_client.search_items(limit=_CATALOG_INGEST_LIMIT)
+    return [
+        RawProductRecord(
+            product_id=item["item_id"],
+            raw_description=item.get("description") or item["name"],
+            specs={"category": item["category"]} if item.get("category") else {},
+            reviews=[],
+            price=str(item["price"]),
+        )
+        for item in items
+    ]
 
 
 @lru_cache
@@ -102,7 +112,29 @@ def get_data_pipeline() -> DataIngestionPipeline:
 
 @lru_cache
 def get_agents() -> dict[str, BaseAgent]:
-    deps = (get_llm_service(), get_rag_service(), get_ecommerce_client(), get_pii_masker())
+    """The canonical agent registry - the only place agent name -> instance
+    is decided. This dict's keys are load-bearing, not just labels:
+    services/orchestrator.py dispatches sub-tasks by looking a
+    decomposer-supplied name up in this exact dict (falling back to
+    GeneralPurposeAgent on a miss), and services/llm_inference.py's
+    call_task_decomposer() is handed `list(self.agents)` from here so the
+    LLM is only ever offered names that actually resolve.
+
+    Each key here MUST match the literal string that agent's own __init__
+    passes to BaseAgent.__init__ (e.g. OrderTrackingAgent's
+    `super().__init__("OrderTrackingAgent", ...)`) - that string becomes
+    self.name, which flows into every StructuredAgentResult.agent_name this
+    agent returns and ultimately the customer-facing
+    ChatbotResponse.agent_invoked. Nothing enforces this match
+    automatically: renaming a key here without updating the matching
+    agent's __init__ (or vice versa) won't error - dispatch still works
+    because it's driven by this dict, not by self.name - but every log
+    line and the customer-facing response would keep reporting the old
+    name. main_simulation.py constructs the same four agents against the
+    same four name strings for the CLI entry point; keep both in sync by
+    hand if an agent is ever added, renamed, or removed here.
+    """
+    deps = (get_llm_service(), get_rag_service(), get_ecommerce_client())
     agents = {
         "OrderTrackingAgent": OrderTrackingAgent(*deps),
         "ProductRecommendationAgent": ProductRecommendationAgent(*deps),
@@ -125,7 +157,27 @@ def warm_up_services() -> None:
     logger.info("[API] Warming up services...")
     get_orchestrator()  # transitively constructs everything else
     pipeline = get_data_pipeline()
-    pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)
-    pipeline.ingest_product_catalog(_SAMPLE_PRODUCTS)
-    pipeline.ingest_pdf_documents(docs_folder="docs", source_type="customer_policy")
+
+    # main.py's lifespan handler awaits this directly with nothing else
+    # guarding it - an exception here fails FastAPI's startup entirely and
+    # the API never starts serving requests at all. Each ingestion step
+    # already skips individual chunks/products/files on an embedding
+    # failure rather than raising (see data_pipeline.py), but this is a
+    # deliberate second layer: even an unrelated/unexpected failure in one
+    # ingestion step (a DB hiccup, a bug) shouldn't block the other two, or
+    # take down the whole API - a container that boots with a partially (or
+    # even completely) empty RAG store is recoverable; one that never boots
+    # isn't.
+    for step_name, step in (
+        ("customer conversations", lambda: pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)),
+        ("product catalog", lambda: pipeline.ingest_product_catalog(_build_catalog_products(get_ecommerce_client()))),
+        ("PDF documents", lambda: pipeline.ingest_pdf_documents(docs_folder="docs", source_type="customer_policy")),
+    ):
+        try:
+            step()
+        except Exception:
+            logger.critical(
+                "[API] Warm-up ingestion step '%s' failed - continuing startup with RAG store incomplete for this step",
+                step_name, exc_info=True,
+            )
     logger.info("[API] Service warm-up complete.")
