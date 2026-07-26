@@ -18,12 +18,17 @@ writeup; this docstring covers only what's implemented.
 
 2. screen_output() - scans the LLM's generated reply for PII/secret-shaped
    substrings (email, phone, credit-card-like digit runs, DB connection
-   strings) before it reaches the customer, and redacts any hit. This is the
-   output-side counterpart to PIIMasker (services/pii_masker.py), which only
-   ever looks at the *input* side - nothing today checks what the LLM itself
-   emits, and a generative model echoing back something it was fed (a
-   shipping address, a raw tool response) is a real leak path PIIMasker
-   can't see.
+   strings) before it reaches the customer. Email/phone/credit-card hits are
+   partially masked (e.g. "vi***y@gm**m", "+91 93*** ***26", "**** **** ****
+   1111") rather than fully redacted - a customer confirming their own
+   contact details needs to recognize them, and a "[REDACTED_EMAIL]" token
+   reads as a system error rather than a privacy protection. `secret`
+   (API keys/connection strings) has no such legitimate customer-facing use,
+   so it's still fully redacted. This is the output-side counterpart to
+   PIIMasker (services/pii_masker.py), which only ever looks at the *input*
+   side - nothing today checks what the LLM itself emits, and a generative
+   model echoing back something it was fed (a shipping address, a raw tool
+   response) is a real leak path PIIMasker can't see.
 
 Both fail open on their own errors (a regex that somehow throws doesn't
 block a chat turn) and log every hit at WARNING - loud enough to show up
@@ -90,20 +95,37 @@ _INJECTION_PATTERNS = [
 # a leaked name. `secret` catches connection strings/API-key-shaped tokens -
 # defense in depth against a tool result or stack trace fragment ending up
 # quoted back in a generated reply.
-# The store's own published support addresses - RAG-sourced replies
-# legitimately quote these back (e.g. "email us for an RMA"); redacting them
-# breaks the very instruction the customer needs. Not a PII leak, so
-# exempted from the email pattern below rather than tightening the pattern
-# itself (which would just re-open the false-negative side for a real leak).
-_SAFE_EMAILS = {"store@alumni.iisc.ac.in"}
+# The store's own published support addresses/numbers - RAG-sourced replies
+# legitimately quote these back (e.g. "email us for an RMA", the escalation
+# policy's support line). Redacting them breaks the very instruction the
+# customer needs. Not a PII leak, so exempted from the patterns below rather
+# than tightening the patterns themselves (which would just re-open the
+# false-negative side for a real leak).
+_SAFE_EMAILS = {"store@alumni.iisc.ac.in", "support@shopassist.com"}
+# Digits-only, so "91-7777777777", "+91 7777777777" and "917777777777" all
+# normalize to the same key regardless of how the LLM happens to format it
+# back (see the normalization in screen_output() below).
+_SAFE_PHONES = {"917777777777", "7777777777"}
 
 _OUTPUT_LEAK_PATTERNS = {
     "email": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
-    "phone": re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b"),
     # Luhn-validated in screen_output() below, not here - a bare 13-16 digit
     # regex also matches order/tracking IDs and phone+extension numbers,
     # which would otherwise get needlessly redacted as false positives.
+    # Checked *before* "phone" below: a dash-grouped 16-digit card number
+    # (e.g. "4111-1111-1111-1111") contains 12-digit substrings between
+    # dashes that would otherwise satisfy the phone pattern first and steal
+    # the match before the Luhn check ever runs.
     "credit_card": re.compile(r"\b(?:\d[ -]?){13,16}\b"),
+    # A run of exactly 10-12 digits, with separators (dash/dot/space) and an
+    # optional leading "+" allowed anywhere between digits - covers
+    # "555-123-4567", "91-7777777777", a bare "9371722926", and
+    # "+91 9371722926" as a single match (leading "+" included), so
+    # _mask_phone() below never has to guess whether one was already there.
+    # (?<!\d)/(?!\d) bound the match to the *entire* digit run on both ends,
+    # so this can't fire on a 10-12 digit substring carved out of a longer
+    # 13-16 digit credit-card run.
+    "phone": re.compile(r"(?<!\d)\+?(?:\d[-.\s]?){9,11}\d(?!\d)"),
     # AKIA... (AWS access key ID) and JWT-shaped tokens added alongside the
     # original connection-string / OpenAI-Gemini-key coverage - all three
     # are plausible secrets to end up quoted back by a tool result.
@@ -113,6 +135,50 @@ _OUTPUT_LEAK_PATTERNS = {
         r"|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"
     ),
 }
+
+
+def _mask_segment(value: str, keep_start: int, keep_end: int, stars: int) -> str:
+    """Keeps a few characters at each end and replaces the middle with a
+    fixed number of stars - not one star per hidden character, since the
+    real hidden length is itself worth not leaking. Too short to have a
+    real middle (e.g. a 2-char local part)? Show only the first character.
+    This is the shared primitive behind the customer-facing partial masks
+    below - full-redaction tokens like "[REDACTED_EMAIL]" read as an error
+    to an end user; a partial mask lets them recognize their own data
+    without ever displaying the whole thing back to them.
+    """
+    if len(value) <= keep_start + keep_end:
+        return value[0] + "*" * (len(value) - 1) if len(value) > 1 else value
+    return value[:keep_start] + "*" * stars + value[-keep_end:]
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = email.partition("@")
+    return f"{_mask_segment(local, 2, 1, 3)}@{_mask_segment(domain, 2, 1, 2)}"
+
+
+def _mask_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) > 10:
+        country, national = digits[:-10], digits[-10:]
+    else:
+        # No country code present in a 10-digit (or shorter) number - "91"
+        # is this store's own locale, used only for a friendlier display,
+        # never inferred as fact about the customer.
+        country, national = "91", digits
+    if len(national) == 10:
+        masked_national = f"{national[:2]}*** ***{national[-2:]}"
+    else:
+        masked_national = _mask_segment(national, 2, 2, 4)
+    return f"+{country} {masked_national}"
+
+
+def _mask_credit_card(raw: str) -> str:
+    digits = re.sub(r"[ -]", "", raw)
+    last4 = digits[-4:]
+    stars = "*" * (len(digits) - 4)
+    groups = [stars[i : i + 4] for i in range(0, len(stars), 4)] + [last4]
+    return " ".join(groups)
 
 
 def _luhn_valid(digits: str) -> bool:
@@ -165,7 +231,7 @@ class GuardrailService:
                         nonlocal redacted_any
                         if _luhn_valid(re.sub(r"[ -]", "", m.group(0))):
                             redacted_any = True
-                            return "[REDACTED_CREDIT_CARD]"
+                            return _mask_credit_card(m.group(0))
                         return m.group(0)  # fails Luhn - likely an order/tracking ID, leave as-is
 
                     safe_text = pattern.sub(_redact_if_valid, safe_text)
@@ -188,9 +254,28 @@ class GuardrailService:
                         if matched.lower() in _SAFE_EMAILS:
                             return matched + trailing  # the store's own published contact address
                         redacted_any = True
-                        return "[REDACTED_EMAIL]" + trailing
+                        return _mask_email(matched) + trailing
 
                     safe_text = pattern.sub(_redact_if_not_safe, safe_text)
+                    if redacted_any:
+                        categories.append(category)
+                elif category == "phone":
+                    redacted_any = False
+
+                    def _redact_if_not_safe_phone(m: re.Match) -> str:
+                        nonlocal redacted_any
+                        matched = m.group(0)
+                        # Separators (-, ., whitespace) and an optional
+                        # leading "+" don't change a phone number's
+                        # identity - strip everything but digits before
+                        # comparing against the published-number allowlist.
+                        normalized = re.sub(r"\D", "", matched)
+                        if normalized in _SAFE_PHONES:
+                            return matched  # the store's own published support line
+                        redacted_any = True
+                        return _mask_phone(matched)
+
+                    safe_text = pattern.sub(_redact_if_not_safe_phone, safe_text)
                     if redacted_any:
                         categories.append(category)
                 elif pattern.search(safe_text):

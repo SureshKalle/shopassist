@@ -1,30 +1,38 @@
 # Runtime dependencies for the FastAPI backend (api/) and the services/
 # clients/common layers it wires together. Install with:
 #   pip install -r requirements.txt
+#
+# Pinned to the exact versions this project is actually developed and
+# tested against (via `pip show` in the project's own .venv), not a
+# `>=` floor - a transitive dependency bump landing silently on a fresh
+# `pip install` is exactly the kind of change that's hardest to catch
+# without a test suite (see README.md's Known gaps). Bump deliberately,
+# one at a time, re-testing after each - not by loosening these back to
+# a range.
 
-fastapi>=0.115
-uvicorn[standard]>=0.32
-pydantic>=2.9
-python-dotenv>=1.0
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+python-dotenv==1.2.2
 
 # LLM calls (OpenAI-compatible client, local Ollama by default)
-openai>=1.50
+openai==2.47.0
 
 # clients/ecommerce_api_client.py: SQLite locally, Postgres via DATABASE_URL
-SQLAlchemy>=2.0
-psycopg2-binary>=2.9
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
 
 # services/classifier_client.py: classifier service HTTP client
-requests>=2.31
+requests==2.34.2
 
 # services/rag.py: FAISS vector index + embeddings
-faiss-cpu>=1.8
-numpy>=1.26
+faiss-cpu==1.14.3
+numpy==2.5.1
 
 # services/data_pipeline.py: PDF ingestion and text chunking
-pypdf>=4.0
-reportlab>=4.0
-langchain-text-splitters>=0.3
+pypdf==6.14.2
+reportlab==5.0.0
+langchain-text-splitters==1.1.2
 
 # common/langfuse_config.py: LLM call tracing (disabled if keys unset)
-langfuse>=2.50,<5
+langfuse==4.14.1

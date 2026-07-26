@@ -21,7 +21,7 @@ from common.models import (
     ChunkedDocument
 )
 from services.pii_masker import PIIMasker
-from services.llm_inference import LLMInferenceService
+from services.llm_inference import LLMInferenceService, EmbeddingUnavailableError
 from services.classifier_client import ClassifierClient
 # --- MODIFIED: Import RAGService, not MockRAGService ---
 from services.rag import RAGService
@@ -53,6 +53,7 @@ class DataIngestionPipeline:
     def ingest_customer_conversations(self, raw_conversations: List[RawCustomerConversation]) -> List[CleanedCustomerConversation]:
         logger.info("Ingesting %d customer conversation(s)", len(raw_conversations))
         cleaned_conversations = []
+        skipped_chunks = 0
         for raw_conv in raw_conversations:
             logger.debug("Processing raw conversation ID: %s", raw_conv.id)
 
@@ -82,20 +83,41 @@ class DataIngestionPipeline:
             if masked_text and len(masked_text) > 20: # Example length threshold
                 chunks = [masked_text] # Simple: one chunk per conversation; real: recursive chunking
                 for i, chunk_content in enumerate(chunks):
+                    # call_embeddings() raises EmbeddingUnavailableError (not a
+                    # silent zero-vector) if the embedding backend is down -
+                    # skip just this chunk and keep ingesting the rest rather
+                    # than letting one outage abort every remaining
+                    # conversation (or, at startup, crash warm_up_services()
+                    # entirely).
+                    try:
+                        embedding = self.llm_inference_client.call_embeddings(chunk_content)
+                    except EmbeddingUnavailableError:
+                        logger.error(
+                            "ingest_customer_conversations: embedding failed for conv_id=%s chunk_idx=%d - skipping chunk",
+                            raw_conv.id, i, exc_info=True,
+                        )
+                        skipped_chunks += 1
+                        continue
                     chunk = ChunkedDocument(
                         doc_id=f"conv_chunk_{raw_conv.id}_{i}",
                         content=chunk_content,
-                        embedding=self.llm_inference_client.call_embeddings(chunk_content),
+                        embedding=embedding,
                         source_type="customer_support_conversation",
                         metadata={"conv_id": raw_conv.id, "chunk_idx": i}
                     )
                     self.rag_service.ingest_document(chunk)
+        if skipped_chunks:
+            logger.error(
+                "ingest_customer_conversations: %d chunk(s) skipped due to embedding failures - RAG knowledge base is incomplete",
+                skipped_chunks,
+            )
         logger.info("Customer conversation ingestion complete: %d record(s)", len(cleaned_conversations))
         return cleaned_conversations
 
     def ingest_product_catalog(self, raw_products: List[RawProductRecord]) -> List[CleanedProductRecord]:
         logger.info("Ingesting %d product record(s)", len(raw_products))
         cleaned_products = []
+        skipped_products = 0
         for raw_prod in raw_products:
             logger.debug("Processing raw product ID: %s", raw_prod.product_id)
 
@@ -139,14 +161,34 @@ class DataIngestionPipeline:
             reviews_summary = ". ".join([r['text'] for r in sentiment_analyzed_reviews])
             content_for_rag = f"Product: {clean_description}. Specifications: {raw_prod.specs}. Customer Reviews: {reviews_summary}"
 
+            # call_embeddings() raises EmbeddingUnavailableError (not a
+            # silent zero-vector) if the embedding backend is down - skip
+            # only this product's RAG chunk (its CleanedProductRecord above
+            # is still returned) rather than aborting the whole catalog
+            # ingestion, or crashing warm_up_services() at API startup.
+            try:
+                embedding = self.llm_inference_client.call_embeddings(content_for_rag)
+            except EmbeddingUnavailableError:
+                logger.error(
+                    "ingest_product_catalog: embedding failed for product_id=%s - skipping RAG chunk",
+                    raw_prod.product_id, exc_info=True,
+                )
+                skipped_products += 1
+                continue
+
             chunk = ChunkedDocument(
                 doc_id=f"prod_chunk_{raw_prod.product_id}",
                 content=content_for_rag,
-                embedding=self.llm_inference_client.call_embeddings(content_for_rag),
+                embedding=embedding,
                 source_type="product_catalog",
                 metadata={"product_id": raw_prod.product_id}
             )
             self.rag_service.ingest_document(chunk)
+        if skipped_products:
+            logger.error(
+                "ingest_product_catalog: %d product(s) skipped RAG ingestion due to embedding failures - product recommendations for these will be unavailable",
+                skipped_products,
+            )
         logger.info("Product catalog ingestion complete: %d record(s)", len(cleaned_products))
         return cleaned_products
 
@@ -170,7 +212,13 @@ class DataIngestionPipeline:
     def ingest_pdf_documents(self, docs_folder: str, source_type: str = "internal_document") -> int:
         """
         Reads all PDF documents from the specified folder, chunks them,
-        applies PII masking, generates embeddings, and ingests them into the RAG service.
+        generates embeddings, and ingests them into the RAG service.
+
+        Deliberately does NOT run these through PIIMasker, unlike
+        ingest_customer_conversations() - see the inline comment above the
+        chunking step for why: these are store-authored policy documents,
+        not customer text, and legitimately contain the store's own
+        published contact info that masking would otherwise mangle.
         """
         if not os.path.isdir(docs_folder):
             logger.error("Provided docs_folder '%s' is not a valid directory.", docs_folder)
@@ -194,24 +242,35 @@ class DataIngestionPipeline:
                         logger.warning("PDF file '%s' had no extractable text. Skipping.", file_name)
                         continue
 
-                    # --- PII Masking of Raw PDF Text ---
-                    # Mask entire document first, as chunks might split PII
-                    masked_pdf_data = self.pii_masker.mask_text(raw_text, session_id=f"pdf_ingest_{file_name}", user_id="system_ingest")
-                    masked_text = masked_pdf_data.masked_text
+                    # --- NOT PII-masked, deliberately ---
+                    # Unlike ingest_customer_conversations() (real customer
+                    # text), these PDFs are store-authored reference
+                    # documents (docs/*.pdf - return/shipping/privacy/
+                    # escalation/fraud policies) with no customer PII in
+                    # them to protect. They do legitimately contain the
+                    # store's own published contact info (e.g. "email
+                    # support@shopassist.com for an RMA") - PIIMasker's
+                    # email/phone patterns can't tell "the customer's own
+                    # PII" apart from "the store's published contact info in
+                    # its own policy doc", so running these documents
+                    # through it mangled that contact info into literal
+                    # "[EMAIL]"/"[PHONE]" tokens before it was ever chunked
+                    # or embedded - the RAG store would echo that mangled
+                    # text back to a customer verbatim, which is a worse
+                    # outcome than not masking at all.
+                    chunks = self.text_splitter.split_text(raw_text)
 
-                    # --- Chunking the Masked Text ---
-                    chunks = self.text_splitter.split_text(masked_text)
-                    
                     if not chunks:
-                        logger.warning("No chunks generated from PDF file '%s' after masking. Skipping.", file_name)
+                        logger.warning("No chunks generated from PDF file '%s'. Skipping.", file_name)
                         continue
 
+                    original_text_hash = str(hash(raw_text))
                     for i, chunk_content in enumerate(chunks):
                         if not chunk_content.strip(): # Skip empty chunks
                             continue
 
                         chunk_id = f"{source_type}_{file_name.replace('.', '_')}_chunk_{i}"
-                        
+
                         # --- Embedding for RAG ---
                         embedding = self.llm_inference_client.call_embeddings(chunk_content)
 
@@ -220,7 +279,7 @@ class DataIngestionPipeline:
                             content=chunk_content,
                             embedding=embedding,
                             source_type=source_type,
-                            metadata={"file_name": file_name, "chunk_idx": i, "original_text_hash": masked_pdf_data.original_text_hash}
+                            metadata={"file_name": file_name, "chunk_idx": i, "original_text_hash": original_text_hash}
                         )
                         self.rag_service.ingest_document(chunk_document)
                         processed_chunks_count += 1

@@ -8,6 +8,24 @@ Retrieval now uses FAISS for vector similarity search against the document
 embeddings, and the JSON Lines file (`docs/rag_data/rag_knowledge_base.jsonl`)
 serves as the persistent store for the full ChunkedDocument objects (content +
 metadata) which are mapped by their integer index in the FAISS vector index.
+
+Embedding provider/model provenance: unlike LLMInferenceService's other four
+call_* roles (router/reason/interpret/generative), which are stateless
+per-request and safe to switch providers on at any time, call_embeddings()
+feeds a *persistent* index here. Two different embedding models produce
+vectors that aren't comparable even at the same dimension (see
+services/llm_inference.py's EMBEDDING_DIM/call_embeddings() docstrings for
+why gemini-embedding-001 is truncated to match Ollama's nomic-embed-text
+size) - mixing them in one FAISS index wouldn't error, it would just make
+L2 "nearest neighbor" silently meaningless. _setup_faiss_index() below
+stamps a small provenance sidecar file next to the persisted index recording
+which provider/model built it, and discards (not merges) a persisted store
+built with a different one rather than risk silently corrupting retrieval.
+In this project's own Docker deployment this rarely matters in practice -
+docs/rag_data/ is .dockerignore'd and rebuilt fresh from source PDFs/data on
+every container start (api/dependencies.py's warm_up_services()) - but it
+matters for main_simulation.py or any deployment that persists docs/rag_data/
+across restarts (e.g. a future volume mount).
 """
 import logging
 import json
@@ -55,9 +73,6 @@ class RAGService:
         self._setup_faiss_index()
         # --- END MODIFIED ---
 
-        # The rag_query_cache is still kept, could be adapted for embedding hash or removed if FAISS is fast enough
-        self.rag_query_cache: Dict[str, List[ChunkedDocument]] = {}
-
 
     # --- NEW: Methods for FAISS setup and JSONL persistence ---
     def _load_from_file(self) -> List[ChunkedDocument]:
@@ -93,12 +108,71 @@ class RAGService:
         except Exception as e:
             logger.error("Failed to append document '%s' to file %s: %s", doc.doc_id, self.db_file_path, e)
 
+    def _provenance_path(self) -> str:
+        """Sidecar file path recording which embedding provider/model built
+        the persisted store - see module docstring for why this matters."""
+        base, _ = os.path.splitext(self.db_file_path)
+        return f"{base}.embedding_provenance.json"
+
+    def _current_embedding_provenance(self) -> Dict[str, str]:
+        return {
+            "provider": self.llm_inference_client.embedding_provider,
+            "model": self.llm_inference_client.embedding_model,
+        }
+
+    def _load_provenance(self) -> Optional[Dict[str, str]]:
+        path = self._provenance_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to read embedding provenance file %s: %s", path, e)
+            return None
+
+    def _save_provenance(self, provenance: Dict[str, str]):
+        try:
+            with open(self._provenance_path(), "w", encoding="utf-8") as f:
+                json.dump(provenance, f)
+        except Exception as e:
+            logger.warning("Failed to write embedding provenance file %s: %s", self._provenance_path(), e)
+
+    def _discard_stale_store_if_provider_mismatch(self):
+        """If a persisted store exists and was built with a different
+        embedding provider/model than is currently configured, discard it
+        (in-memory and on disk) rather than silently mixing incompatible
+        vector spaces into one FAISS index. A missing provenance file (e.g.
+        a store persisted before this check existed) is NOT treated as a
+        mismatch - there's no record to contradict the current config, so
+        the existing store is trusted and a fresh provenance file is simply
+        written going forward.
+        """
+        if not self.doc_store:
+            return
+        stored = self._load_provenance()
+        current = self._current_embedding_provenance()
+        if stored is not None and stored != current:
+            logger.critical(
+                "RAG store at %s was built with embedding provider/model %s, but %s is "
+                "currently configured - vectors from different embedding models aren't "
+                "comparable even at the same dimension, so mixing them would silently "
+                "corrupt retrieval. Discarding the persisted RAG store and starting fresh "
+                "(it will be repopulated by the next ingestion run).",
+                self.db_file_path, stored, current,
+            )
+            self.doc_store = []
+            for path in (self.db_file_path, self.faiss_index_path):
+                if os.path.exists(path):
+                    os.remove(path)
+
     def _setup_faiss_index(self):
         """
         Initializes the FAISS index by loading from disk or building from loaded documents.
         This method is called once at service startup.
         """
         self.doc_store = self._load_from_file() # Populate doc_store from JSONL file
+        self._discard_stale_store_if_provider_mismatch()
 
         if os.path.exists(self.faiss_index_path):
             try:
@@ -117,6 +191,12 @@ class RAGService:
         else:
             logger.info("FAISS index file not found at %s. Attempting to build new index.", self.faiss_index_path)
             self._build_faiss_index_from_doc_store()
+
+        # Record the provider/model now in effect, so a *future* startup can
+        # tell whether the store it's about to load matches. Written last
+        # (after any discard-and-rebuild above), so a mismatch this run
+        # results in this run's provider being what's recorded going forward.
+        self._save_provenance(self._current_embedding_provenance())
 
     def _build_faiss_index_from_doc_store(self):
         """Builds a new FAISS index from the current in-memory doc_store."""

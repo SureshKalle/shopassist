@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 from common.models import AgentTask, StructuredAgentResult, StructuredProductRecommendation, LLMAgentReasonRequest
 from services.agents.base_agent import BaseAgent
+from services.llm_inference import EmbeddingUnavailableError
 # --- Langfuse Integration Start ---
 from langfuse import observe
 # --- Langfuse Integration End ---
@@ -29,12 +30,13 @@ class ProductRecommendationAgent(BaseAgent):
         """Recommend a product, either via a direct catalog tool call or,
         failing that, the RAG-based fallback below.
 
-        Note the RAG-path recommendation itself (product_id, name, price) is
-        still a hardcoded placeholder, not looked up from
-        `clients/ecommerce_api_client.py`'s items table - only the RAG-matched
+        Both paths return a real item_id/name/price from
+        `clients/ecommerce_api_client.py`'s items table - the RAG path uses
+        the product_id ingest_product_catalog() (services/data_pipeline.py)
+        stamped into the matched chunk's metadata to look the item up live,
+        rather than trusting a value cached at ingestion time. Only the
         description snippet and the customer-history framing (favorite
-        category, last purchase) are real. The searchItems tool path below
-        doesn't have this problem - it returns a real item_id/name/price.
+        category, last purchase) come from RAG/history directly.
         """
         logger.info("Received task: task_id=%s intent=%s", task.task_id, task.intent)
 
@@ -177,26 +179,41 @@ class ProductRecommendationAgent(BaseAgent):
         # something" with no specific search term or category-popularity ask).
         # 2. Use RAG to find relevant products based on query and history (Internal Tool: RAG Service)
         rag_query_text = f"{task.original_query} based on customer's favorite category '{customer_history.get('favorite_category')}' and last purchase '{customer_history.get('last_purchase')}'"
-        rag_results = self.rag_service.query_knowledge_base(
-            self.llm_inference_client.call_embeddings(rag_query_text),
-            rag_query_text,
-            top_k=3 # Request multiple relevant documents
-        )
+        # If the embedding backend is down, treat it the same as "RAG found
+        # nothing" (below) rather than letting the exception crash this
+        # customer's whole chat turn - see EmbeddingUnavailableError's
+        # docstring (services/llm_inference.py) for why call_embeddings()
+        # raises instead of returning a meaningless zero-vector here.
+        try:
+            rag_results = self.rag_service.query_knowledge_base(
+                self.llm_inference_client.call_embeddings(rag_query_text),
+                rag_query_text,
+                top_k=3 # Request multiple relevant documents
+            )
+        except EmbeddingUnavailableError:
+            logger.error("process_task: embedding backend unavailable for RAG fallback query - task_id=%s", task.task_id, exc_info=True)
+            rag_results = []
         
         recommended_product = None
         if rag_results:
-            # Simulate picking a product from RAG results and crafting a structured recommendation
             # In a real system, LLMInf_AgentInterpret might help select the best product and reason
             product_info_doc = next((doc for doc in rag_results if doc.source_type == 'product_catalog'), None)
             if product_info_doc:
-                # Mock a structured recommendation
-                recommended_product = StructuredProductRecommendation(
-                    product_id="PROD_XYZ", # This would be extracted from product_info_doc
-                    name="Super Widget Pro",
-                    description_snippet=product_info_doc.content[:50] + "...", # Use snippet from RAG
-                    price=299.99, # This would be looked up from a product DB based on product_id
-                    reason=f"it aligns with your interest in {customer_history.get('favorite_category')} and similar to your last purchase '{customer_history.get('last_purchase', 'no previous purchase')}' as suggested by our knowledge base."
-                )
+                # ingest_product_catalog() (services/data_pipeline.py) stamps every
+                # product_catalog chunk with its real product_id in metadata at
+                # ingestion time - reuse it to look up current name/price live
+                # rather than caching them here, so a price change since ingestion
+                # doesn't get echoed back stale.
+                real_product_id = product_info_doc.metadata.get("product_id")
+                item = self.ecommerce_api_client.get_item(real_product_id) if real_product_id else None
+                if item:
+                    recommended_product = StructuredProductRecommendation(
+                        product_id=item["item_id"],
+                        name=item["name"],
+                        description_snippet=product_info_doc.content[:150], # Use snippet from RAG
+                        price=item["price"],
+                        reason=f"it aligns with your interest in {customer_history.get('favorite_category')} and similar to your last purchase '{customer_history.get('last_purchase', 'no previous purchase')}' as suggested by our knowledge base."
+                    )
         
         if recommended_product:
             logger.info("Recommendation found: product_id=%s", recommended_product.product_id)

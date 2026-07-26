@@ -164,24 +164,21 @@ class ChatbotResponse(BaseModel):
 
 
 # --- LLM INFERENCE SERVICE REQUEST/RESPONSE MODELS ---
-# RoutingRequest: Input to LLMInf_Router
-class RoutingRequest(BaseModel):
-    session_id: str
-    conversation_history: List[Message] # Uses Message model
-    current_query: str # PII-masked query
-
-# AgentInvocation: Output from LLMInf_Router, used by Orchestrator
-class AgentInvocation(BaseModel):
-    agent_name: str # e.g., "OrderTrackingAgent", "ProductRecommendationAgent"
-    confidence: float
-    parameters: AgentInputParams # Uses AgentInputParams Union
-
 # AgentTask: Input from Orchestrator to Specialized Agents
 class AgentTask(BaseModel):
     session_id: str
     task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     original_query: str # Masked
+    # Overloaded: on the normal decomposition path (services/orchestrator.py)
+    # this is the target agent's registry name itself (e.g.
+    # "OrderTrackingAgent" - see api/dependencies.py::get_agents()'s
+    # docstring), used only for logging on that path, since routing already
+    # happened by the time an AgentTask is built. On the guardrail-block/
+    # sub-task-error escalation paths it's instead a free-form semantic
+    # label ("escalation_due_to_guardrail", "escalation_due_to_sub_task_error")
+    # - no agent branches on this field's value, so the inconsistency is
+    # harmless today, just worth knowing before adding logic that reads it.
     intent: str
     params: AgentInputParams # Uses AgentInputParams Union
     conversation_context: List[Message] # Uses Message model

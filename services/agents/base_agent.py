@@ -2,17 +2,20 @@
 """
 Shared contract and dependency set for every specialist agent
 (services/agents/order_tracking_agent.py, product_recommendation_agent.py,
-general_purpose_agent.py, escalation_agent.py). Each agent gets the same four
+general_purpose_agent.py, escalation_agent.py). Each agent gets the same three
 dependencies injected by api/dependencies.py / main_simulation.py, then
 implements process_task() with its own domain logic - deciding whether to call
 EcommerceClient, query the RAG store, or ask the LLM to reason/interpret.
+
+PII masking isn't one of the three: it happens once, centrally, in
+services/orchestrator.py before any agent ever runs (every agent already
+receives PII-masked text) - no agent needs its own PIIMasker instance.
 """
 from abc import ABC, abstractmethod
 from common.models import AgentTask, StructuredAgentResult
 from services.llm_inference import LLMInferenceService
 from services.rag import RAGService
 from clients.ecommerce_api_client import EcommerceClient
-from services.pii_masker import PIIMasker
 
 class BaseAgent(ABC):
     """
@@ -20,17 +23,23 @@ class BaseAgent(ABC):
     Defines the common interface and shared dependencies.
     """
     def __init__(self, name: str, llm_inference_client: LLMInferenceService, rag_service: RAGService,
-                 ecommerce_api_client: EcommerceClient, pii_masker: PIIMasker):
+                 ecommerce_api_client: EcommerceClient):
+        # `name` is a literal string each concrete agent hardcodes into its
+        # own super().__init__() call (e.g. OrderTrackingAgent passes
+        # "OrderTrackingAgent") - it must exactly match the key that same
+        # agent is registered under in api/dependencies.py::get_agents()
+        # (and main_simulation.py's equivalent dict for the CLI entry
+        # point). Dispatch itself doesn't depend on this - services/
+        # orchestrator.py looks agents up by the registry's dict key, not by
+        # self.name - but self.name is what ends up in every
+        # StructuredAgentResult.agent_name this agent returns, and
+        # ultimately the customer-facing ChatbotResponse.agent_invoked, so a
+        # mismatch here silently reports the wrong agent name everywhere
+        # instead of erroring.
         self.name = name
         self.llm_inference_client = llm_inference_client
         self.rag_service = rag_service
         self.ecommerce_api_client = ecommerce_api_client
-        self.pii_masker = pii_masker
-        # Reserved for caching an agent's own reasoning decisions; declared but
-        # not yet read or written by any agent - available for a subclass that
-        # wants to cache its process_task() logic the way orchestrator.py
-        # caches routing decisions.
-        self.agent_reasoning_cache = {}
 
     @abstractmethod
     def process_task(self, task: AgentTask) -> StructuredAgentResult:

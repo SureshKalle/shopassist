@@ -163,12 +163,17 @@ if __name__ == "__main__":
     print(f"\nSynthetic queries (Sample for LLM training): {synthetic_queries[0]}, {synthetic_queries[1]}")
     print("--- Data Preparation & Ingestion Cycle Complete ---")
 
-    # 3. Initialize Specialized Agents
+    # 3. Initialize Specialized Agents - the CLI entry point's own copy of
+    # api/dependencies.py::get_agents()'s registry (see that function's
+    # docstring for why each key must exactly match the name string the
+    # matching agent's own __init__ hardcodes). The two aren't wired
+    # together - keep this dict in sync by hand if an agent is ever added,
+    # renamed, or removed in api/dependencies.py.
     agents = {
-        "OrderTrackingAgent": OrderTrackingAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
-        "ProductRecommendationAgent": ProductRecommendationAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
-        "GeneralPurposeAgent": GeneralPurposeAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
-        "EscalationAgent": EscalationAgent(llm_inference_service, rag_service, ecommerce_api_client, pii_masker),
+        "OrderTrackingAgent": OrderTrackingAgent(llm_inference_service, rag_service, ecommerce_api_client),
+        "ProductRecommendationAgent": ProductRecommendationAgent(llm_inference_service, rag_service, ecommerce_api_client),
+        "GeneralPurposeAgent": GeneralPurposeAgent(llm_inference_service, rag_service, ecommerce_api_client),
+        "EscalationAgent": EscalationAgent(llm_inference_service, rag_service, ecommerce_api_client),
         # You would add "ReturnsAgent" and other agents here
     }
     print("\nInitialized Specialized AI Agents.")
