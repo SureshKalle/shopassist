@@ -1,8 +1,15 @@
 # services/agents/escalation_agent.py
 import logging
+from typing import Dict, Any # Added for explicit type hinting for params_dict
+
+from pydantic import BaseModel # Added to check if task.params is a BaseModel
 
 from common.models import AgentTask, StructuredAgentResult
 from services.agents.base_agent import BaseAgent
+
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +21,16 @@ class EscalationAgent(BaseAgent):
     def __init__(self, *args, **kwargs):
         super().__init__("EscalationAgent", *args, **kwargs)
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="escalation_agent_process_task")
+    # --- Langfuse Integration End ---
     def process_task(self, task: AgentTask) -> StructuredAgentResult:
-        escalation_reason = task.params.get("reason", "Issue could not be resolved by automated agents.")
+        # Robustly handle task.params, ensuring it's a dict for .get() access
+        # If task.params is a Pydantic BaseModel, convert it to a dict using .model_dump()
+        # Otherwise, assume it's already a dict or None
+        params_dict: Dict[str, Any] = task.params.model_dump() if isinstance(task.params, BaseModel) else task.params if task.params is not None else {}
+
+        escalation_reason = params_dict.get("reason", "Issue could not be resolved by automated agents.")
         logger.warning("Escalating: task_id=%s reason=%s", task.task_id, escalation_reason)
         
         # In a real system, this agent would also:
@@ -36,4 +51,4 @@ class EscalationAgent(BaseAgent):
 
 # This agent would not typically be run directly
 if __name__ == "__main__":
-    print("EscalationAgent handles unresolved queries.")
+    logger.info("EscalationAgent handles unresolved queries.") # Changed print to logger.info for consistency

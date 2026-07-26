@@ -1,28 +1,37 @@
 # services/llm_inference.py
 """
 The one place every LLM call in shopassist goes through. Wraps an OpenAI-
-compatible client behind five purpose-specific methods, one per step of the
-pipeline in services/orchestrator.py and services/agents/*.py:
+compatible client behind four purpose-specific methods, one per step of the
+pipeline in services/orchestrator.py and services/agents/*.py (routing
+itself is call_task_decomposer(), further down - it superseded an earlier
+single-intent call_router() method, now removed):
 
-- call_router           - which specialist agent should handle this message?
 - call_agent_reason     - should this agent call a tool (DB/RAG), or return now?
 - call_agent_interpret  - given raw tool output, what's the structured diagnosis?
 - call_generative       - turn an agent's structured result into a customer reply.
 - call_embeddings       - turn text into a vector (used by services/rag.py).
 
-Each of the first four independently defaults to the local Ollama server
+Each of these four independently defaults to the local Ollama server
 (OLLAMA_API_BASE_URL / OLLAMA_<ROLE>_MODEL in .env.example) and can be
 switched to Gemini's OpenAI-compatible endpoint per-role via
-<ROLE>_PROVIDER=gemini + GEMINI_API_KEY - see _resolve_role() below. This is
-what lets a cheap/fast local model handle the frequent routing/reasoning
-steps while an expensive cloud model is reserved for the one step that
-actually reaches the customer (call_generative).
+<ROLE>_PROVIDER=gemini (EMBEDDING_PROVIDER=gemini for call_embeddings) +
+GEMINI_API_KEY - see _resolve_role() below for the first three,
+call_embeddings()'s own docstring for the embedding-specific caveats (a
+persistent FAISS index, unlike the other three's stateless-per-request
+calls). This is what lets a cheap/fast local model handle the frequent
+reasoning steps while an expensive cloud model is reserved for the one step
+that actually reaches the customer (call_generative).
 
-Each method sends a system prompt describing the exact JSON schema the LLM must
-return, then validates the response against the matching Pydantic model in
-common/models.py. If the model is unavailable, times out, or returns invalid
-JSON, every method degrades to a safe fallback value instead of raising -
-callers never need to handle an LLM-specific exception themselves.
+The first three each send a system prompt describing the exact JSON schema
+the LLM must return, then validate the response against the matching
+Pydantic model in common/models.py. If the model is unavailable, times out,
+or returns invalid JSON, each of those three degrades to a safe fallback
+value instead of raising - callers never need to handle an LLM-specific
+exception themselves. call_embeddings() is the deliberate exception to that
+rule: it raises EmbeddingUnavailableError on failure rather than a fallback
+vector - see its own docstring for why a silent fallback is actually worse
+here, and services/data_pipeline.py / services/agents/*.py for how callers
+handle it.
 """
 import logging
 import os
@@ -30,26 +39,63 @@ from typing import List, Optional, Type, TypeVar
 from dotenv import load_dotenv
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
+# --- NEW IMPORT ---
+from openai import OpenAIError # For robust error handling with OpenAI client
+# --- END NEW IMPORT ---
 from pydantic import BaseModel, ValidationError
 
 from common.models import (
-    RoutingRequest, AgentInvocation,
     LLMAgentReasonRequest, LLMAgentReasonResponse,
     LLMAgentInterpretRequest, LLMAgentInterpretResponse,
     NLGRequest, StructuredAgentResult,
-    StructuredOrderSummary, 
+    StructuredOrderSummary,
     StructuredProductRecommendation,
     AgentGenerationOutput,
-    GeneralPurposeAnswer,  
-    EscalationDetails,      
-    OrderIssueAnalysis,    
-    FinalNLGOutput                
+    GeneralPurposeAnswer,
+    EscalationDetails,
+    OrderIssueAnalysis,
+    FinalNLGOutput,
+    DecomposedQuery, DecomposedSubTask # For task decomposition
 )
-load_dotenv()
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
+
+load_dotenv(override=True)  # Load .env file, allowing overrides from the environment
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
+
+# --- MODIFIED FALLBACK EMBEDDING DIMENSION ---
+# nomic-embed-text (Ollama) generates 768-dimensional embeddings - must
+# match services/rag.py's DEFAULT_EMBEDDING_DIM. When EMBEDDING_PROVIDER is
+# "gemini", call_embeddings() passes this same value as the `dimensions`
+# param to gemini-embedding-001 (which natively outputs 3072 and supports
+# Matryoshka truncation down to smaller sizes) so both providers produce
+# vectors of the same shape the existing FAISS index expects - see
+# call_embeddings() and services/rag.py's provenance guard for why matching
+# *dimension* alone still isn't enough to make the two providers'
+# vectors interchangeable.
+EMBEDDING_DIM = 768
+# Only used for the deliberate empty-text short-circuit in call_embeddings()
+# below - a real embedding *failure* raises EmbeddingUnavailableError
+# instead (see that method's docstring for why: a silent zero-vector is a
+# worse failure mode than an exception here, since FAISS's L2 distance
+# treats an all-zero vector as "equidistant from everything," silently
+# turning every RAG lookup into a near-arbitrary result instead of visibly
+# failing).
+FALLBACK_EMBEDDING = [0.0] * EMBEDDING_DIM
+# --- END MODIFIED ---
+
+
+class EmbeddingUnavailableError(Exception):
+    """Raised by call_embeddings() when the embedding backend is unreachable
+    or errors - deliberately NOT swallowed into a fallback vector. Callers
+    that can degrade gracefully (RAG lookups) should catch this and treat it
+    like "no results", the same fail-closed pattern already used elsewhere
+    (e.g. ProductRecommendationAgent's RAG-fallback path) rather than
+    presenting a confidently wrong answer built on a meaningless vector."""
 
 
 class LLMInferenceService:
@@ -71,41 +117,73 @@ class LLMInferenceService:
         # Per-role client/model/structured-output-mode/provider/local-fallback-
         # model. Each of these four roles independently defaults to "local"
         # (Ollama, same as before) and can be switched to Gemini via
-        # <ROLE>_PROVIDER=gemini - see _resolve_role(). The 5th element
+        # <ROLE>_PROVIDER=gemini + GEMINI_API_KEY - see _resolve_role(). The 5th element
         # (local_model) is always resolved regardless of the active
         # provider, so a cloud-provider role can transparently retry against
         # Ollama if the cloud call fails (quota, outage, ...) - see
         # _complete_structured()'s fallback_model param. call_embeddings()
-        # isn't listed here: it's a deterministic stub today (see its
-        # docstring), not a real model call, so there's no client to route yet.
+        # isn't listed here because it needs its own resolution (below,
+        # right after self.embedding_model) - EMBEDDING_PROVIDER=gemini uses
+        # gemini-embedding-001 truncated to EMBEDDING_DIM via the
+        # `dimensions` param (Matryoshka truncation - see call_embeddings())
+        # so it stays comparable to Ollama's 768-dim nomic-embed-text
+        # vectors already in a persisted FAISS index; there's no
+        # generative-style "mode" to resolve since embeddings aren't
+        # structured JSON output.
         self.router_client, self.router_model, self.router_mode, self.router_provider, self.router_local_model = self._resolve_role(
-            "ROUTER", "llama3:8b-instruct", "gemini-2.5-flash"
+            "ROUTER", "llama3.2:latest", "gemini-2.5-flash"
         )
         self.agent_reason_client, self.agent_reason_model, self.agent_reason_mode, self.agent_reason_provider, self.agent_reason_local_model = self._resolve_role(
-            "AGENT_REASON", "llama3:8b-instruct", "gemini-2.5-flash"
+            "AGENT_REASON", "llama3.2:latest", "gemini-2.5-flash"
         )
         self.agent_interpret_client, self.agent_interpret_model, self.agent_interpret_mode, self.agent_interpret_provider, self.agent_interpret_local_model = self._resolve_role(
-            "AGENT_INTERPRET", "llama3:8b-instruct", "gemini-2.5-flash"
+            "AGENT_INTERPRET", "llama3.2:latest", "gemini-2.5-flash"
         )
         # Shared by call_generative() and call_agent_generate() - both
         # already used the same self.generative_model before this refactor.
+        # --- NOTE: If your local setup is specifically using "llama3.2:latest",
+        #           you might need to change the default "llama3:8b-instruct" here
+        #           to "llama3.2:latest" or ensure it's set via OLLAMA_GENERATIVE_MODEL env var.
+        #           The traceback suggests it's trying to use llama3.2:latest for generative.
         self.generative_client, self.generative_model, self.generative_mode, self.generative_provider, self.generative_local_model = self._resolve_role(
-            "GENERATIVE", "llama3:8b-instruct", "gemini-2.5-pro"
+            "GENERATIVE", "llama3.2:latest", "gemini-2.5-pro"
         )
+        # --- END NOTE ---
+        # --- NEW LLM ROLE FOR DECOMPOSER ---
+        self.decomposer_client, self.decomposer_model, self.decomposer_mode, self.decomposer_provider, self.decomposer_local_model = self._resolve_role(
+            "DECOMPOSER", "llama3.2:latest", "gemini-2.5-pro" # Use a capable model for decomposition
+        )
+        # --- END NEW LLM ROLE ---
 
-        self.embedding_model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        # EMBEDDING_PROVIDER (default "local") mirrors the <ROLE>_PROVIDER
+        # convention above, but resolved separately from _resolve_role()
+        # since embeddings need a fixed output dimension (EMBEDDING_DIM),
+        # not a structured-output "mode". Validated eagerly so a typo'd
+        # provider fails at startup (loudly, during warm-up) instead of on
+        # the first RAG query.
+        self.embedding_provider = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
+        if self.embedding_provider == "gemini":
+            self.embedding_model = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+        elif self.embedding_provider == "local":
+            self.embedding_model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
+        else:
+            raise ValueError(f"Unknown EMBEDDING_PROVIDER '{self.embedding_provider}' (expected 'local' or 'gemini')")
 
         # One line, always at INFO regardless of LOG_LEVEL, showing exactly
         # which provider/model handles each pipeline step for this process -
         # the fastest way to confirm a hybrid local/cloud config actually
         # took effect without digging through per-request logs.
+        # --- MODIFIED LOGGING HERE ---
         logger.info(
-            "LLMInferenceService ready | ROUTER=%s:%s AGENT_REASON=%s:%s AGENT_INTERPRET=%s:%s GENERATIVE=%s:%s",
+            "LLMInferenceService ready | ROUTER=%s:%s DECOMPOSER=%s:%s AGENT_REASON=%s:%s AGENT_INTERPRET=%s:%s GENERATIVE=%s:%s EMBEDDING=%s:%s",
             self.router_provider, self.router_model,
+            self.decomposer_provider, self.decomposer_model, # Added decomposer to startup log
             self.agent_reason_provider, self.agent_reason_model,
             self.agent_interpret_provider, self.agent_interpret_model,
             self.generative_provider, self.generative_model,
+            self.embedding_provider, self.embedding_model
         )
+        # --- END MODIFIED LOGGING ---
 
     def _resolve_role(self, role: str, local_default_model: str, gemini_default_model: str) -> tuple[OpenAI, str, str, str, str]:
         """Pick the client/model/structured-output-mode/provider/local-model
@@ -234,93 +312,12 @@ class LLMInferenceService:
                 schema=schema, temperature=temperature, seed=seed,
             )
 
-    def call_router(self, request: RoutingRequest) -> AgentInvocation:
-        """Decide which specialist agent should handle this query.
-
-        Sends the (PII-masked) conversation history plus the current query and
-        asks the LLM to pick one of the five known agent names with a confidence
-        score. Falls back to GeneralPurposeAgent - at a lower confidence each
-        time - if the LLM names an unknown agent, returns invalid JSON, or the
-        call itself fails (network error, model not pulled, etc.).
-        """
-        logger.info("call_router: provider=%s model=%s query=%r", self.router_provider, self.router_model, request.current_query)
-        
-        # Prepare conversation history for the LLM
-        messages: List[ChatCompletionMessageParam] = [
-            {"role": "system", "content": (
-                "You are an expert routing agent for an e-commerce customer service chatbot. "
-                "Your task is to analyze the user's current query and conversation history to determine "
-                "which specialized agent should handle the request. "
-                "You must respond with a JSON object containing three fields: " 
-                "1. `agent_name`: The name of the agent to invoke. Choose from: "
-                "'OrderTrackingAgent', 'ProductRecommendationAgent', 'ReturnsAgent', 'GeneralPurposeAgent', 'EscalationAgent'. "
-                "2. `parameters`: A JSON object containing any key-value pairs relevant to the agent's task "
-                "(e.g., {'order_id': '12345'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
-                "If no specific parameters are extracted, return an empty object {}. "
-                "3. `confidence`: A float between 0.0 and 1.0 representing your confidence in this routing decision. " # <--- ADDED HERE
-                "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent'. "
-                "If the request implies an unresolvable issue or an explicit need for human intervention, choose 'EscalationAgent'. "
-                "Always output a valid JSON object. Do NOT include any other text."
-            )}
-        ]
-        
-        # Add conversation history
-        for msg in request.conversation_history:
-            messages.append({"role": msg.role, "content": msg.content})   
-        
-        # Add current user query
-        messages.append({"role": "user", "content": request.current_query})
-
-        try:
-            parsed_invocation = self._complete_structured(
-                caller="call_router", provider=self.router_provider,
-                client=self.router_client, model=self.router_model, mode=self.router_mode,
-                messages=messages, schema=AgentInvocation,
-                fallback_model=self.router_local_model,
-                temperature=0.0, seed=42, # low temp + fixed seed for deterministic routing
-            )
-
-            # Simple check for known agents, fallback if LLM invents one
-            if parsed_invocation.agent_name not in ["OrderTrackingAgent", "ProductRecommendationAgent", "ReturnsAgent", "GeneralPurposeAgent", "EscalationAgent"]:
-                logger.warning("call_router: LLM suggested unknown agent '%s' - falling back to GeneralPurposeAgent", parsed_invocation.agent_name)
-                return AgentInvocation(agent_name="GeneralPurposeAgent", confidence=0.5, parameters={"original_query": request.current_query})
-
-            logger.info("call_router: agent=%s confidence=%s", parsed_invocation.agent_name, parsed_invocation.confidence)
-            return parsed_invocation
-
-        except ValidationError as e:
-            logger.warning("call_router: LLM output invalid (%s) - falling back to GeneralPurposeAgent", e)
-            # Fallback for malformed LLM output
-            return AgentInvocation(
-                agent_name="GeneralPurposeAgent",
-                confidence=0.3, # Lower confidence for fallback
-                parameters={"original_query": request.current_query, "error": "LLM routing output parse error"}
-            )
-        except Exception as e:
-            logger.error("call_router: error calling router LLM: %s", e, exc_info=True)
-            # General fallback for API errors, network issues, etc.
-            return AgentInvocation(
-                agent_name="GeneralPurposeAgent",
-                confidence=0.2, # Very low confidence for general errors
-                parameters={"original_query": request.current_query, "error": f"LLM routing general error: {e}"}
-            )
-
+    # --- Langfuse Integration Start: @observe decorator for call_agent_reason ---
+    @observe(name="llm_inference_call_agent_reason")
+    # --- Langfuse Integration End ---
     def call_agent_reason(self, request: LLMAgentReasonRequest) -> LLMAgentReasonResponse:
-        """Ask the LLM to plan the agent's single next step.
-
-        Given a task description, the agent's current state, and the tools it's
-        allowed to use (`request.available_tools`), the LLM returns one of
-        'call_api' / 'query_rag' / 'return_result' / 'escalate', plus which tool
-        to call and with what parameters if applicable. Callers must compare
-        `response.tool_name` against the exact string they advertised in
-        `available_tools` - see services/agents/order_tracking_agent.py for the
-        convention (`'ECommerceAPI.getOrderDetails'`, not just `'ECommerceAPI'`).
-        Falls back to `action='return_result'` on any unknown action, invalid
-        JSON, or call failure.
-        """
         logger.info("call_agent_reason: provider=%s model=%s agent=%s", self.agent_reason_provider, self.agent_reason_model, request.agent_name)
 
-        # Prepare the reasoning prompt for the LLM
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": (
                 "You are a reasoning engine for a specialised customer-support AI agent. "
@@ -328,10 +325,15 @@ class LLMInferenceService:
                 "decide the SINGLE NEXT action the agent should take. "
                 "You must respond with a JSON object containing exactly these fields: "
                 "1. `action`: one of 'call_api', 'query_rag', 'return_result', 'escalate'. "
-                "2. `tool_name`: the name of the tool to call if action is 'call_api' or 'query_rag' "
-                "(must be one of the tools listed in `available_tools`), otherwise null. "
-                "3. `tool_params`: a JSON object of parameters required for that tool call, otherwise null. "
-                "4. `thought`: a brief chain-of-thought explanation for this decision. "
+                "2. `tool_name`: The general name of the tool category (e.g., 'ECommerceAPI', 'RAG'). "
+                "   Return null if `action` is 'return_result' or 'escalate'. "
+                "3. `tool_params`: A JSON object of parameters required for that tool call. "
+                "   If `action` is 'call_api' or 'query_rag', this object MUST include a `method` field "
+                "   specifying the exact function to call within that tool (e.g., {'method': 'getOrderDetails', 'order_id': 'ord-1001'}). "
+                "   Order IDs always look like 'ord-<characters>' (e.g. 'ord-1001') - never strip the 'ord-' prefix "
+                "   or extract a bare number, even if the customer wrote one. "
+                "   Otherwise, return null. "
+                "4. `thought`: A brief chain-of-thought explanation for this decision. "
                 "Use 'return_result' once enough information has been gathered to answer the task. "
                 "Use 'escalate' only if the task cannot be resolved with the available tools. "
                 "Always output a valid JSON object. Do NOT include any other text."
@@ -340,7 +342,7 @@ class LLMInferenceService:
                 f"Agent: {request.agent_name}\n"
                 f"Task: {request.task_description}\n"
                 f"Current state: {request.current_state}\n"
-                f"Available tools: {request.available_tools}"
+                f"Available tools: {request.available_tools}" # This list is still useful for context
             )}
         ]
 
@@ -350,10 +352,9 @@ class LLMInferenceService:
                 client=self.agent_reason_client, model=self.agent_reason_model, mode=self.agent_reason_mode,
                 messages=messages, schema=LLMAgentReasonResponse,
                 fallback_model=self.agent_reason_local_model,
-                temperature=0.0, seed=42, # low temp + fixed seed for deterministic reasoning
+                temperature=0.0, seed=42,
             )
 
-            # Simple check for known actions, fallback if LLM invents one
             valid_actions = {"call_api", "query_rag", "return_result", "escalate"}
             if parsed_response.action not in valid_actions:
                 logger.warning("call_agent_reason: LLM suggested unknown action '%s' - falling back to return_result", parsed_response.action)
@@ -362,37 +363,67 @@ class LLMInferenceService:
                     thought=f"Unknown action '{parsed_response.action}' from LLM; defaulting to return_result."
                 )
 
+            # --- MODIFIED VALIDATION LOGIC ---
+            if parsed_response.action in ["call_api", "query_rag"]:
+                if not parsed_response.tool_name:
+                    logger.warning("call_agent_reason: LLM suggested action '%s' but no tool_name - falling back to return_result", parsed_response.action)
+                    return LLMAgentReasonResponse(action="return_result", thought="LLM suggested tool action without a tool_name.")
+
+                if not parsed_response.tool_params or "method" not in parsed_response.tool_params:
+                    logger.warning("call_agent_reason: LLM suggested action '%s' but missing 'method' in tool_params - falling back to return_result", parsed_response.action)
+                    return LLMAgentReasonResponse(action="return_result", thought="LLM suggested tool action without 'method' in tool_params.")
+
+                # Now, instead of checking if tool_name is in available_tools, we check if the full method name is implicitly valid
+                # For now, we rely on the agent's 'tools' dict to do the final validation.
+                # The LLM is now trained to put "ECommerceAPI" in tool_name and "getOrderDetails" in tool_params['method']
+                full_tool_identifier = f"{parsed_response.tool_name}.{parsed_response.tool_params['method']}"
+                if full_tool_identifier not in request.available_tools:
+                    logger.warning(
+                        "call_agent_reason: LLM suggested tool '%s' with method '%s' not in available tools %s - falling back to return_result",
+                        parsed_response.tool_name, parsed_response.tool_params['method'], request.available_tools
+                    )
+                    return LLMAgentReasonResponse(
+                        action="return_result",
+                        thought=f"LLM suggested unknown/unavailable tool method '{full_tool_identifier}'; defaulting to return_result."
+                    )
+            # --- END MODIFIED VALIDATION LOGIC ---
+
             logger.info(
-                "call_agent_reason: agent=%s action=%s tool_name=%s",
+                "call_agent_reason: agent=%s action=%s tool_name=%s method=%s",
                 request.agent_name, parsed_response.action, parsed_response.tool_name,
+                parsed_response.tool_params.get('method') if parsed_response.tool_params else None,
             )
             return parsed_response
 
         except ValidationError as e:
             logger.warning("call_agent_reason: LLM output invalid (%s) - defaulting to return_result", e)
-            # Fallback for malformed LLM output
             return LLMAgentReasonResponse(
                 action="return_result",
                 thought=f"LLM agent-reason output parse error: {e}"
             )
         except Exception as e:
             logger.error("call_agent_reason: error calling agent-reason LLM: %s", e, exc_info=True)
-            # General fallback for API errors, network issues, etc.
             return LLMAgentReasonResponse(
                 action="return_result",
                 thought=f"LLM agent-reason general error: {e}"
             )
 
-
+    # --- Langfuse Integration Start: @observe decorator for call_agent_interpret ---
+    @observe(name="llm_inference_call_agent_interpret")
+    # --- Langfuse Integration End ---
     def call_agent_interpret(self, request: LLMAgentInterpretRequest) -> LLMAgentInterpretResponse:
-        """Turn a tool's raw output into a structured diagnosis.
+        """Turn a tool's raw output into a structured diagnosis or confirmation.
 
-        Only one `interpretation_goal` is implemented today - 'diagnose order
-        issue', which always validates against `OrderIssueAnalysis`. A second
-        goal (e.g. for ProductRecommendationAgent) would need this method to
-        pick a different response model based on `request.interpretation_goal`,
-        which it doesn't do yet. Falls back to `issue_type='Unknown'` with
-        `severity='high'` on invalid JSON or a call failure.
+        Always validates against `OrderIssueAnalysis`, regardless of which of
+        `OrderTrackingAgent`'s three `interpretation_goal` strings is passed
+        ('diagnose order issue', 'confirm the cancellation...', 'confirm the
+        deletion...') - the system prompt below explains all three so a
+        successful cancel/delete doesn't get awkwardly forced into an "issue"
+        framing. A goal for a different agent (e.g. ProductRecommendationAgent)
+        would need this method to pick a different response model based on
+        `request.interpretation_goal`, which it doesn't do yet. Falls back to
+        `issue_type='Unknown'` with `severity='high'` on invalid JSON or a
+        call failure.
         """
         logger.info(
             "call_agent_interpret: provider=%s model=%s agent=%s goal=%s",
@@ -404,13 +435,18 @@ class LLMInferenceService:
             {"role": "system", "content": (
                 "You are an expert AI assistant tasked with interpreting raw data "
                 "and extracting structured insights based on a specific interpretation goal. "
-                "You must respond with a JSON object representing the structured interpretation. "
-                "For the 'diagnose order issue' goal, the JSON must contain: "
+                "You must respond with a JSON object representing the structured interpretation, containing: "
                 "1. `issue_type`: A string describing the issue (e.g., 'PaymentPending', 'ShippingDelay', 'None', 'Unknown'). "
                 "2. `recommendation`: A brief, actionable recommendation or summary related to the issue. "
                 "3. `severity`: An optional string for severity ('low', 'medium', 'high'). "
                 "4. `additional_notes`: Any optional extra context or details. "
-                "If no issue is found, `issue_type` should be 'None' and `recommendation` should reflect no issue. "
+                "For a 'diagnose order issue' goal: identify what, if anything, is wrong with the order from the "
+                "raw data. If no issue is found, `issue_type` should be 'None' and `recommendation` should reflect "
+                "no issue. "
+                "For a 'confirm the cancellation'/'confirm the deletion' goal: the action in raw_data ALREADY "
+                "succeeded - you are not diagnosing a problem. Set `issue_type` to 'None', and make "
+                "`recommendation` a short, customer-facing confirmation sentence (e.g. 'Your order has been "
+                "cancelled; any payment will be refunded within 5-7 business days.'), not a description of an issue. "
                 "Always output a valid JSON object strictly adhering to the schema. Do NOT include any other text."
             )},
             {"role": "user", "content": (
@@ -454,7 +490,10 @@ class LLMInferenceService:
                 structured_interpretation=OrderIssueAnalysis(issue_type="Unknown", recommendation=f"An internal error occurred during interpretation: {e}", severity="high"),
                 thought=f"LLM agent-interpret general error for goal '{request.interpretation_goal}'"
             )
-    
+
+    # --- Langfuse Integration Start: @observe decorator for call_agent_generate ---
+    @observe(name="llm_inference_call_agent_generate")
+    # --- Langfuse Integration End ---
     def call_agent_generate(self, request: LLMAgentReasonRequest) -> AgentGenerationOutput:
         """Generate a short natural-language snippet for a single agent-level task.
 
@@ -516,7 +555,10 @@ class LLMInferenceService:
                 confidence=0.0, # Zero confidence for general errors
                 context_used=[f"LLM general error: {e}"]
             )
-        
+
+    # --- Langfuse Integration Start: @observe decorator for call_generative ---
+    @observe(name="llm_inference_call_generative")
+    # --- Langfuse Integration End ---
     def call_generative(self, request: NLGRequest) -> FinalNLGOutput:
         """Synthesize the final customer-facing reply from the agent's result(s).
 
@@ -562,17 +604,38 @@ class LLMInferenceService:
                         f"- Source Documents: {', '.join(result_data.source_documents_summary) if result_data.source_documents_summary else 'None'}"
                     )
                 elif isinstance(result_data, EscalationDetails): # New handler for EscalationAgent
+                    # --- FIX: Changed 'conversation_context' to 'conversation_summary' ---
                     formatted_outputs.append(
                         f"### Escalation Notification ({status_indicator})\n"
                         f"- Reason: {result_data.escalation_reason}\n"
                         f"- Original Query: {result_data.original_query}\n"
                         f"- Conversation Summary Snippet: {result_data.conversation_summary[-1].content if result_data.conversation_summary else 'N/A'}"
                     )
+                    # --- END FIX ---
                 elif isinstance(result_data, AgentGenerationOutput): # If an agent returned a raw generation
                      formatted_outputs.append(
                         f"### Agent Generated Snippet ({status_indicator})\n"
                         f"- Snippet: {result_data.generated_text}\n"
                         f"- Confidence: {result_data.confidence:.2f}"
+                    )
+                elif isinstance(result_data, dict) and "message" in result_data:
+                    # The common shape for an agent-generated status/failure/
+                    # confirmation-request sentence - e.g. OrderTrackingAgent's
+                    # failure path and its confirmation-gate branches,
+                    # ProductRecommendationAgent's tool branches. Surface the
+                    # message as plain text rather than falling through to the
+                    # raw-dict-repr branch below, which would otherwise leak
+                    # internal bookkeeping keys (needs_confirmation,
+                    # pending_confirmation, exact tool identifiers like
+                    # "ECommerceAPI.cancelOrder") straight into this prompt.
+                    extra = {
+                        k: v for k, v in result_data.items()
+                        if k not in ("message", "needs_confirmation", "pending_confirmation")
+                    }
+                    extra_str = f"\n- Additional details: {extra}" if extra else ""
+                    formatted_outputs.append(
+                        f"### {res.agent_name} Message ({status_indicator})\n"
+                        f"- Message: {result_data['message']}{extra_str}"
                     )
                 else: # Fallback for Dict[str, Any] or other unexpected types
                     formatted_outputs.append(
@@ -608,11 +671,17 @@ class LLMInferenceService:
         # Prepare conversation history for the LLM
         messages: List[ChatCompletionMessageParam] = [
             {"role": "system", "content": (
-                "You are the main customer service chatbot, designed to provide friendly, "
+                "You are Maximus, the IISc Alumni Store's main customer service chatbot. "
+                "Introduce yourself by name only if the customer asks who they're talking to - "
+                "don't reintroduce yourself every turn. You are designed to provide friendly, "
                 "helpful, and accurate responses to e-commerce customers. "
                 "Your goal is to synthesize information from various specialized agents and "
                 "the ongoing conversation history into a single, coherent, natural language response. "
                 "Prioritize direct answers from agent results. "
+                "Only state facts that actually appear in the agent results or conversation history below - "
+                "never invent or assume an order status, price, product detail, or other fact that wasn't "
+                "actually given to you. If the agent results don't fully answer the customer's question, say so "
+                "rather than filling the gap with a guess. "
                 "Maintain a helpful and polite tone. "
                 "If an escalation is needed, clearly state that a human agent will be involved. "
                 "You must respond with a JSON object containing three fields: "
@@ -668,29 +737,177 @@ class LLMInferenceService:
                 confidence=0.0
             )
 
+    # --- Langfuse Integration Start: @observe decorator ---
+    #@observe(name="llm_inference_call_embeddings")
+    # --- Langfuse Integration End ---
     def call_embeddings(self, text: str) -> List[float]:
         """Return a vector for `text`, used by services/rag.py for similarity search.
 
-        This is a deterministic stub, not a real embedding model call: it maps
-        the first 16 characters to floats via `ord()`. Good enough for the
-        in-memory RAG demo (services/rag.py's MockRAGService does substring/
-        keyword matching, not real vector similarity), not representative of
-        real embedding quality or dimensionality (real models return
-        hundreds-to-thousands of dimensions; this returns at most 16).
+        Part of the same hybrid local/Gemini provider design as the other
+        four call_* methods (see _resolve_role()), via EMBEDDING_PROVIDER
+        (default "local"):
+        - "local": Ollama's embedding model (e.g. 'nomic-embed-text', native
+          768-dim) via local_client.
+        - "gemini": gemini-embedding-001 via the same Gemini OpenAI-compat
+          client the chat roles use, with `dimensions=EMBEDDING_DIM` to
+          truncate its native 3072-dim output down to 768 (a genuine
+          Matryoshka truncation, not a lossy reshape - confirmed the
+          truncated output is a stable prefix of the full one) so it stays
+          the same shape as whatever's already in the FAISS index.
+
+        Same dimension is necessary but NOT sufficient for the two
+        providers' vectors to be interchangeable - they're different
+        models, so their vector spaces don't line up even at equal
+        dimension. services/rag.py's RAGService stamps a provenance marker
+        alongside the persisted index recording which provider/model built
+        it, and refuses to silently mix in vectors from a different one -
+        see its docstring.
+
+        Raises EmbeddingUnavailableError on any failure rather than
+        returning a zero-vector fallback: with FAISS's IndexFlatL2 (see
+        services/rag.py), an all-zero embedding doesn't error, it silently
+        becomes "equidistant from every document," turning a real backend
+        outage into near-arbitrary RAG results with no visible failure -
+        worse than raising, which lets each caller decide how to degrade
+        (skip this chunk during ingestion, treat as "no RAG match" during a
+        query) instead of masking the problem entirely. Every caller of this
+        method must handle EmbeddingUnavailableError - see
+        services/data_pipeline.py's ingestion methods and
+        services/agents/general_purpose_agent.py /
+        product_recommendation_agent.py's RAG-fallback paths.
         """
-        return [float(ord(c)) / 100 for c in text[:16]]
+        if not text or not text.strip():
+            logger.warning("call_embeddings: Received empty text, returning fallback embedding.")
+            return FALLBACK_EMBEDDING
+
+        logger.info("call_embeddings: provider=%s model=%s text_len=%d", self.embedding_provider, self.embedding_model, len(text))
+        try:
+            if self.embedding_provider == "gemini":
+                response = self._gemini_client().embeddings.create(
+                    model=self.embedding_model,
+                    input=text,
+                    dimensions=EMBEDDING_DIM,
+                )
+            else:
+                # The OpenAI client's embeddings.create method expects 'input' and 'model'
+                response = self.local_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=text,
+                )
+            embedding = response.data[0].embedding
+            logger.debug("call_embeddings: successfully generated embedding of size %d", len(embedding))
+            return embedding
+        except OpenAIError as e:
+            logger.error("call_embeddings: %s API error for model %s: %s", self.embedding_provider, self.embedding_model, e, exc_info=True)
+            raise EmbeddingUnavailableError(f"Embedding backend error for provider={self.embedding_provider} model={self.embedding_model}") from e
+        except Exception as e:
+            logger.error("call_embeddings: General error generating embedding for provider %s model %s: %s", self.embedding_provider, self.embedding_model, e, exc_info=True)
+            raise EmbeddingUnavailableError(f"Embedding backend error for provider={self.embedding_provider} model={self.embedding_model}") from e
+    
+    # --- Langfuse Integration Start: @observe decorator for call_task_decomposer ---
+    @observe(name="llm_inference_call_task_decomposer")
+    # --- Langfuse Integration End ---
+    def call_task_decomposer(self, session_id: str, query: str, available_agents: Optional[List[str]] = None) -> DecomposedQuery:
+        """
+        Decomposes a complex user query into a list of smaller, actionable sub-tasks.
+        Each sub-task includes an inferred agent and its parameters.
+
+        `available_agents` should be the orchestrator's actual registered agent
+        names (`list(AgentOrchestratorService.agents)`) - defaults to the
+        historical four if omitted so any existing caller keeps working
+        unchanged, but a caller that passes the real list keeps this prompt in
+        sync with whichever agents are actually registered, instead of a name
+        added/renamed in api/dependencies.py silently going stale here.
+        """
+        agent_names = available_agents or [
+            "OrderTrackingAgent", "ProductRecommendationAgent", "GeneralPurposeAgent", "EscalationAgent",
+        ]
+        agent_choices = ", ".join(f"'{name}'" for name in agent_names)
+        logger.info("call_task_decomposer: provider=%s model=%s query=%r", self.decomposer_provider, self.decomposer_model, query)
+
+        messages: List[ChatCompletionMessageParam] = [
+            {"role": "system", "content": (
+                "You are an expert AI task decomposition engine for an e-commerce customer service chatbot. "
+                "Your task is to break down complex, multi-intent user queries into a list of independent sub-tasks. "
+                "For each sub-task, identify the relevant part of the original query, "
+                "infer the most appropriate specialized agent to handle it, and extract any necessary parameters. "
+                "You must respond with a JSON object containing three fields: "
+                "1. `primary_intent_summary`: A brief summary of the user's overall goal. "
+                "2. `sub_tasks`: A list of JSON objects, each representing a 'DecomposedSubTask'. Each 'DecomposedSubTask' MUST contain: "
+                "   - `original_segment`: The direct quote or paraphrase of the part of the original query addressed by this sub-task. "
+                f"   - `inferred_agent_name`: The name of the agent. Choose from: {agent_choices}. "
+                "   - `inferred_parameters`: A JSON object of key-value pairs relevant to the agent's task "
+                "     (e.g., {'order_id': 'ord-1001'} for OrderTrackingAgent, {'product_type': 'laptop'} for ProductRecommendationAgent). "
+                "     Order IDs always look like 'ord-<characters>' (e.g. 'ord-1001') - never strip the 'ord-' prefix "
+                "     or extract a bare number, even if the customer wrote one. "
+                "     If no specific parameters are extracted, return an empty object {}. "
+                "3. `overall_confidence`: A float between 0.0 and 1.0 representing your confidence in this decomposition. "
+                "If the query is simple and clearly single-intent, return a single sub-task. "
+                "If the intent is unclear or too broad for a specialized agent, default to 'GeneralPurposeAgent' for that sub-task. "
+                "If the request implies an unresolvable issue or an explicit need for human intervention, choose 'EscalationAgent' for that sub-task. "
+                "Always output a valid JSON object strictly adhering to the DecomposedQuery schema. Do NOT include any other text."
+            )},
+            {"role": "user", "content": f"Decompose the following customer query: \"{query}\""}
+        ]
+
+        try:
+            parsed_decomposition = self._complete_structured(
+                caller="call_task_decomposer", provider=self.decomposer_provider,
+                client=self.decomposer_client, model=self.decomposer_model, mode=self.decomposer_mode,
+                messages=messages, schema=DecomposedQuery,
+                fallback_model=self.decomposer_local_model,
+                temperature=0.0, seed=42, # low temp + fixed seed for deterministic decomposition
+            )
+            logger.debug("call_task_decomposer: Raw decomposition result: %s", parsed_decomposition.model_dump_json(indent=2))
+            logger.info("call_task_decomposer: decomposed into %d sub-task(s)", len(parsed_decomposition.sub_tasks))
+            return parsed_decomposition
+
+        except ValidationError as e:
+            logger.warning("call_task_decomposer: LLM output invalid (%s) - falling back to single GeneralPurposeAgent", e)
+            return DecomposedQuery(
+                primary_intent_summary="Error in task decomposition",
+                sub_tasks=[
+                    DecomposedSubTask(
+                        original_segment=query,
+                        inferred_agent_name="GeneralPurposeAgent",
+                        inferred_parameters={"original_query": query},
+                    )
+                ],
+                overall_confidence=0.3
+            )
+        except Exception as e:
+            logger.error("call_task_decomposer: error calling decomposer LLM: %s", e, exc_info=True)
+            return DecomposedQuery(
+                primary_intent_summary="Error in task decomposition",
+                sub_tasks=[
+                    DecomposedSubTask(
+                        original_segment=query,
+                        inferred_agent_name="GeneralPurposeAgent",
+                        inferred_parameters={"original_query": query},
+                    )
+                ],
+                overall_confidence=0.2
+            )
+    # --- END NEW METHOD call_task_decomposer ---
 
 # Example of how this service might be run (e.g., as a FastAPI endpoint):
 if __name__ == "__main__":
     # Local by default (needs Ollama running); set ROUTER_PROVIDER=gemini
     # (+ GEMINI_API_KEY) in the environment to exercise the cloud path instead.
     llm_service = LLMInferenceService()
-    
-    # Mock a router call
-    router_req = RoutingRequest(session_id="test_123", conversation_history=[], current_query="Check my order")
-    agent_invoc = llm_service.call_router(router_req)
-    print(f"\nRouter Result: {agent_invoc}")
-    
-    # Mock an embedding call
-    embedding = llm_service.call_embeddings("Hello World")
-    print(f"Embedding: {embedding[:5]}...")
+
+    decomposer_query = "What is your return policy and where is my order 123?"
+    decomposed_result = llm_service.call_task_decomposer("test_decomp_session", decomposer_query)
+    print(f"\nDecomposer Result for '{decomposer_query}':")
+    print(f"  Primary Intent: {decomposed_result.primary_intent_summary}")
+    for i, sub_task in enumerate(decomposed_result.sub_tasks):
+        print(f"  Sub-task {i+1}: Segment='{sub_task.original_segment}', Agent='{sub_task.inferred_agent_name}', Params={sub_task.inferred_parameters}")
+    # --- MODIFIED EMBEDDING TEST ---
+    # Test a normal embedding call
+    embedding = llm_service.call_embeddings("Hello World from the real embedding model!")
+    print(f"Embedding (first 5 values): {embedding[:5]}... (Length: {len(embedding)})")
+
+    # Test with empty text for fallback
+    empty_embedding = llm_service.call_embeddings("")
+    print(f"Empty Embedding (first 5 values): {empty_embedding[:5]}... (Length: {len(empty_embedding)})")
+    # --- END MODIFIED EMBEDDING TEST ---

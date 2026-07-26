@@ -12,20 +12,62 @@ and isn't shared across multiple replicas. Fine for local dev/demo; would need
 a real store (Redis, a DB table) before running more than one instance.
 """
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+# --- Langfuse Integration Start: Only import observe ---
+from langfuse import observe, get_client
+# --- Langfuse Integration End ---
 from common.models import (
     CustomerQuery, ChatbotResponse,
-    RoutingRequest, AgentInvocation, AgentTask, StructuredAgentResult, NLGRequest,
+    AgentTask, StructuredAgentResult, NLGRequest,
     Message,
     FinalNLGOutput,
     SentimentResult,
+    # --- NEW IMPORTS: For multi-intent decomposition ---
+    DecomposedQuery, DecomposedSubTask,
+    # For the passive faithfulness check below (step 5.6)
+    StructuredOrderSummary, StructuredProductRecommendation,
 )
 from services.pii_masker import PIIMasker
 from services.llm_inference import LLMInferenceService
 from services.classifier_client import ClassifierClient
+from services.guardrails import GuardrailService
 from services.agents.base_agent import BaseAgent  # for type hinting the agents dict
 
 logger = logging.getLogger(__name__)
+
+
+def _log_faithfulness_check(agent_results: List[StructuredAgentResult], response_text: str) -> None:
+    """Passive, logging-only check: does the generated reply actually
+    mention the key facts each successful agent result carried (an order's
+    ID, a recommended product's name)? Never blocks or alters the reply -
+    call_generative()'s own fallback/confidence handling already covers
+    outright failure; this is a narrower signal for a *plausible-looking but
+    wrong* reply (a dropped or misstated detail), worth a human glancing at
+    the trace for, not worth risking a false positive withholding a reply
+    that's actually fine. Checked against the pre-guardrail text
+    (call_generative()'s raw output) since this measures generation
+    faithfulness specifically, not the separate output-redaction concern.
+    """
+    lowered_response = (response_text or "").lower()
+    for result in agent_results:
+        if result.status != "success":
+            continue
+        data = result.result_data
+        if isinstance(data, StructuredOrderSummary):
+            if data.order_id and data.order_id.lower() not in lowered_response:
+                logger.warning(
+                    "Faithfulness check: generated reply does not mention order_id=%s (agent=%s) - "
+                    "possible dropped/hallucinated detail in call_generative()'s synthesis",
+                    data.order_id, result.agent_name,
+                )
+        elif isinstance(data, StructuredProductRecommendation):
+            if data.name and data.name.lower() not in lowered_response:
+                logger.warning(
+                    "Faithfulness check: generated reply does not mention recommended product name=%r (agent=%s) - "
+                    "possible dropped/hallucinated detail in call_generative()'s synthesis",
+                    data.name, result.agent_name,
+                )
+
 
 class AgentOrchestratorService:
     """
@@ -34,7 +76,8 @@ class AgentOrchestratorService:
     conversation history, and final customer-facing natural language synthesis.
     """
     def __init__(self, llm_inference_client: LLMInferenceService, pii_masker: PIIMasker,
-                 agents: Dict[str, BaseAgent], classifier_client: ClassifierClient = None):
+                 agents: Dict[str, BaseAgent], classifier_client: ClassifierClient = None,
+                 guardrail_service: GuardrailService = None):
         self.llm_inference_client = llm_inference_client
         self.pii_masker = pii_masker
         self.agents = agents  # agent_name -> agent instance (see api/dependencies.py get_agents())
@@ -42,6 +85,11 @@ class AgentOrchestratorService:
         # default until that's started separately - see ClassifierClient's
         # fail-soft behaviour) rather than requiring every caller to build one.
         self.classifier_client = classifier_client or ClassifierClient()
+        # Stateless rule-based checks (services/guardrails.py) - defaults the
+        # same way classifier_client does, so existing callers
+        # (api/dependencies.py, main_simulation.py) need no changes to get
+        # guardrails for free.
+        self.guardrail_service = guardrail_service or GuardrailService()
         # Per-session conversation turns, oldest first. Not persisted anywhere.
         self.conversation_history_db: Dict[str, List[Message]] = {}
         # Last agent/result per session - currently write-only, no reader consults it yet.
@@ -51,10 +99,31 @@ class AgentOrchestratorService:
         # NLGRequest.customer_sentiment / LLMInferenceService.call_generative)
         # - routing/agent selection still ignores it, only NLG consumes it.
         self.session_sentiment: Dict[str, SentimentResult] = {}
+        # user_id that first used each session_id - first-write-wins, never
+        # overwritten on later turns. Lets api/routers/chat.py's history/delete
+        # endpoints refuse a mismatched user_id the same way
+        # EcommerceClient.get_order_details() refuses a mismatched order owner.
+        self.session_owner: Dict[str, str] = {}
+        # session_id -> {"tool": ..., "order_id": ...} for a destructive order
+        # action (cancel/delete) awaiting the customer's yes/no - set below
+        # when an agent result carries needs_confirmation=True (see
+        # services/agents/order_tracking_agent.py's confirmation gate),
+        # cleared once that session's next turn resolves it either way.
+        self.pending_confirmation: Dict[str, Dict[str, Any]] = {}
         # Routing decisions keyed by exact masked-text match, so a repeated identical
         # query skips a second LLM router call. Grows unbounded for the process lifetime.
-        self.orchestrator_routing_cache: Dict[str, AgentInvocation] = {}
+        # --- MODIFIED: Cache now stores DecomposedQuery for multi-intent ---
+        self.orchestrator_routing_cache: Dict[str, DecomposedQuery] = {}
+        # --- END MODIFIED ---
 
+    # --- Langfuse Integration Start: Root Trace using @observe decorator ---
+    # capture_input/output=False: `query.text` (the decorator's default input
+    # capture target) is raw, UNMASKED customer text - PII masking happens
+    # inside this function, not before it. Input/output are set manually
+    # below, after masking/guardrail screening, so the trace still shows
+    # something useful without ever sending raw PII to Langfuse Cloud.
+    @observe(name="orchestrator_handle_customer_query", capture_input=False, capture_output=False)
+    # --- Langfuse Integration End ---
     def handle_customer_query(self, query: CustomerQuery) -> ChatbotResponse:
         """Run one customer message through the full pipeline and return a reply.
 
@@ -69,6 +138,9 @@ class AgentOrchestratorService:
              failure never surfaces as a raw error to the customer.
           5. Turn the agent's structured result into a natural-language reply,
              calibrated to the sentiment from step 1.5 when available.
+          5.6. Passive faithfulness check (_log_faithfulness_check) - logs a
+               warning if the reply omits a key fact an agent result carried;
+               never blocks or alters the reply.
           6. Persist the updated history and return the response.
         """
         logger.info("Handling customer query: session_id=%s user_id=%s", query.session_id, query.user_id)
@@ -78,6 +150,13 @@ class AgentOrchestratorService:
         # on receipt, since there's no separate edge layer in this project yet.
         masked_query = self.pii_masker.mask_text(query.text, session_id=query.session_id, user_id=query.user_id)
         logger.debug("Masked query: '%s'", masked_query.masked_text)
+
+        # Set the trace's input now that it's masked (see capture_input=False
+        # above) - session_id/user_id are opaque identifiers, not PII content.
+        get_client().update_current_span(
+            input=masked_query.masked_text,
+            metadata={"session_id": query.session_id, "user_id": query.user_id, "source_channel": query.source_channel},
+        )
 
         # 1.5. Sentiment of the customer's message, via the (separate,
         # optional) encoder-model classifier service - see
@@ -96,6 +175,7 @@ class AgentOrchestratorService:
         # append the current turn, and hand the running list to every downstream
         # call (router, agent, NLG) so each has full conversational context.
         session_id = query.session_id
+        self.session_owner.setdefault(session_id, query.user_id)
 
         current_history_raw = self.conversation_history_db.get(session_id, [])
         # Defensive: tolerate plain dicts here too, in case a caller ever seeds
@@ -103,81 +183,134 @@ class AgentOrchestratorService:
         current_history: List[Message] = [Message(**m) if isinstance(m, dict) else m for m in current_history_raw]
         current_history.append(Message(role="user", content=masked_query.masked_text))
 
-        # 3. Route to a specialist agent. Cache hit skips a second LLM call for an
-        # identical masked query (e.g. a user resending the same message).
-        logger.debug("Consulting orchestrator routing cache...")
-        routing_key = masked_query.masked_text  # simple key; could incorporate user_id if needed
-        agent_invocation: AgentInvocation
-        if routing_key in self.orchestrator_routing_cache:
-            agent_invocation = self.orchestrator_routing_cache[routing_key]
-            logger.debug("Routing cache hit for session_id=%s", session_id)
-        else:
-            logger.debug("Routing cache miss - calling the LLM router")
-            routing_request = RoutingRequest(
-                session_id=session_id,
-                conversation_history=current_history,
-                current_query=masked_query.masked_text
-            )
-            agent_invocation = self.llm_inference_client.call_router(routing_request)
-            self.orchestrator_routing_cache[routing_key] = agent_invocation
+        # 2.5. Input guardrail (services/guardrails.py) - screens for blatant
+        # prompt-injection/jailbreak attempts before anything reaches the LLM
+        # router. A block substitutes the routing decision below with
+        # EscalationAgent instead of special-casing control flow - the same
+        # agent-run -> NLG path every other route already takes, so the
+        # customer still gets a natural reply, just never gets to the router
+        # or a specialist agent.
+        input_verdict = self.guardrail_service.screen_input(masked_query.masked_text)
 
-        logger.info(
-            "Routing decision: agent=%s confidence=%s",
-            agent_invocation.agent_name, agent_invocation.confidence,
-        )
-
-        # 4. Run the chosen agent. If the router named an agent that isn't
-        # registered (e.g. a name change on one side but not the other), or
-        # confidence is too low to trust the routing decision, fall back instead
-        # of erroring: low confidence goes to EscalationAgent (treat it as
-        # unresolvable), anything else goes to GeneralPurposeAgent.
-        target_agent: BaseAgent = self.agents.get(agent_invocation.agent_name)
-        if not target_agent:
-            logger.warning(
-                "Agent '%s' not found - falling back to GeneralPurposeAgent/EscalationAgent",
-                agent_invocation.agent_name,
-            )
-            if agent_invocation.confidence < 0.5:  # arbitrary cutoff, not tuned against real data
-                target_agent = self.agents["EscalationAgent"]
-                agent_invocation.agent_name = "EscalationAgent"
-                agent_invocation.parameters = {"reason": f"No agent found for intent: {agent_invocation.agent_name}, low confidence."}
-            else:
-                target_agent = self.agents["GeneralPurposeAgent"]
-                agent_invocation.agent_name = "GeneralPurposeAgent"
-                agent_invocation.parameters = {"query": masked_query.masked_text}
-
-        agent_task = AgentTask(
-            session_id=session_id,
-            user_id=query.user_id,
-            original_query=masked_query.masked_text,
-            intent=agent_invocation.agent_name,  # the agent name doubles as the intent label here
-            params=agent_invocation.parameters,
-            conversation_context=current_history
-        )
-
-        # Only one agent ever runs per request today (no fan-out/parallel agents),
-        # so this list always ends up with exactly one result.
         agent_results: List[StructuredAgentResult] = []
-        try:
-            result = target_agent.process_task(agent_task)
-            agent_results.append(result)
-        except Exception as e:
-            # Catch-all: whatever the agent raised (LLM error, bad tool response,
-            # unhandled edge case), the customer still gets a coherent reply
-            # instead of a stack trace - EscalationAgent packages it for a human.
-            logger.error(
-                "Agent %s failed processing task_id=%s: %s - falling back to EscalationAgent",
-                target_agent.name, agent_task.task_id, e, exc_info=True,
+        final_user_intent_summary: str # To be set by decomposition or single-intent routing
+
+        if input_verdict.blocked:
+            logger.warning(
+                "Routing bypassed - input guardrail blocked this message: session_id=%s category=%s",
+                session_id, input_verdict.category,
             )
+            # If blocked, directly invoke EscalationAgent
             escalation_task = AgentTask(
                 session_id=session_id,
                 user_id=query.user_id,
                 original_query=masked_query.masked_text,
-                intent="escalation_due_to_error",
-                params={"reason": f"Agent {target_agent.name} failed with error: {e}"},
+                intent="escalation_due_to_guardrail",
+                params={"reason": f"Blocked by input guardrail (category={input_verdict.category})"},
                 conversation_context=current_history
             )
             agent_results.append(self.agents["EscalationAgent"].process_task(escalation_task))
+            final_user_intent_summary = "Blocked by guardrail, escalated."
+        else:
+            # --- START MODIFIED BLOCK: Multi-intent handling replaces old single-intent routing logic ---
+            decomposed_query: DecomposedQuery
+            # A reply to a previously-asked "are you sure?" (see
+            # services/agents/order_tracking_agent.py's confirmation gate)
+            # isn't itself a fresh request to route - skip the decomposer
+            # entirely and go straight back to OrderTrackingAgent with
+            # exactly what's pending, so a bare "yes"/"no" can never get
+            # misrouted to a different agent by the decomposer.
+            pending_confirmation = self.pending_confirmation.get(session_id)
+            if pending_confirmation:
+                logger.info(
+                    "Session %s has a pending order-action confirmation (%s) - routing this reply directly to OrderTrackingAgent",
+                    session_id, pending_confirmation,
+                )
+                decomposed_query = DecomposedQuery(
+                    primary_intent_summary="Confirming a previously requested order action",
+                    sub_tasks=[
+                        DecomposedSubTask(
+                            original_segment=masked_query.masked_text,
+                            inferred_agent_name="OrderTrackingAgent",
+                            inferred_parameters={"confirm_pending_action": True, **pending_confirmation},
+                        )
+                    ],
+                    overall_confidence=1.0,
+                )
+            else:
+                # For now, we always try to decompose. A future optimization could
+                # use a lightweight classifier to decide if decomposition is needed.
+                # We can also add caching for decomposition results here if the exact
+                # masked query is repeated (orchestrator_routing_cache is typed for this).
+                decomposed_query = self.llm_inference_client.call_task_decomposer(
+                    session_id, masked_query.masked_text, available_agents=list(self.agents)
+                )
+            final_user_intent_summary = decomposed_query.primary_intent_summary or "Customer query" # Set primary intent from decomposer
+
+            logger.info(
+                "Decomposed query into %d sub-task(s). Primary intent: '%s'",
+                len(decomposed_query.sub_tasks), final_user_intent_summary
+            )
+
+            # Process each sub-task
+            for sub_task in decomposed_query.sub_tasks:
+                logger.info(
+                    "Processing sub-task: original_segment='%s', inferred_agent_name='%s'",
+                    sub_task.original_segment, sub_task.inferred_agent_name
+                )
+                target_agent_name = sub_task.inferred_agent_name
+                target_agent: BaseAgent = self.agents.get(target_agent_name)
+
+                # Fallback if decomposer suggests an unknown agent
+                if not target_agent:
+                    logger.warning(
+                        "Decomposer suggested unknown agent '%s' for sub-task '%s' - falling back to GeneralPurposeAgent",
+                        target_agent_name, sub_task.original_segment
+                    )
+                    target_agent = self.agents["GeneralPurposeAgent"]
+                    target_agent_name = "GeneralPurposeAgent"
+                    sub_task.inferred_parameters = {"query": sub_task.original_segment} # Ensure GP agent gets the segment
+
+                sub_agent_task = AgentTask(
+                    session_id=session_id,
+                    user_id=query.user_id,
+                    original_query=sub_task.original_segment, # Use the segment for the agent's context
+                    intent=target_agent_name,
+                    params=sub_task.inferred_parameters,
+                    conversation_context=current_history # Full history is still relevant
+                )
+
+                try:
+                    result = target_agent.process_task(sub_agent_task)
+                    agent_results.append(result)
+                except Exception as e:
+                    logger.error(
+                        "Agent %s failed processing sub-task '%s': %s - falling back to EscalationAgent for this sub-task",
+                        target_agent.name, sub_task.original_segment, e, exc_info=True,
+                    )
+                    # For a failed sub-task, escalate just that sub-task's issue
+                    escalation_task = AgentTask(
+                        session_id=session_id,
+                        user_id=query.user_id,
+                        original_query=sub_task.original_segment,
+                        intent="escalation_due_to_sub_task_error",
+                        params={"reason": f"Agent {target_agent.name} failed with error during sub-task: {e}"},
+                        conversation_context=current_history
+                    )
+                    agent_results.append(self.agents["EscalationAgent"].process_task(escalation_task))
+            # --- END MODIFIED BLOCK ---
+
+            # Confirmation-gate bookkeeping: clear whatever was pending for
+            # this session - this turn resolved it one way or another (see
+            # OrderTrackingAgent._handle_confirmation_reply) - then check
+            # whether any agent result from *this* turn is itself a new
+            # confirmation request to remember for the next one.
+            if pending_confirmation:
+                self.pending_confirmation.pop(session_id, None)
+            for result in agent_results:
+                if isinstance(result.result_data, dict) and result.result_data.get("needs_confirmation"):
+                    self.pending_confirmation[session_id] = result.result_data["pending_confirmation"]
+                    break
 
         # 5. Turn the agent's structured result (a StructuredOrderSummary, a
         # StructuredProductRecommendation, etc.) into a natural-language reply.
@@ -185,29 +318,57 @@ class AgentOrchestratorService:
         nlg_request = NLGRequest(
             session_id=session_id,
             conversation_history=current_history,
-            agent_results=agent_results,
-            final_user_intent=agent_invocation.agent_name,  # simplified: the routed agent name stands in for intent
+            agent_results=agent_results, # Now a list of results from potentially multiple agents
+            final_user_intent=final_user_intent_summary, # Use the summary from decomposition
             customer_sentiment=self.session_sentiment.get(session_id),  # from step 1.5; None/"unknown" is a no-op in call_generative
         )
 
         final_nlg_output: FinalNLGOutput = self.llm_inference_client.call_generative(nlg_request)
         final_response_text = final_nlg_output.response_text
 
+        # 5.6. Faithfulness check (see _log_faithfulness_check above) -
+        # passive/logging-only, never blocks or changes what the customer
+        # receives.
+        _log_faithfulness_check(agent_results, final_response_text)
+
+        # 5.5. Output guardrail (services/guardrails.py) - the counterpart to
+        # step 1's input-side PII masking: scans what the LLM actually
+        # generated (which can echo back a tool result or a shipping
+        # address) for PII/secret-shaped substrings and redacts any hit
+        # before it reaches the customer.
+        output_verdict = self.guardrail_service.screen_output(final_response_text)
+        final_response_text = output_verdict.safe_text
+
+        # Set the trace's output now that it's guardrail-screened (see
+        # capture_output=False above).
+        get_client().update_current_span(
+            output=final_response_text,
+            metadata={"primary_intent": final_user_intent_summary, "confidence": final_nlg_output.confidence},
+        )
+
         # 6. Persist the turn and return. conversation_history_db/agent_state_store
         # are per-process only (see class docstring) - both reset on restart.
         self.conversation_history_db[session_id] = current_history + [Message(role="assistant", content=final_response_text)]
-        self.agent_state_store[session_id] = {"last_agent": agent_invocation.agent_name, "last_result": agent_results}
+        # --- MODIFIED: agent_state_store update to reflect multi-agent orchestration ---
+        self.agent_state_store[session_id] = {
+            "primary_intent": final_user_intent_summary,
+            "invoked_agents": [res.agent_name for res in agent_results],
+            "all_results": agent_results # Store all results for potential debugging/analysis
+        }
+        # --- END MODIFIED ---
 
         logger.info(
-            "Query handled: session_id=%s agent=%s confidence=%s",
-            session_id, agent_invocation.agent_name, final_nlg_output.confidence,
+            "Query handled: session_id=%s primary_intent='%s' invoked_agents=%s confidence=%s",
+            session_id, final_user_intent_summary, [res.agent_name for res in agent_results], final_nlg_output.confidence,
         )
+        # --- MODIFIED: ChatbotResponse.agent_invoked to reflect multi-agent orchestration ---
         return ChatbotResponse(
             session_id=session_id,
             response_text=final_response_text,
-            agent_invoked=agent_invocation.agent_name,
+            agent_invoked="Multi-Agent Orchestrator" if len(agent_results) > 1 else agent_results[0].agent_name if agent_results else None,
             confidence_score=final_nlg_output.confidence
         )
+        # --- END MODIFIED ---
 
 # Not meant to be run directly - api/dependencies.py and main_simulation.py both
 # construct this with real dependencies and call handle_customer_query() on it.

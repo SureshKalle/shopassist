@@ -1,110 +1,413 @@
 # services/rag.py
 """
-In-memory stand-in for a real RAG/vector-store service. Documents are ingested
-via ingest_document() (services/data_pipeline.py and api/dependencies.py's
-warm_up_services() both do this at startup) and matched via
-query_knowledge_base(), which is substring/keyword matching against
-doc.content - not a real vector similarity search - so results are only as
-good as the exact words a document and query happen to share.
+FAISS-powered vector store for RAG. Documents are ingested via ingest_document()
+(services/data_pipeline.py and api/dependencies.py's warm_up_services() both
+do this at startup).
+
+Retrieval now uses FAISS for vector similarity search against the document
+embeddings, and the JSON Lines file (`docs/rag_data/rag_knowledge_base.jsonl`)
+serves as the persistent store for the full ChunkedDocument objects (content +
+metadata) which are mapped by their integer index in the FAISS vector index.
+
+Embedding provider/model provenance: unlike LLMInferenceService's other four
+call_* roles (router/reason/interpret/generative), which are stateless
+per-request and safe to switch providers on at any time, call_embeddings()
+feeds a *persistent* index here. Two different embedding models produce
+vectors that aren't comparable even at the same dimension (see
+services/llm_inference.py's EMBEDDING_DIM/call_embeddings() docstrings for
+why gemini-embedding-001 is truncated to match Ollama's nomic-embed-text
+size) - mixing them in one FAISS index wouldn't error, it would just make
+L2 "nearest neighbor" silently meaningless. _setup_faiss_index() below
+stamps a small provenance sidecar file next to the persisted index recording
+which provider/model built it, and discards (not merges) a persisted store
+built with a different one rather than risk silently corrupting retrieval.
+In this project's own Docker deployment this rarely matters in practice -
+docs/rag_data/ is .dockerignore'd and rebuilt fresh from source PDFs/data on
+every container start (api/dependencies.py's warm_up_services()) - but it
+matters for main_simulation.py or any deployment that persists docs/rag_data/
+across restarts (e.g. a future volume mount).
 """
 import logging
-from typing import List, Dict
+import json
+import os
+import faiss       # NEW: Import faiss for vector indexing
+import numpy as np # NEW: Import numpy for array manipulation (FAISS input/output)
+from typing import List, Dict, Optional, Any
 from common.models import ChunkedDocument
-from services.llm_inference import LLMInferenceService # To get embeddings
+from services.llm_inference import LLMInferenceService
+# --- Langfuse Integration Start ---
+from langfuse import observe
+# --- Langfuse Integration End ---
 
 logger = logging.getLogger(__name__)
 
-class MockRAGService:
+# --- MODIFIED DEFAULT_EMBEDDING_DIM ---
+# Set default embedding dimension to match nomic-embed-text (768)
+DEFAULT_EMBEDDING_DIM = 768
+# --- END MODIFIED ---
+
+class RAGService:
     """
-    Simulates the RAG Service.
-    In a real system, this would be a microservice interacting with a vector database
-    (e.g., Pinecone, Weaviate, ChromaDB) and potentially a search cache (Redis).
+    Implements a RAG Service using FAISS for vector retrieval and
+    a JSON Lines file for persistent storage of ChunkedDocument data.
     """
-    def __init__(self, llm_inference_client: LLMInferenceService):
-        self.vector_db: Dict[str, ChunkedDocument] = {} # {doc_id: ChunkedDocument}
-        self.rag_query_cache: Dict[str, List[ChunkedDocument]] = {}
+    def __init__(self, llm_inference_client: LLMInferenceService,
+                 db_file_path: str = "docs/rag_data/rag_knowledge_base.jsonl",
+                 faiss_index_path: str = "docs/rag_data/faiss_index.bin"):
         self.llm_inference_client = llm_inference_client
+        self.db_file_path = db_file_path
+        self.faiss_index_path = faiss_index_path
 
-    def query_knowledge_base(self, query_embedding: List[float], query_text: str, top_k: int = 1) -> List[ChunkedDocument]:
-        """Return up to `top_k` documents matching `query_text`.
+        self.doc_store: List[ChunkedDocument] = [] # Stores ChunkedDocument objects, indexed by list position
+        self.faiss_index: Optional[faiss.Index] = None # The FAISS vector index
 
-        `query_embedding` is accepted (and every caller computes one via
-        `LLMInferenceService.call_embeddings()`) but not actually used below -
-        matching is plain substring/keyword comparison against `query_text`
-        against `doc.content`. A real vector store would rank by embedding
-        similarity instead; this keeps the parameter so callers don't need to
-        change once that swap happens.
+        # Both paths can include a directory component (e.g. docs/rag_data/) -
+        # create it if missing so a fresh checkout doesn't crash on first
+        # write. os.path.dirname("") for a bare filename is a no-op-safe "".
+        for path in (self.db_file_path, self.faiss_index_path):
+            dir_name = os.path.dirname(path)
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+
+        # --- MODIFIED: Setup FAISS index at initialization ---
+        self._setup_faiss_index()
+        # --- END MODIFIED ---
+
+
+    # --- NEW: Methods for FAISS setup and JSONL persistence ---
+    def _load_from_file(self) -> List[ChunkedDocument]:
+        """Loads ChunkedDocuments from the specified JSON Lines file."""
+        loaded_docs: List[ChunkedDocument] = []
+        if not self.db_file_path or not os.path.exists(self.db_file_path):
+            logger.info("RAG DB file not found at %s. Starting with an empty doc store.", self.db_file_path)
+            return loaded_docs
+
+        logger.info("Loading ChunkedDocuments from %s...", self.db_file_path)
+        with open(self.db_file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    data = json.loads(line)
+                    doc = ChunkedDocument.model_validate(data) # Pydantic validation
+                    loaded_docs.append(doc)
+                except json.JSONDecodeError as e:
+                    logger.error("Error decoding JSON on line %d in RAG DB file (%s): %s - Line content: %s", line_num, self.db_file_path, e, line.strip())
+                except Exception as e:
+                    logger.error("Error validating ChunkedDocument on line %d from RAG DB file (%s): %s - Line content: %s", line_num, self.db_file_path, e, line.strip())
+        logger.info("Loaded %d ChunkedDocuments from %s.", len(loaded_docs), self.db_file_path)
+        return loaded_docs
+
+    def _append_to_file(self, doc: ChunkedDocument):
+        """Appends a single ChunkedDocument to the JSON Lines file."""
+        if not self.db_file_path:
+            logger.warning("No db_file_path set for RAGService, skipping file write.")
+            return
+        try:
+            with open(self.db_file_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(doc.model_dump()) + '\n')
+            logger.debug("Appended document '%s' to %s", doc.doc_id, self.db_file_path)
+        except Exception as e:
+            logger.error("Failed to append document '%s' to file %s: %s", doc.doc_id, self.db_file_path, e)
+
+    def _provenance_path(self) -> str:
+        """Sidecar file path recording which embedding provider/model built
+        the persisted store - see module docstring for why this matters."""
+        base, _ = os.path.splitext(self.db_file_path)
+        return f"{base}.embedding_provenance.json"
+
+    def _current_embedding_provenance(self) -> Dict[str, str]:
+        return {
+            "provider": self.llm_inference_client.embedding_provider,
+            "model": self.llm_inference_client.embedding_model,
+        }
+
+    def _load_provenance(self) -> Optional[Dict[str, str]]:
+        path = self._provenance_path()
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning("Failed to read embedding provenance file %s: %s", path, e)
+            return None
+
+    def _save_provenance(self, provenance: Dict[str, str]):
+        try:
+            with open(self._provenance_path(), "w", encoding="utf-8") as f:
+                json.dump(provenance, f)
+        except Exception as e:
+            logger.warning("Failed to write embedding provenance file %s: %s", self._provenance_path(), e)
+
+    def _discard_stale_store_if_provider_mismatch(self):
+        """If a persisted store exists and was built with a different
+        embedding provider/model than is currently configured, discard it
+        (in-memory and on disk) rather than silently mixing incompatible
+        vector spaces into one FAISS index. A missing provenance file (e.g.
+        a store persisted before this check existed) is NOT treated as a
+        mismatch - there's no record to contradict the current config, so
+        the existing store is trusted and a fresh provenance file is simply
+        written going forward.
         """
-        logger.info("query_knowledge_base: query=%r top_k=%d", query_text, top_k)
+        if not self.doc_store:
+            return
+        stored = self._load_provenance()
+        current = self._current_embedding_provenance()
+        if stored is not None and stored != current:
+            logger.critical(
+                "RAG store at %s was built with embedding provider/model %s, but %s is "
+                "currently configured - vectors from different embedding models aren't "
+                "comparable even at the same dimension, so mixing them would silently "
+                "corrupt retrieval. Discarding the persisted RAG store and starting fresh "
+                "(it will be repopulated by the next ingestion run).",
+                self.db_file_path, stored, current,
+            )
+            self.doc_store = []
+            for path in (self.db_file_path, self.faiss_index_path):
+                if os.path.exists(path):
+                    os.remove(path)
 
-        # Check cache first
-        if query_text in self.rag_query_cache:
-            logger.debug("query_knowledge_base: cache hit for %r", query_text)
-            return self.rag_query_cache[query_text][:top_k]
+    def _setup_faiss_index(self):
+        """
+        Initializes the FAISS index by loading from disk or building from loaded documents.
+        This method is called once at service startup.
+        """
+        self.doc_store = self._load_from_file() # Populate doc_store from JSONL file
+        self._discard_stale_store_if_provider_mismatch()
 
-        # Simulate retrieval from vector DB (simple keyword match for mock)
-        results = []
-        for doc_id, doc in self.vector_db.items():
-            # In a real system, this would be a vector similarity search
-            if query_text.lower() in doc.content.lower():
-                results.append(doc)
-            elif "return policy" in query_text.lower() and doc.source_type == "customer_support_policy":
-                results.append(doc)
-            elif "laptop features" in query_text.lower() and doc.source_type == "product_catalog":
-                results.append(doc)
-            # Add more sophisticated mock matching here if needed
+        if os.path.exists(self.faiss_index_path):
+            try:
+                logger.info("Loading FAISS index from %s...", self.faiss_index_path)
+                self.faiss_index = faiss.read_index(self.faiss_index_path)
+                logger.info("FAISS index loaded successfully with %d vectors.", self.faiss_index.ntotal)
+                # Verify consistency: If doc_store and FAISS index have different sizes, something is off.
+                # For this dev setup, we trust the JSONL is the source of truth for docs.
+                if self.faiss_index.ntotal != len(self.doc_store):
+                    logger.warning("FAISS index has %d vectors, but doc_store has %d documents. Index might be out of sync. Rebuilding for safety.", self.faiss_index.ntotal, len(self.doc_store))
+                    self._build_faiss_index_from_doc_store() # Rebuild to ensure consistency
+            except Exception as e:
+                logger.error("Failed to load FAISS index from %s: %s. Attempting to rebuild.", self.faiss_index_path, e)
+                self.faiss_index = None # Reset and try to rebuild
+                self._build_faiss_index_from_doc_store() # Rebuild
+        else:
+            logger.info("FAISS index file not found at %s. Attempting to build new index.", self.faiss_index_path)
+            self._build_faiss_index_from_doc_store()
 
-        # Sort by some mock relevance (e.g., length of content match)
-        results.sort(key=lambda x: len(x.content) if query_text.lower() in x.content.lower() else 0, reverse=True)
+        # Record the provider/model now in effect, so a *future* startup can
+        # tell whether the store it's about to load matches. Written last
+        # (after any discard-and-rebuild above), so a mismatch this run
+        # results in this run's provider being what's recorded going forward.
+        self._save_provenance(self._current_embedding_provenance())
 
-        # Cache results for future queries
-        self.rag_query_cache[query_text] = results
+    def _build_faiss_index_from_doc_store(self):
+        """Builds a new FAISS index from the current in-memory doc_store."""
+        if not self.doc_store:
+            logger.warning("No documents in doc_store to build FAISS index. Initializing empty index.")
+            self.faiss_index = faiss.IndexFlatL2(DEFAULT_EMBEDDING_DIM) # Initialize empty index
+            return
 
-        logger.info("query_knowledge_base: %d result(s) for %r", len(results[:top_k]), query_text)
-        return results[:top_k]
+        # Ensure all embeddings have the same dimension, otherwise FAISS will fail
+        embedding_dimension = len(self.doc_store[0].embedding) if self.doc_store else DEFAULT_EMBEDDING_DIM
+        if not all(len(doc.embedding) == embedding_dimension for doc in self.doc_store):
+            logger.error("Embeddings have inconsistent dimensions. Cannot build FAISS index. Initializing empty index.")
+            # Fallback to an empty index or raise an error
+            self.faiss_index = faiss.IndexFlatL2(DEFAULT_EMBEDDING_DIM)
+            return
+        
+        # --- NEW: Check if index is already correctly initialized with current dimension ---
+        if self.faiss_index and self.faiss_index.d == embedding_dimension and self.faiss_index.ntotal == len(self.doc_store):
+             logger.info("FAISS index already consistent with doc_store, no rebuild needed.")
+             return
+        # --- END NEW ---
 
+        logger.info("Building new FAISS index from %d documents with dimension %d...", len(self.doc_store), embedding_dimension)
+        self.faiss_index = faiss.IndexFlatL2(embedding_dimension) # Using L2 (Euclidean) distance
+        
+        # Prepare embeddings for FAISS (needs numpy array of float32)
+        embeddings_matrix = np.array([doc.embedding for doc in self.doc_store]).astype('float32')
+        self.faiss_index.add(embeddings_matrix)
+        
+        faiss.write_index(self.faiss_index, self.faiss_index_path)
+        logger.info("FAISS index built and saved to %s with %d vectors.", self.faiss_index_path, self.faiss_index.ntotal)
+    # --- END NEW methods ---
+
+
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="rag_service_query_knowledge_base")
+    # --- Langfuse Integration End ---
+    # --- MODIFIED: Use FAISS for retrieval ---
+    def query_knowledge_base(self, query_embedding: List[float], query_text: str, top_k: int = 1) -> List[ChunkedDocument]:
+        """
+        Performs vector similarity search using FAISS to retrieve top_k documents.
+        `query_text` is still included for logging/context but the search is
+        based on `query_embedding`.
+        """
+        logger.info("query_knowledge_base: query=%r top_k=%d (using FAISS)", query_text, top_k)
+
+        if not self.faiss_index or self.faiss_index.ntotal == 0:
+            logger.warning("FAISS index not initialized or empty. Cannot perform semantic search. Returning empty results.")
+            return []
+
+        # Convert query embedding to numpy array (FAISS expects float32)
+        query_vector = np.array([query_embedding]).astype('float32')
+
+        # --- FIX: Check query_vector dimension against FAISS index dimension ---
+        if query_vector.shape[1] != self.faiss_index.d:
+            logger.error("Query embedding dimension mismatch. FAISS index expects %d, got %d. Returning empty results.", self.faiss_index.d, query_vector.shape[1])
+            return []
+        # --- END FIX ---
+
+        # Perform similarity search (distances, indices)
+        # D: distances of the k nearest neighbors
+        # I: labels (indices) of the k nearest neighbors
+        distances, indices = self.faiss_index.search(query_vector, top_k)
+
+        results: List[ChunkedDocument] = []
+        for i_idx in indices[0]: # indices[0] contains the indices of the top_k most similar documents
+            if i_idx == -1: # FAISS returns -1 for empty slots if top_k > ntotal
+                continue
+            if 0 <= i_idx < len(self.doc_store): # Defensive check against out-of-bounds indices
+                results.append(self.doc_store[i_idx])
+            else:
+                logger.warning("FAISS returned an out-of-bounds index: %d. Index might be stale or doc_store mismatch.", i_idx)
+
+        logger.info("query_knowledge_base: %d result(s) for %r (FAISS search completed)", len(results), query_text)
+        # The results from FAISS are already sorted by similarity, so no extra sort needed.
+        return results
+    # --- END MODIFIED ---
+
+    # --- Langfuse Integration Start: @observe decorator ---
+    @observe(name="rag_service_ingest_document")
+    # --- Langfuse Integration End ---
+    # --- MODIFIED: ingest_document to add to FAISS and persist ---
     def ingest_document(self, doc: ChunkedDocument):
         """
-        Ingests a chunked document into the RAG vector database.
-        In a real system, this would write to a persistent vector store.
+        Ingests a chunked document into the RAG service (in-memory doc_store,
+        FAISS index, and JSONL file).
         """
-        logger.debug("Ingesting document '%s' (source_type=%s) into vector DB", doc.doc_id, doc.source_type)
-        self.vector_db[doc.doc_id] = doc
+        logger.debug("Ingesting document '%s' (source_type=%s) into RAG service", doc.doc_id, doc.source_type)
+
+        # Add to in-memory doc_store
+        self.doc_store.append(doc)
+
+        # Add embedding to FAISS index
+        if self.faiss_index:
+            # Check embedding dimension consistency before adding
+            if self.faiss_index.d != len(doc.embedding):
+                logger.error("Embedding dimension mismatch for doc '%s'. FAISS index expects %d, got %d. Skipping FAISS add.", doc.doc_id, self.faiss_index.d, len(doc.embedding))
+            else:
+                self.faiss_index.add(np.array([doc.embedding]).astype('float32'))
+                # Persist FAISS index after each ingestion (for simplicity in dev).
+                # In prod, this would be batched or handled by a dedicated indexing service.
+                faiss.write_index(self.faiss_index, self.faiss_index_path)
+                logger.debug("Added embedding for '%s' to FAISS index and saved.", doc.doc_id)
+        else:
+            logger.warning("FAISS index not initialized. Document '%s' only added to doc_store and JSONL. Rebuilding index might be needed.", doc.doc_id)
+
+        # Persist to JSONL file
+        self._append_to_file(doc)
+    # --- END MODIFIED ---
 
 # Example of how this service might be used:
 if __name__ == "__main__":
+    # Ensure LLMInferenceService is ready (Ollama server and nomic-embed-text pulled)
+    from services.llm_inference import LLMInferenceService # Moved import here to avoid circular dependencies if run directly
+
+    # Initialize LLM Inference Client
     llm_inf_client = LLMInferenceService()
-    rag_service = MockRAGService(llm_inf_client)
-    
-    # Ingest some mock documents
+
+    # --- MODIFIED RAG Service initialization for file paths ---
+    rag_data_file = "docs/rag_data/demo_rag_knowledge_base.jsonl"
+    faiss_index_file = "docs/rag_data/demo_faiss_index.bin"
+
+    # Clean up previous demo files for a fresh run
+    if os.path.exists(rag_data_file):
+        os.remove(rag_data_file)
+        print(f"Removed existing {rag_data_file} for a clean demo run.")
+    if os.path.exists(faiss_index_file):
+        os.remove(faiss_index_file)
+        print(f"Removed existing {faiss_index_file} for a clean demo run.")
+
+    rag_service = RAGService(llm_inf_client, db_file_path=rag_data_file, faiss_index_path=faiss_index_file)
+    print(f"\nInitialized RAGService. JSONL file: {rag_service.db_file_path}, FAISS index: {rag_service.faiss_index_path}")
+    print(f"Initial in-memory doc_store size: {len(rag_service.doc_store)}")
+    print(f"Initial FAISS index size: {rag_service.faiss_index.ntotal if rag_service.faiss_index else 'N/A'}")
+    # --- END MODIFIED RAG Service initialization ---
+
+    print("\n--- Ingesting Documents ---")
     doc1 = ChunkedDocument(
         doc_id="prod_lap_001_desc_chunk",
-        content="This high-performance laptop features an i7 processor, 16GB RAM, and a 1TB SSD. Ideal for gaming and professional use.",
-        embedding=llm_inf_client.call_embeddings("high-performance laptop features"),
+        content="This high-performance gaming laptop features an Intel i7 processor, 16GB RAM, and a 1TB SSD. Ideal for serious gamers.",
+        embedding=llm_inf_client.call_embeddings("high-performance gaming laptop i7"),
         source_type="product_catalog",
         metadata={"product_id": "PROD_LAP_001"}
     )
     doc2 = ChunkedDocument(
         doc_id="policy_returns_general",
-        content="Our general return policy states that items can be returned within 30 days of purchase, provided they are in original packaging.",
-        embedding=llm_inf_client.call_embeddings("general return policy"),
+        content="Our general return policy states that unused items can be returned within 30 days of purchase, provided they are in original packaging. Some electronics have a 15-day return window.",
+        embedding=llm_inf_client.call_embeddings("general return policy for products"),
         source_type="customer_support_policy",
         metadata={"policy_type": "returns"}
     )
+    doc3 = ChunkedDocument(
+        doc_id="prod_head_002_desc_chunk",
+        content="Premium noise-cancelling headphones for immersive audio. Comfortable earcups and 20-hour battery life. Perfect for travel.",
+        embedding=llm_inf_client.call_embeddings("best headphones for travel"),
+        source_type="product_catalog",
+        metadata={"product_id": "PROD_HEAD_002"}
+    )
+
     rag_service.ingest_document(doc1)
     rag_service.ingest_document(doc2)
+    rag_service.ingest_document(doc3)
 
-    # Query the knowledge base
-    query_text = "What are the features of your high-end gaming laptops?"
-    query_embedding = llm_inf_client.call_embeddings(query_text)
-    results = rag_service.query_knowledge_base(query_embedding, query_text)
-    print(f"\nRAG Query Results for '{query_text}':")
-    for res in results:
-        print(f"- Doc ID: {res.doc_id}, Content: '{res.content[:50]}...'")
-    
-    query_text_2 = "What is your return policy?"
+    print(f"\nIn-memory doc_store size after ingestion: {len(rag_service.doc_store)}")
+    print(f"FAISS index size after ingestion: {rag_service.faiss_index.ntotal if rag_service.faiss_index else 'N/A'}")
+
+    # Query the knowledge base with real semantic queries
+    print("\n--- Querying Knowledge Base (FAISS Semantic Search) ---")
+
+    query_text_1 = "I need information about gaming computers."
+    query_embedding_1 = llm_inf_client.call_embeddings(query_text_1)
+    results_1 = rag_service.query_knowledge_base(query_embedding_1, query_text_1, top_k=2)
+    print(f"\nSemantic Query Results for '{query_text_1}':")
+    if results_1:
+        for i, res in enumerate(results_1):
+            print(f"- {i+1}. Doc ID: {res.doc_id}, Content: '{res.content[:70]}...' (Source: {res.source_type})")
+    else:
+        print("No results found.")
+
+    query_text_2 = "What is the policy for sending items back?"
     query_embedding_2 = llm_inf_client.call_embeddings(query_text_2)
-    results_2 = rag_service.query_knowledge_base(query_embedding_2, query_text_2)
-    print(f"\nRAG Query Results for '{query_text_2}':")
-    for res in results_2:
-        print(f"- Doc ID: {res.doc_id}, Content: '{res.content[:50]}...'")
+    results_2 = rag_service.query_knowledge_base(query_embedding_2, query_text_2, top_k=1)
+    print(f"\nSemantic Query Results for '{query_text_2}':")
+    if results_2:
+        for i, res in enumerate(results_2):
+            print(f"- {i+1}. Doc ID: {res.doc_id}, Content: '{res.content[:70]}...' (Source: {res.source_type})")
+    else:
+        print("No results found.")
+
+    query_text_3 = "Comfortable headphones for long flights"
+    query_embedding_3 = llm_inf_client.call_embeddings(query_text_3)
+    results_3 = rag_service.query_knowledge_base(query_embedding_3, query_text_3, top_k=1)
+    print(f"\nSemantic Query Results for '{query_text_3}':")
+    if results_3:
+        for i, res in enumerate(results_3):
+            print(f"- {i+1}. Doc ID: {res.doc_id}, Content: '{res.content[:70]}...' (Source: {res.source_type})")
+    else:
+        print("No results found.")
+
+
+    # --- Simulating Service Restart and Loading from File/Index ---
+    print("\n--- Simulating Service Restart and Loading from File/Index ---")
+    reloaded_rag_service = RAGService(llm_inf_client, db_file_path=rag_data_file, faiss_index_path=faiss_index_file)
+    print(f"Reloaded in-memory doc_store size: {len(reloaded_rag_service.doc_store)}")
+    print(f"Reloaded FAISS index size: {reloaded_rag_service.faiss_index.ntotal if reloaded_rag_service.faiss_index else 'N/A'}")
+
+    reloaded_results = reloaded_rag_service.query_knowledge_base(query_embedding_1, query_text_1, top_k=1)
+    print(f"\nReloaded RAG Query Results for '{query_text_1}':")
+    if reloaded_results:
+        for i, res in enumerate(reloaded_results):
+            print(f"- {i+1}. Doc ID: {res.doc_id}, Content: '{res.content[:70]}...' (Source: {res.source_type})")
+    else:
+        print("No results found.")
+    # --- END NEW: Test loading from file again ---

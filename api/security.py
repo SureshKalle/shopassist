@@ -38,7 +38,7 @@ def verify_api_key(api_key: str | None = Security(_api_key_header)) -> str | Non
         return None
 
     if api_key and secrets.compare_digest(api_key, settings.api_key):
-        logger.info("Request authenticated (key ...%s)", api_key[-4:])
+        logger.info("Request authenticated")
         return api_key
 
     logger.warning(

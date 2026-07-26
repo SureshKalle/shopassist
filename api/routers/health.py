@@ -14,10 +14,11 @@ import urllib.request
 from fastapi import APIRouter, Depends
 
 from api.config import settings
-from api.dependencies import get_agents, get_ecommerce_client, get_rag_service
+from api.dependencies import get_agents, get_classifier_client, get_ecommerce_client, get_rag_service
 from api.schemas import HealthResponse
 from clients.ecommerce_api_client import EcommerceClient
-from services.rag import MockRAGService
+from services.classifier_client import ClassifierClient
+from services.rag import RAGService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/health", tags=["health"])
@@ -38,19 +39,22 @@ def _ollama_reachable(timeout: float = 3.0) -> bool:
 @router.get("", response_model=HealthResponse)
 def health_check(
     agents: dict = Depends(get_agents),
-    rag_service: MockRAGService = Depends(get_rag_service),
+    rag_service: RAGService = Depends(get_rag_service),
     ecommerce_client: EcommerceClient = Depends(get_ecommerce_client),
+    classifier_client: ClassifierClient = Depends(get_classifier_client),
 ) -> HealthResponse:
     """
     Never raises on a downstream outage — that should show up as
-    database_reachable=False / llm_reachable=False, not a 500 that takes
-    the health check down along with whatever it was trying to report on.
+    database_reachable=False / llm_reachable=False /
+    classifier_reachable=False, not a 500 that takes the health check down
+    along with whatever it was trying to report on.
     """
     return HealthResponse(
         status="ok",
         registered_agents=list(agents.keys()),
-        rag_documents_indexed=len(rag_service.vector_db),
+        rag_documents_indexed=len(rag_service.doc_store),
         database_reachable=ecommerce_client.is_reachable(),
         llm_reachable=_ollama_reachable(),
+        classifier_reachable=classifier_client.is_reachable(),
         api_key_enforced=settings.api_key_enforce,
     )

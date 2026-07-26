@@ -143,8 +143,8 @@ class MaskedQuery(BaseModel):
     masked_text: str
     original_text_hash: str # To reference original for audit, but not store PII
 
-# SentimentResult: shopassist's local mirror of shopassist-model's classifier
-# service response (classifier/schemas.py SentimentResponse) - see
+# SentimentResult: shopassist's local mirror of the classifier service's
+# response shape (its own SentimentResponse schema) - see
 # services/classifier_client.py. Not yet consulted by routing/NLG - today
 # it's only logged/recorded (services/orchestrator.py's sentiment hook,
 # services/data_pipeline.py's review-sentiment call site).
@@ -164,24 +164,21 @@ class ChatbotResponse(BaseModel):
 
 
 # --- LLM INFERENCE SERVICE REQUEST/RESPONSE MODELS ---
-# RoutingRequest: Input to LLMInf_Router
-class RoutingRequest(BaseModel):
-    session_id: str
-    conversation_history: List[Message] # Uses Message model
-    current_query: str # PII-masked query
-
-# AgentInvocation: Output from LLMInf_Router, used by Orchestrator
-class AgentInvocation(BaseModel):
-    agent_name: str # e.g., "OrderTrackingAgent", "ProductRecommendationAgent"
-    confidence: float
-    parameters: AgentInputParams # Uses AgentInputParams Union
-
 # AgentTask: Input from Orchestrator to Specialized Agents
 class AgentTask(BaseModel):
     session_id: str
     task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: str # Schema-driven identifier (db/README.md) - matches customers.user_id
     original_query: str # Masked
+    # Overloaded: on the normal decomposition path (services/orchestrator.py)
+    # this is the target agent's registry name itself (e.g.
+    # "OrderTrackingAgent" - see api/dependencies.py::get_agents()'s
+    # docstring), used only for logging on that path, since routing already
+    # happened by the time an AgentTask is built. On the guardrail-block/
+    # sub-task-error escalation paths it's instead a free-form semantic
+    # label ("escalation_due_to_guardrail", "escalation_due_to_sub_task_error")
+    # - no agent branches on this field's value, so the inconsistency is
+    # harmless today, just worth knowing before adding logic that reads it.
     intent: str
     params: AgentInputParams # Uses AgentInputParams Union
     conversation_context: List[Message] # Uses Message model
@@ -197,7 +194,10 @@ class LLMAgentReasonRequest(BaseModel):
 # LLMAgentReasonResponse: Output from LLMInf_AgentReason
 class LLMAgentReasonResponse(BaseModel):
     action: str # e.g., 'call_api', 'query_rag', 'return_result', 'escalate'
+    # tool_name can now be a category like "ECommerceAPI" or "RAG"
+    # The actual method/operation will be in tool_params.method
     tool_name: Optional[str] = None
+    # tool_params will now *always* include a 'method' field for 'call_api'/'query_rag'
     tool_params: Optional[Dict[str, Any]] = None
     thought: str
 
@@ -264,3 +264,18 @@ class ChunkedDocument(BaseModel):
     embedding: List[float]
     source_type: str # 'product_catalog', 'customer_support_policy'
     metadata: Dict[str, Any]
+
+# --- MULTI-INTENT & TASK DECOMPOSITION MODELS (NEW SECTION) ---
+
+class DecomposedSubTask(BaseModel):
+    """Represents a single sub-task extracted from a multi-intent query."""
+    sub_task_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    original_segment: str # The part of the original query this sub-task addresses
+    inferred_agent_name: str # e.g., "OrderTrackingAgent", "GeneralPurposeAgent"
+    inferred_parameters: Dict[str, Any] = Field(default_factory=dict) # Parameters for the agent
+
+class DecomposedQuery(BaseModel):
+    """Output model for the LLM that decomposes a multi-intent query."""
+    primary_intent_summary: str # A summary of the overall user goal
+    sub_tasks: List[DecomposedSubTask] # List of individual sub-tasks
+    overall_confidence: float = Field(default=1.0, ge=0.0, le=1.0)

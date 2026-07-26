@@ -11,7 +11,7 @@ layer can evolve its request/response shape independently.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -36,6 +36,16 @@ class ChatResponse(BaseModel):
     timestamp: datetime
 
 
+class ChatMessage(BaseModel):
+    role: str = Field(description="Message author: 'user' or 'assistant'.")
+    content: str = Field(description="The message text.")
+
+
+class ChatHistoryResponse(BaseModel):
+    session_id: str
+    messages: List[ChatMessage] = Field(description="Conversation turns, oldest first.")
+
+
 # ---------------------------------------------------------------------------
 # Health endpoint
 # ---------------------------------------------------------------------------
@@ -45,5 +55,6 @@ class HealthResponse(BaseModel):
     rag_documents_indexed: int
     database_reachable: bool
     llm_reachable: bool
+    classifier_reachable: bool
     api_key_enforced: bool
 

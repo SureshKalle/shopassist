@@ -1,0 +1,21 @@
+# Extra dependencies for evaluation/ only - install on top of the project's
+# own requirements.txt:
+#   pip install -r requirements.txt -r evaluation/requirements-eval.txt
+
+# F1 / precision / recall / classification_report for intent-routing eval
+# (evaluation/metrics.py -> compute_routing_metrics)
+scikit-learn>=1.3
+
+# Cosine similarity over LLMInferenceService.call_embeddings() output
+# (evaluation/metrics.py -> answer_relevancy); also a transitive dep of
+# scikit-learn, pinned explicitly since metrics.py imports it directly.
+numpy>=1.26
+
+# NOT included: the `ragas` package itself. It expects an OpenAI-shaped /
+# LangChain-wrapped LLM+embeddings client for its faithfulness/relevancy
+# judging; this project's LLMInferenceService is a custom hybrid local
+# (Ollama) / cloud (Gemini) client with its own request/response models
+# (common/models.py), so evaluation/metrics.py reimplements the same four
+# RAGAS metrics as lightweight heuristics instead - see that file's
+# module docstring for the reasoning and the upgrade path if real
+# LLM-judged scoring is wanted later.
