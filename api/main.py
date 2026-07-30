@@ -32,7 +32,7 @@ from api.dependencies import warm_up_services
 from api.middleware import RequestLoggingMiddleware
 from api.request_context import RequestIDLogFilter
 from api.routers import chat, health
-from common.langfuse_config import initialize_langfuse_client
+from common.langfuse_config import get_langfuse_client_instance, initialize_langfuse_client
 
 # See .env.example / api/config.py for all api-owned settings.
 # LOG_LEVEL=DEBUG also enables full request/response body logging (api/middleware.py).
@@ -58,12 +58,27 @@ async def lifespan(app: FastAPI):
         "ENFORCED" if settings.api_key_enforce else "advisory only (set API_KEY_ENFORCE=true to require it)",
     )
     # No-ops (logs a warning, doesn't raise) if LANGFUSE_PUBLIC_KEY/SECRET_KEY
-    # aren't set - see common/langfuse_config.py. Registers its own atexit
-    # flush hook, so traces are sent before the process exits on shutdown.
+    # aren't set - see common/langfuse_config.py. Also registers its own
+    # atexit flush hook, but that's not relied on alone here (see below).
     initialize_langfuse_client()
     warm_up_services()
     yield
     logger.info("[API] Shutting down.")
+    # Explicit flush during the ASGI lifespan's shutdown phase - mirrors
+    # main_simulation.py's own explicit flush before it exits - rather than
+    # relying solely on the atexit hook registered inside
+    # initialize_langfuse_client(). atexit only fires on normal interpreter
+    # teardown, which here would have to complete *after* uvicorn's own
+    # graceful-drain/shutdown sequence, all inside docker-compose.yml's 10s
+    # stop_grace_period before Docker sends SIGKILL (which skips atexit
+    # entirely). Flushing here runs earlier in that sequence - ASGI
+    # guarantees this code runs on every graceful stop - so pending traces
+    # go out without depending on the rest of that chain finishing in time.
+    langfuse_client = get_langfuse_client_instance()
+    if langfuse_client:
+        logger.info("[API] Flushing Langfuse traces...")
+        langfuse_client.flush()
+        logger.info("[API] Langfuse traces flushed.")
 
 
 app = FastAPI(

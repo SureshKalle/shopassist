@@ -11,7 +11,7 @@ import logging
 from functools import lru_cache
 
 from clients.ecommerce_api_client import EcommerceClient
-from common.models import RawCustomerConversation, RawProductRecord
+from common.models import RawProductRecord
 from services.agents.base_agent import BaseAgent
 from services.agents.escalation_agent import EscalationAgent
 from services.agents.general_purpose_agent import GeneralPurposeAgent
@@ -26,26 +26,16 @@ from services.rag import RAGService
 
 logger = logging.getLogger(__name__)
 
-# Same sample data main_simulation.py ingests before its demo queries, so
-# the RAG store isn't empty on this API's first request. Policy PDFs
-# (docs/) are ingested separately below, also matching main_simulation.py.
-_SAMPLE_CONVERSATIONS = [
-    RawCustomerConversation(
-        id="conv_001",
-        text="Hi, my name is John Doe, and I want to know about my order 12345.",
-        metadata={"source": "twitter", "user_id": "jd_123"},
-    ),
-    RawCustomerConversation(
-        id="conv_002",
-        text="Can you help me with a return for product X? My email is john.doe@example.com.",
-        metadata={"source": "web_form", "user_id": "jd_123"},
-    ),
-    RawCustomerConversation(
-        id="conv_003",
-        text="I love my new laptop! Is there a warranty?",
-        metadata={"source": "web_chat", "user_id": "alum_002"},
-    ),
-]
+# NOTE: main_simulation.py seeds its own equivalent fixture conversations
+# for its CLI demo - deliberately NOT reused here. Those are fabricated
+# placeholder transcripts (fictional names/emails) meant only to give that
+# offline script's RAG store something to match against; ingesting them into
+# this live API's shared knowledge base let GeneralPurposeAgent's
+# unfiltered, unscoped top-k search (services/agents/general_purpose_agent.py)
+# surface one to a real customer's query and quote it back as if it were
+# that customer's own info (this is how a demo customer once got addressed
+# as "John Doe"). Policy PDFs (docs/) are still ingested below; those are
+# real reference material, not fabricated customer identities.
 
 # Comfortably above the seeded catalog's real size (75 items as of
 # db/seed_postgres.sql) without hardcoding an exact count that would go
@@ -169,7 +159,6 @@ def warm_up_services() -> None:
     # even completely) empty RAG store is recoverable; one that never boots
     # isn't.
     for step_name, step in (
-        ("customer conversations", lambda: pipeline.ingest_customer_conversations(_SAMPLE_CONVERSATIONS)),
         ("product catalog", lambda: pipeline.ingest_product_catalog(_build_catalog_products(get_ecommerce_client()))),
         ("PDF documents", lambda: pipeline.ingest_pdf_documents(docs_folder="docs", source_type="customer_policy")),
     ):

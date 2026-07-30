@@ -98,6 +98,11 @@ class EscalationDetails(BaseModel):
     conversation_summary: List[Message] # Uses the new Message model
     ticket_id: Optional[str] = None
     human_agent_queue: Optional[str] = None
+    # The store's real published escalation channel (services/agents/
+    # escalation_agent.py's _SUPPORT_CONTACT) - given to call_generative() so
+    # it has an actual value to quote instead of inventing one. See that
+    # module for why this exists.
+    support_contact: Optional[str] = None
 
 # --- MAIN AGENT OUTPUT MODEL ---
 # StructuredAgentResult: This is the common wrapper for all agent outputs.
