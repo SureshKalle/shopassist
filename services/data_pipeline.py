@@ -57,8 +57,8 @@ class DataIngestionPipeline:
         for raw_conv in raw_conversations:
             logger.debug("Processing raw conversation ID: %s", raw_conv.id)
 
-            # --- 1. Cleaning & Organization (e.g., lowercasing, removing noise) ---
-            cleaned_text = raw_conv.text.lower().strip()
+            # --- 1. Cleaning & Organization ---
+            stripped_text = raw_conv.text.strip()
             # Advanced steps here:
             # - Typos/Grammar correction: using NLP libraries (e.g., pyspellchecker, textblob)
             # - Slang/informal language standardization: custom dictionaries or LLM-based normalization
@@ -66,9 +66,14 @@ class DataIngestionPipeline:
             # - Noise removal: remove HTML tags, URLs, irrelevant system messages
 
             # --- 2. PII Masking ---
-            # Crucial step: PII is masked before any data reaches an LLM (even for embeddings/fine-tuning)
-            masked_data = self.pii_masker.mask_text(cleaned_text, session_id=raw_conv.id, user_id=raw_conv.metadata.get('user_id'))
-            masked_text = masked_data.masked_text
+            # Crucial step: PII is masked before any data reaches an LLM (even for embeddings/fine-tuning).
+            # Must run on the original-cased text: PIIMasker's name pattern only
+            # fires on a capitalized name (by design, to avoid mismasking
+            # lowercase Title-Case-only product/city names) - lowercasing first
+            # would silently defeat name masking. Lowercase afterward instead,
+            # once masking has already replaced any name with "[NAME]".
+            masked_data = self.pii_masker.mask_text(stripped_text, session_id=raw_conv.id, user_id=raw_conv.metadata.get('user_id'))
+            masked_text = masked_data.masked_text.lower()
 
             # Store for potential LLM fine-tuning (e.g., in a data lake/warehouse)
             cleaned_conversations.append(CleanedCustomerConversation(

@@ -107,6 +107,32 @@ _SAFE_EMAILS = {"store@alumni.iisc.ac.in", "support@shopassist.com"}
 # back (see the normalization in screen_output() below).
 _SAFE_PHONES = {"917777777777", "7777777777"}
 
+# Catches degenerate/garbled generation - not a leak, a quality failure:
+# observed from the smaller/quantized local Ollama fallback model
+# degenerating into token-salad output while trying to generate an
+# ungrounded, format-constrained string it had no real value for (e.g. a
+# support contact address it wasn't given - see services/llm_inference.py's
+# call_generative() system prompt and services/agents/escalation_agent.py's
+# _SUPPORT_CONTACT, added specifically to give it one). Every legitimate
+# reply here is English text; a stray accented product/city/person name
+# (e.g. "café", "José") is the only real exception, and even that never
+# reaches this pattern's 50%-non-ASCII-of-a-10+-char-run bar - it takes a
+# true degenerate run to cross it.
+_GARBLED_RUN = re.compile(r"\S{10,}")
+_GARBLED_NON_ASCII_RATIO = 0.5
+_GARBLED_FALLBACK_TEXT = (
+    "I'm sorry, I wasn't able to put together a complete response for that. "
+    "A member of our support team will follow up with you shortly."
+)
+
+
+def _is_garbled(text: str) -> bool:
+    return any(
+        sum(1 for ch in run.group(0) if ord(ch) > 127) / len(run.group(0)) > _GARBLED_NON_ASCII_RATIO
+        for run in _GARBLED_RUN.finditer(text)
+    )
+
+
 _OUTPUT_LEAK_PATTERNS = {
     "email": re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"),
     # Luhn-validated in screen_output() below, not here - a bare 13-16 digit
@@ -220,6 +246,16 @@ class GuardrailService:
     def screen_output(self, text: str) -> OutputGuardrailVerdict:
         if not text:
             return OutputGuardrailVerdict(flagged=False, safe_text=text or "")
+        try:
+            if _is_garbled(text):
+                logger.warning(
+                    "Guardrail: output looks garbled (degenerate model output) - replacing with fallback text"
+                )
+                return OutputGuardrailVerdict(
+                    flagged=True, categories=["garbled_output"], safe_text=_GARBLED_FALLBACK_TEXT
+                )
+        except Exception:
+            logger.warning("screen_output: garbled-output check itself failed - continuing to PII scan", exc_info=True)
         safe_text = text
         categories: List[str] = []
         try:

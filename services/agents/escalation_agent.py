@@ -13,6 +13,15 @@ from langfuse import observe
 
 logger = logging.getLogger(__name__)
 
+# The store's real, published escalation channel (docs/Customer Support
+# Escalation Policy.pdf, "Communication Channels") - also allowlisted as a
+# non-PII value in services/guardrails.py's _SAFE_EMAILS/_SAFE_PHONES.
+# Threaded into EscalationDetails.support_contact so call_generative()'s
+# LLM has a real value to quote on an escalation instead of inventing one -
+# a small/quantized local model asked to fabricate a contact address it has
+# no grounding for previously degenerated into garbled output.
+_SUPPORT_CONTACT = "support@shopassist.com (or +91 77777 77777 for urgent escalations)"
+
 class EscalationAgent(BaseAgent):
     """
     Specialized AI Agent designated as a fallback for unresolvable issues or critical failures.
@@ -45,7 +54,8 @@ class EscalationAgent(BaseAgent):
             result_data={
                 "escalation_reason": escalation_reason,
                 "original_query": task.original_query,
-                "conversation_summary": task.conversation_context[-3:] # Last 3 turns for context
+                "conversation_summary": task.conversation_context[-3:], # Last 3 turns for context
+                "support_contact": _SUPPORT_CONTACT,
             },
         )
 
